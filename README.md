@@ -4,6 +4,8 @@ Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 AP
 
 **当前仅为开发脚手架，不是可用的同步产品。** 编辑器仅使用内存，刷新即丢失；没有笔记保存、同步、认证或附件业务。API 可达不代表正文已保存。
 
+当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/MinIO 的镜像拉取与运行也尚未完成验收，详见下文限制。
+
 ## 技术栈与目录
 
 Python 3.12+、FastAPI、uv、SQLAlchemy 2.x async、asyncpg、Alembic；仅 PostgreSQL。附件存储方向固定为 MinIO。

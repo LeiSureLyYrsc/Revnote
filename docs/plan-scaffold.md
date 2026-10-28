@@ -2,7 +2,7 @@
 
 > 本计划经会话确认后进入 Build；文中的任务清单是实施范围，不代表验收已通过。实际启动方法和验证限制见根 README。
 >
-> 依据：`plan-prompt.md`、`docs/consensus-brief.md`、`docs/stack-blueprint.md`。
+> 依据：已确认的会话需求、`docs/consensus-brief.md`、`docs/stack-blueprint.md`。本地任务提示文件不随仓库发布。
 > Build 补充约定：`docs/build-conventions.md` 优先；需添加 API Dockerfile 与 GitHub Actions→GHCR，但**禁止本地构建本仓镜像**。本地 Compose 仅运行官方 PostgreSQL、MinIO 及其初始化工具，API/Web 在宿主机运行。
 
 ## 1. 目标与非目标

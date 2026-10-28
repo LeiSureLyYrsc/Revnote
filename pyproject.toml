@@ -1,0 +1,79 @@
+# Revnote — uv workspace root.
+#
+# This root manifest is a **virtual** project: it is never built or installed.
+# It exists so the whole monorepo shares a single `.venv/` and a single
+# `uv.lock`. Run every Python command from the repository root:
+#
+#   uv sync                                   # create/refresh .venv
+#   uv run uvicorn revnote_api.app:app --reload
+#   uv run pytest                             # unit tests (no DB needed)
+#   uv run ruff check .                       # lint
+#   uv run alembic -c apps/api/alembic.ini upgrade head
+#
+# Workspace members:
+#   apps/api -> distribution `revnote-api`, import package `revnote_api`
+
+[project]
+name = "revnote-workspace"
+version = "0.1.0"
+description = "Revnote monorepo root (virtual uv workspace project; never published)"
+requires-python = ">=3.12"
+dependencies = ["revnote-api"]
+
+[tool.uv]
+# Virtual project: workspace glue only, nothing to build or install.
+package = false
+
+[tool.uv.workspace]
+members = ["apps/api"]
+
+[tool.uv.sources]
+revnote-api = { workspace = true }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[dependency-groups]
+# Repo-wide Python tooling — installed by `uv sync` into the shared .venv.
+dev = [
+    "httpx>=0.28",
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+# --------------------------------------------------------------------------- #
+# pytest — `uv run pytest` from the repo root
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+testpaths = ["apps/api/tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: needs a real PostgreSQL server (set TEST_DATABASE_URL, else skipped)",
+]
+
+# --------------------------------------------------------------------------- #
+# ruff — `uv run ruff check .` / `uv run ruff format --check .`
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["apps/api/src", "apps/api/tests", "apps/api/migrations"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "ASYNC", # flake8-async
+    "RUF",   # ruff-specific rules
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["revnote_api"]

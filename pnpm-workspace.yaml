@@ -1,0 +1,6 @@
+packages:
+  - 'apps/web'
+minimumReleaseAgeExclude:
+  - lucide-react@1.63.0
+allowBuilds:
+  esbuild: true

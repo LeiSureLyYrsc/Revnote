@@ -1,0 +1,18 @@
+{
+  "name": "revnote-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.15.0",
+  "engines": {
+    "node": ">=24.22.1"
+  },
+  "scripts": {
+    "dev:web": "pnpm --filter @revnote/web dev",
+    "build:web": "pnpm --filter @revnote/web build",
+    "lint:web": "pnpm --filter @revnote/web lint",
+    "typecheck:web": "pnpm --filter @revnote/web typecheck",
+    "check:markdown": "pnpm --filter @revnote/web check:markdown",
+    "test:markdown": "pnpm --filter @revnote/web check:markdown"
+  }
+}

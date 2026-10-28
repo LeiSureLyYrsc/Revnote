@@ -1,0 +1,357 @@
+# Revnote CI — checks first, API image last.
+#
+#   * The image job depends on the check jobs, so a red test can never publish.
+#   * Images are built ONLY here; local `docker build` is prohibited.
+#   * Pull requests never push and never receive a registry token.
+#   * Pushes to main and manual dispatches publish to
+#     ghcr.io/<lowercase owner>/revnote-api using the workflow GITHUB_TOKEN.
+#   * Permissions are minimal: `contents: read`, plus `packages: write` on the
+#     image job only.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Deny by default, then grant per job.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run, but a publishing run
+# is never cancelled halfway through a layer push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_NO_PROGRESS: "1"
+  # Hardlinking across the cache/venv boundary is unreliable in containers.
+  UV_LINK_MODE: "copy"
+
+jobs:
+  # ------------------------------------------------------------------------- #
+  # API: lint + unit tests + real-PostgreSQL integration tests + migration gate
+  # ------------------------------------------------------------------------- #
+  api:
+    name: api (lint + unit + postgres integration + migrations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        # Official Docker Official Image, pinned to the same version as
+        # docker-compose.yml. A real server: the scaffold is PostgreSQL-only.
+        image: postgres:17.11-alpine3.23
+        env:
+          POSTGRES_USER: revnote
+          POSTGRES_PASSWORD: revnote_ci_only_password
+          POSTGRES_DB: revnote_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username revnote --dbname revnote_ci --timeout=5"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 20s
+
+    env:
+      # Gates the PostgreSQL integration tests: with this set, those tests must
+      # connect or the job fails. DATABASE_URL and APP_ENV are intentionally NOT
+      # set here — the unit tests assert their defaults, so a job-wide value
+      # would break unrelated assertions. They are injected per step instead.
+      TEST_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            apps/api/pyproject.toml
+
+      - name: Sync workspace from the lock file
+        # --locked fails when uv.lock disagrees with pyproject.toml rather than
+        # quietly re-resolving.
+        run: uv sync --locked
+
+      - name: Lint (ruff check)
+        run: uv run ruff check apps/api
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check apps/api
+
+      - name: Unit tests (must pass with no external service)
+        # Proves create_app() boots and serves / with /health while PostgreSQL and
+        # MinIO are absent — the scaffold's core promise.
+        run: uv run pytest apps/api/tests/unit -v
+
+      - name: Integration tests against the real PostgreSQL service
+        # `--strict-markers` is already in the repo config, so `-m integration`
+        # selects exactly the opt-in database tests.
+        run: uv run pytest apps/api/tests/integration -v -m integration --junitxml=api-integration.xml
+
+      - name: Guard - integration tests must not have been skipped
+        # A skip is NOT a database acceptance check. Parsing the JUnit XML (not
+        # grepping it) avoids `set -o pipefail` failing when there is nothing to
+        # match, and counts real elements rather than lines.
+        run: |
+          uv run python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          try:
+              suites = ET.parse("api-integration.xml").getroot()
+          except (OSError, ET.ParseError) as exc:
+              print(f"::error::cannot read api-integration.xml: {exc}")
+              sys.exit(1)
+
+          total = skipped = 0
+          for case in suites.iter("testcase"):
+              total += 1
+              if case.find("skipped") is not None:
+                  skipped += 1
+
+          print(f"integration testcases={total} skipped={skipped}")
+          if total == 0:
+              print("::error::No integration tests ran.")
+              sys.exit(1)
+          if skipped:
+              print("::error::Integration tests were skipped: TEST_DATABASE_URL was not honoured.")
+              sys.exit(1)
+          PY
+
+      - name: Alembic upgrade head (documented repo-root command)
+        # Alembic reads DATABASE_URL from Settings, so it is supplied here only —
+        # never at job level, where it would break the unit tests' default checks.
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: uv run alembic -c apps/api/alembic.ini upgrade head
+
+      - name: Alembic current
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: uv run alembic -c apps/api/alembic.ini current
+
+      - name: Verify the baseline created no business tables
+        # Inspect the live catalog instead of trusting the migration exit code.
+        # Only Alembic's bookkeeping table may exist: any note / workspace /
+        # change_event / attachment table is a scaffold regression. asyncpg comes
+        # from the project venv, so no runner-level psql client is required.
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: |
+          set -eu
+          # Written outside the workspace so it can never be picked up as a
+          # tracked file or leak into a later `git status` check.
+          helper="${RUNNER_TEMP:-/tmp}/check-schema.py"
+          cat > "$helper" <<'PY'
+          import asyncio
+          import os
+          import re
+
+          import asyncpg
+
+          dsn = re.sub(
+              r"^postgresql\+asyncpg://",
+              "postgresql://",
+              os.environ["DATABASE_URL"],
+          )
+
+
+          async def main() -> int:
+              conn = await asyncpg.connect(dsn=dsn)
+              try:
+                  rows = await conn.fetch(
+                      "SELECT tablename FROM pg_tables"
+                      " WHERE schemaname = current_schema() ORDER BY tablename"
+                  )
+              finally:
+                  await conn.close()
+
+              tables = [row["tablename"] for row in rows]
+              print(f"tables after 'upgrade head': {tables}")
+
+              unexpected = [t for t in tables if t != "alembic_version"]
+              if unexpected:
+                  print(f"::error::baseline created unexpected tables: {unexpected}")
+                  return 1
+              if "alembic_version" not in tables:
+                  print("::error::alembic_version missing: the migration did not apply")
+                  return 1
+              print("OK: baseline applied, no business tables created")
+              return 0
+
+
+          raise SystemExit(asyncio.run(main()))
+          PY
+          uv run python "$helper"
+
+      - name: Alembic downgrade base (baseline must be reversible)
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: uv run alembic -c apps/api/alembic.ini downgrade base
+
+      - name: Upload integration test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: api-integration-report
+          path: api-integration.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ------------------------------------------------------------------------- #
+  # Web: lint, typecheck, production build, Markdown round-trip check
+  # ------------------------------------------------------------------------- #
+  web:
+    name: web (lint + typecheck + build + markdown)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        # Version comes from the repo's own `packageManager` field, so CI cannot
+        # drift from a developer machine. Must run before setup-node's pnpm cache.
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: package.json
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Show toolchain versions
+        run: node --version && pnpm --version
+
+      - name: Install dependencies
+        # --frozen-lockfile: fail rather than silently rewriting pnpm-lock.yaml.
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm --filter @revnote/web lint
+
+      - name: Typecheck
+        run: pnpm --filter @revnote/web typecheck
+
+      - name: Build
+        run: pnpm --filter @revnote/web build
+
+      - name: Markdown round-trip check
+        # Exercises the TipTap Markdown serializer/parser (basic node semantics
+        # only — no LaTeX/HTML/whitespace guarantees). It is a script, not a
+        # Markdown linter, and needs no browser or API.
+        run: pnpm --filter @revnote/web check:markdown
+
+  # ------------------------------------------------------------------------- #
+  # API image -> GHCR, only after every check is green.
+  # ------------------------------------------------------------------------- #
+  image:
+    name: image (build + push to GHCR)
+    needs: [api, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Skipped for every pull_request (including same-repo PRs) and therefore for
+    # fork PRs, which must never receive a registry token. Publishing happens on
+    # main pushes and manual dispatches only.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve the image reference
+        id: img
+        # GHCR paths must be lowercase, but owner logins can contain uppercase.
+        # Fail closed if the event ever resolves to an empty owner.
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          if [ -z "${OWNER}" ]; then
+            echo "::error::github.repository_owner is empty; refusing to build a broken reference."
+            exit 1
+          fi
+          image="ghcr.io/$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')/revnote-api"
+          echo "name=${image}" >> "$GITHUB_OUTPUT"
+          echo "Image reference: ${image}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=revnote-api
+            org.opencontainers.image.description=Revnote API scaffold (liveness endpoints only)
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          # Context is the REPOSITORY ROOT: the API image resolves the root uv
+          # workspace (root pyproject.toml + uv.lock + the apps/api member).
+          context: .
+          file: ./apps/api/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=revnote-api
+          cache-to: type=gha,mode=max,scope=revnote-api
+
+      - name: Summarise the pushed image
+        run: |
+          {
+            echo "### revnote-api image"
+            echo
+            echo "Pushed to \`${{ steps.img.outputs.name }}\`:"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Commit: \`${{ github.sha }}\` · event: \`${{ github.event_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

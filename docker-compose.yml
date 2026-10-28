@@ -1,0 +1,163 @@
+# Revnote — local development infrastructure (PostgreSQL + MinIO only).
+#
+# Scope: starts the OFFICIAL PostgreSQL image, the OFFICIAL MinIO server, and a
+# one-shot bucket initializer. It deliberately does NOT build or run the API/Web
+# images — those run on the host via uv/pnpm, and the API image is built only by
+# GitHub Actions (see docs/build-conventions.md). There are no `build:` keys
+# here on purpose.
+#
+#   docker compose up -d
+#   docker compose ps -a
+#   docker compose logs minio-wait minio-init
+#   docker compose down            # keeps the named volumes
+#
+# Configuration comes from the repository-root `.env` (copy `.env.example`).
+#
+# --------------------------------------------------------------------------- #
+# OPEN BLOCKER — MinIO image availability (read before changing, and before
+# claiming this stack works).
+#
+# Registry probes in the implementation environment did not establish a
+# pullable official source. HTTP/authentication errors in that environment
+# do not establish that upstream images are universally unavailable.
+#
+# The references below are the OFFICIAL quay.io repositories with explicit
+# release tags. They are a statement of intent, NOT a verified pull: no digest
+# is pinned because none could be retrieved, and no digest may be invented.
+#
+# CONSEQUENCE: the MinIO portion is NOT accepted as runnable yet. Confirm an
+# official pull and review the selected release's security status before use.
+# Do not substitute a third-party rebuild without explicit approval.
+#
+# Action required: verify `docker pull quay.io/minio/minio:<tag>` on a host with
+# a Docker daemon, or decide on an officially supported channel, then pin the
+# digest that was actually observed.
+# --------------------------------------------------------------------------- #
+
+# Official MinIO server and client, with explicit release tags.
+# `minio/mc` is the official client image; it is used as a sidecar because the
+# server image's bundled tooling must not be assumed.
+x-minio-server: &minio-server
+  image: quay.io/minio/minio:RELEASE.2025-09-06T17-38-46Z
+x-minio-client: &minio-client
+  image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+
+services:
+  postgres:
+    # Official Docker Official Image; exact patch version, never `latest`.
+    image: postgres:17.11-alpine3.23
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required - copy .env.example to .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required - copy .env.example to .env}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      # Loopback only: never expose a development database on the LAN.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` ships in the official postgres image (verified present in
+      # 17-alpine3.23 at /usr/local/bin/pg_isready).
+      test:
+        - CMD-SHELL
+        - pg_isready --username "$${POSTGRES_USER}" --dbname "$${POSTGRES_DB}" --timeout=5
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    stop_grace_period: 30s
+
+  minio:
+    <<: *minio-server
+    restart: unless-stopped
+    command:
+      # The official entrypoint prepends `minio` when the first argument is not
+      # `minio`, so the effective command is `minio server /data ...`.
+      # The API port stays at 9000 on purpose (see minio-wait below).
+      - server
+      - /data
+      - --console-address
+      - ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required, min 8 chars}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    # No healthcheck here: it is not guaranteed that the server image ships a
+    # usable probe binary (curl was removed upstream), so readiness is
+    # established by the official `mc` sidecar below instead of being assumed.
+
+  minio-wait:
+    <<: *minio-client
+    # Blocks until the server answers its readiness probe, then exits 0.
+    # `mc ready` loops internally and only returns success once the server is
+    # actually ready, so this replaces an unverifiable in-image healthcheck.
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint:
+      - mc
+    command:
+      - ready
+      - revnote
+    environment:
+      # `MC_HOST_<alias>` is honoured by mc itself (no `mc alias set` needed),
+      # so one-shot containers need no writable home directory.
+      MC_HOST_revnote: http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@minio:9000
+      MC_CONFIG_DIR: /tmp/.mc
+
+  minio-init:
+    <<: *minio-client
+    # One-shot: create the bucket idempotently, then exit. `restart: "no"` keeps
+    # a failure visible as a non-zero exit code instead of a crash-loop.
+    restart: "no"
+    depends_on:
+      minio-wait:
+        condition: service_completed_successfully
+    entrypoint:
+      - mc
+    command:
+      # No shell is available in the official mc image (distroless-ish base), so
+      # this stays a single mc invocation. Re-running is a no-op.
+      # Newly created buckets default to private; minio-private below also
+      # resets policy on existing buckets when initialization is rerun.
+      - mb
+      - --ignore-existing
+      - revnote/${MINIO_BUCKET:?MINIO_BUCKET is required}
+    environment:
+      MC_HOST_revnote: http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@minio:9000
+      MC_CONFIG_DIR: /tmp/.mc
+    # Run-to-completion: a healthcheck would be reported unhealthy after the
+    # intentional exit.
+    healthcheck:
+      disable: true
+
+  minio-private:
+    <<: *minio-client
+    restart: "no"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    entrypoint: [mc]
+    command:
+      - anonymous
+      - set
+      - private
+      - revnote/${MINIO_BUCKET:?MINIO_BUCKET is required}
+    environment:
+      MC_HOST_revnote: http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@minio:9000
+      MC_CONFIG_DIR: /tmp/.mc
+    healthcheck:
+      disable: true
+
+volumes:
+  # Named volumes: `docker compose down` keeps the data, `down -v` destroys it.
+  postgres-data:
+  minio-data:

@@ -1,0 +1,89 @@
+# Revnote — Docker build context filter (repository root is the build context).
+#
+# The API image is built from the REPOSITORY ROOT because it is a uv workspace:
+# the build needs the root `pyproject.toml`, the single root `uv.lock`, and the
+# `apps/api` member. Everything else is excluded to keep the context small and,
+# more importantly, to guarantee no local secret or Python/Node artefact can be
+# baked into a published image.
+#
+# Keep in sync with apps/api/Dockerfile: the paths it COPYs must stay un-ignored:
+#   pyproject.toml, uv.lock, .python-version, apps/api/{pyproject.toml,src,
+#   alembic.ini,migrations,README.md}
+
+# ------------------------------- secrets ---------------------------------- #
+# Never ship credentials. `.env.example` is excluded too: the image must start
+# from the process environment only, with no dotenv file present at runtime.
+.env
+.env.*
+**/.env
+**/.env.*
+*.pem
+*.key
+*.p12
+secrets/
+
+# ------------------------------- version control -------------------------- #
+.git
+.gitignore
+.gitattributes
+.github/
+
+# --------------------------------- Python --------------------------------- #
+# Any local virtualenv must not leak into the image (the image builds its own).
+.venv/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+build/
+**/build/
+dist/
+**/dist/
+.coverage
+coverage.xml
+htmlcov/
+
+# ------------------------------ Node / web -------------------------------- #
+# The API image never needs the Web app or its dependency tree. Root workspace
+# metadata for pnpm is excluded too — uv does not read it.
+apps/web/
+node_modules/
+**/node_modules/
+.pnpm-store/
+**/*.tsbuildinfo
+**/dist-ssr/
+pnpm-lock.yaml
+pnpm-workspace.yaml
+package.json
+.npmrc
+
+# --------------------------------- tooling -------------------------------- #
+.vscode/
+.idea/
+**/*.log
+tmp/
+temp/
+.DS_Store
+Thumbs.db
+
+# ----------------------------------- docs --------------------------------- #
+# Not needed to build or run the API. (`apps/api/README.md` is intentionally
+# NOT excluded — the package metadata references its own README.)
+docs/
+build-prompt.md
+plan-prompt.md
+**/*.md
+!apps/api/README.md
+
+# -------------------------------- compose --------------------------------- #
+# Compose files are for local infrastructure only; they are not needed in an
+# image and would otherwise shadow nothing useful.
+docker-compose.yml
+docker-compose.override.yml
+.dockerignore
+apps/api/Dockerfile

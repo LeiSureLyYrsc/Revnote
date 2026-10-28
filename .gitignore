@@ -1,0 +1,97 @@
+# Revnote — repository-wide ignore rules (single source of truth).
+#
+# Policy: ignore *build output, caches and secrets* — never ignore files the
+# repository needs to reproduce a build. Lock files (`uv.lock`,
+# `pnpm-lock.yaml`), `pyproject.toml`, `package.json`, `.python-version`,
+# `.node-version`, Dockerfiles and `.github/workflows/**` are all tracked on
+# purpose: CI is only reproducible when pins and lock files are versioned.
+
+# ------------------------------- secrets ---------------------------------- #
+# `.env.example` is the tracked template; every real `.env*` is not.
+.env
+.env.*
+!.env.example
+
+# Local overrides some tools write next to the template.
+*.local
+
+# --------------------------------- Python --------------------------------- #
+# Shared workspace virtualenv (root `uv sync`) and any per-member venv.
+# No leading slash, so nested `.venv/` directories are covered too.
+.venv/
+venv/
+ENV/
+**/.venv/
+
+# Byte-compiled / cached Python from installed dependencies. These patterns
+# are unanchored (`__pycache__/` matches at any depth), so the 3k+ entries under
+# a synced .venv are never walked by `git add` / `git status`.
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build / packaging output.
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test & tooling caches.
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.tox/
+.nox/
+
+# -------------------------------- Node / web ------------------------------ #
+# Monorepo layout: this matches the root store AND every nested workspace
+# package (pnpm keeps apps/web/node_modules) because the pattern has no leading
+# slash and no directory prefix.
+node_modules/
+.npm/
+.pnpm-store/
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.eslintcache
+.vite/
+*.tsbuildinfo
+dist-ssr/
+
+# Playwright / Storybook artefacts (not used yet, harmless to pre-ignore).
+.playwright/
+storybook-static/
+
+# ---------------------------------- editors -------------------------------- #
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----------------------------------- docker -------------------------------- #
+# Compose override files are machine-local (ports, bind mounts, credentials).
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+# ------------------------------------ misc --------------------------------- #
+*.log
+tmp/
+temp/
+.cache/

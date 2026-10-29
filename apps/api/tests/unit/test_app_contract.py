@@ -44,10 +44,6 @@ pytestmark = pytest.mark.anyio
 #: What ``/api/v1`` must NOT advertise yet: these are added by later commits.
 FORBIDDEN_V1_PATHS = {
     "/api/v1/me/sessions",
-    "/api/v1/workspaces/{ws}/sync/pull",
-    "/api/v1/workspaces/{ws}/sync/snapshot",
-    "/api/v1/workspaces/{ws}/tree",
-    "/api/v1/workspaces/{ws}/notes/{id}",
 }
 
 #: The exact route set this commit publishes.
@@ -60,6 +56,10 @@ EXPECTED_PATHS = {
     "/api/v1/auth/logout",
     "/api/v1/me",
     "/api/v1/workspaces/{workspace_id}/sync/push",
+    "/api/v1/workspaces/{workspace_id}/sync/pull",
+    "/api/v1/workspaces/{workspace_id}/sync/snapshot",
+    "/api/v1/workspaces/{workspace_id}/tree",
+    "/api/v1/workspaces/{workspace_id}/notes/{note_id}",
 }
 
 

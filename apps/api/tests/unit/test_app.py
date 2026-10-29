@@ -81,6 +81,10 @@ async def test_openapi_exposes_only_implemented_routes(client: AsyncClient) -> N
         "/api/v1/auth/logout",
         "/api/v1/me",
         "/api/v1/workspaces/{workspace_id}/sync/push",
+        "/api/v1/workspaces/{workspace_id}/sync/pull",
+        "/api/v1/workspaces/{workspace_id}/sync/snapshot",
+        "/api/v1/workspaces/{workspace_id}/tree",
+        "/api/v1/workspaces/{workspace_id}/notes/{note_id}",
     }
     assert schema["info"]["title"] == "Revnote API"
 

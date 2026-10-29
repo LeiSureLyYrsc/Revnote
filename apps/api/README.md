@@ -4,13 +4,14 @@ Python3.12+、FastAPI、uv、SQLAlchemy2.x async、asyncpg、Alembic；只支持
 
 ## 范围
 
-- HTTP 仍只有 hello `/` 与进程存活 `/health`；后者不访问 PG/MinIO。
-- Phase2 的 Python service 提供单工作区、单对象写路径，不挂载业务 HTTP。
-- 六表：users、workspaces、folders、notes、change_events、op_ledger。
-- 保留空迁移 `0001_baseline`，新增 `0002_sync_kernel_core`；所有 schema 来自 Alembic，不调用 `create_all()`。
-- 没有认证、附件、Joplin、E2EE、CRDT、合并、清理或前端接入。
+- hello `/` 与进程存活 `/health` 不访问 PG/MinIO；业务端点位于 `/api/v1`。
+- 认证提供注册/登录/轮换refresh/logout/me；默认关闭注册，密码8–256字符，Argon2id，不透明token，session绝对30d。
+- 原生同步push/pull/snapshot及tree/note只读API；无REST写包装，Web尚未接入。
+- 原六张内核表加auth_sessions/auth_access_tokens/auth_refresh_tokens/workspace_members，总计十张领域表。
+- 空基线0001、内核0002、认证0003；所有schema来自Alembic，不调用create_all()。
+- 不含附件、Joplin、E2EE、CRDT、合并、清理或前端业务接入。
 
-完整已确认契约见 [Phase2计划](../../docs/plan-phase2.md)，运行及实测结果见 [根README](../../README.md)。
+完整契约见 [Phase3计划](../../docs/plan-phase3.md)、[API规格](../../docs/phase3-sync-api-spec.md)；运行及实测结果见 [根README](../../README.md)。
 
 ## 根目录命令
 
@@ -45,7 +46,11 @@ command = CreateNote(
 # 重试必须原样保留command及其op_id/entity_id。
 ```
 
-users/workspaces 需由受信任的上层预先准备；本阶段不提供注册/工作区管理API。service自己拥有新session与事务，勿包在调用方 `session_scope()` 中。UUIDv7只作标识，seq按工作区行锁分配；rev/CAS、对象/event/成功ledger在同一事务。返回不可变首次操作结果，不包含旧正文历史。
+HTTP注册开启时原子建立user/workspace/owner；不开放工作区或成员管理。内核service自己拥有新session与事务，勿包在调用方 `session_scope()` 中。UUIDv7只作标识，seq按工作区行锁分配；业务/CAS校验后推进seq，再写对象/event/成功ledger并提交。返回不可变首次操作结果，不包含旧正文历史。
+
+`execute_with_outcome`额外返回applied/replayed；原`execute`不变。每写事务局部lock_timeout5s、statement_timeout10s，57014/55P03确认失败为WriteBusy。提交确认丢失为unknown；取消原样上抛、不shield业务COMMIT，疑似提交连接invalidate。客户端同op_id+同payload重试，不能把断开当回滚。
+
+push逐op事务、1–50ops/2MiB、body_md≤256KiB，冲突继续，busy/unknown/storage停止并标后缀not_attempted。pull单语句快照保留完整事件+去重当前对象，默认100/上限500；snapshot单RR不分页，10k对象/16MiB整次上限，超限409，无半快照。JSON中所有seq/rev/cursor为十进制字符串。
 
 ## 真实 PG 验收
 
@@ -60,4 +65,4 @@ uv run pytest apps/api/tests
 
 迁移往返只允许专库，普通测试库只升不降。CI/强制模式缺任一URL失败，连接失败不得skip。不要对非测试数据执行降级；schema可逆不等于数据可恢复。每个并发任务独立session/真实连接；无SQLite替代。
 
-本地禁止docker build/compose build，镜像由Actions→GHCR。工作区隔离不是身份授权；软删与事件/账本均不清理，min_retained_seq不推进。其余边界和已实测事实以根README为准。
+本地禁止docker build/compose build，镜像由Actions→GHCR。HTTP每请求校验身份/成员，push每op前重查；内核工作区隔离不是身份授权。软删与事件/账本均不清理，min_retained_seq默认1且不推进，过期条件since<floor-1。其余边界和已实测事实以根README为准。

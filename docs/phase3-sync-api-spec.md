@@ -81,8 +81,16 @@ GET /workspaces/{workspace_id}/tree：活跃folders/notes元数据，无正文�
 | storage_failure | 500 / push rejected停止 | true |
 | internal | 500 | false |
 
+无效refresh使用401 `invalid_refresh`；认证数据库暂时不可用使用503 `auth_temporarily_unavailable`（retryable=true）。not_attempted表示没有启动该op，客户端可按同op_id+payload重发，不应将其解释为业务拒绝。注册开放时重复邮箱会返回400，可能透露已注册状态；默认关闭注册，不将其宣称为反枚举机制。
+
 ## 7. 配置/验收
 
 AUTH_REGISTRATION_OPEN=false、AUTH_PASSWORD_MIN_CHARS=8、AUTH_PASSWORD_MAX_CHARS=256、AUTH_ACCESS_TTL_S=600、AUTH_SESSION_TTL_S=2592000、ARGON2_MEMORY_COST=65536、ARGON2_TIME_COST=3、ARGON2_PARALLELISM=4、AUTH_HASH_MAX_CONCURRENCY=2；SYNC_PUSH_MAX_OPS=50、SYNC_PUSH_MAX_BYTES=2097152、SYNC_NOTE_MAX_BYTES=262144、SYNC_PUSH_BUDGET_MS=30000、SYNC_PULL_DEFAULT_LIMIT=100、SYNC_PULL_MAX_LIMIT=500、SYNC_PULL_MAX_BYTES=4194304、SYNC_SNAPSHOT_MAX_OBJECTS=10000、SYNC_SNAPSHOT_MAX_BYTES=16777216；DB_LOCK_TIMEOUT_MS=5000、DB_STATEMENT_TIMEOUT_MS=10000；CORS_ALLOW_ORIGINS=[]、RATE_LIMIT_ENABLED=false（仅占位）。配置名称与.env.example保持同步。
 
 具体schema与认证状态机见计划§9–10，所有权§13，验证§14。真实PG/多连接/uvicorn socket承重测试，0skip，秘密哨兵，保留旧内核责任。六提交、本地全绿、一次push、gh run watch --exit-status等CI绿；不得本机build镜像、触碰Clash或改前端业务。
+
+### 已知运行边界
+
+- snapshot/pull在构造正文JSON前做对象数量/逻辑内容字节预检，并对最终序列化字节再次校验；这是响应上限，不是PostgreSQL执行器的硬内存上限。旧数据或绕过HTTP内核入口写入的巨型压缩正文仍可能产生数据库解压成本。
+- logout需要有效access；仅持refresh的客户端需先refresh。session撤销每请求生效；push批内按D5每op重查member，不额外承诺session撤销会中断已在执行的批次。
+- Argon2参数固定为本阶段锁定值；配置与固定参数不符会明确拒绝认证service初始化，不静默忽略。密码配置可收紧但不能放宽超过8–256范围。

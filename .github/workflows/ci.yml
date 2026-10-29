@@ -7,6 +7,18 @@
 #     ghcr.io/<lowercase owner>/revnote-api using the workflow GITHUB_TOKEN.
 #   * Permissions are minimal: `contents: read`, plus `packages: write` on the
 #     image job only.
+#
+# Test groups (each is its own step with its own JUnit report, and each is
+# guarded by the no-skip check — a group with zero cases, one skip or one
+# failure is a red build):
+#
+#   unit             no external service
+#   integration      real PostgreSQL, sequential kernel behaviour
+#   concurrency      real PostgreSQL, independent connections
+#   migrations       destructive round trips on a disposable database
+#   api-http         /api/v1 over an in-process ASGI client
+#   api-http-concurrency  real PostgreSQL + concurrent HTTP requests
+#   api-transport    a real TCP socket served by uvicorn (disconnect, RST)
 
 name: ci
 
@@ -31,15 +43,19 @@ env:
   UV_NO_PROGRESS: "1"
   # Hardlinking across the cache/venv boundary is unreliable in containers.
   UV_LINK_MODE: "copy"
+  # Pinned type-checker; a floating `ty` would change its diagnostics on its own
+  # schedule and turn unrelated commits red.
+  TY_VERSION: "0.0.94"
 
 jobs:
   # ------------------------------------------------------------------------- #
-  # API: lint + unit tests + real-PostgreSQL integration tests + migration gate
+  # API: lint + types + unit tests + real-PostgreSQL integration tests
+  #      + HTTP/API groups + migration gate
   # ------------------------------------------------------------------------- #
   api:
-    name: api (lint + unit + postgres integration + migrations)
+    name: api (lint + types + unit + postgres integration + http + migrations)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: read
 
@@ -114,10 +130,31 @@ jobs:
       - name: Format check (ruff format)
         run: uv run ruff format --check apps/api
 
+      - name: Type check the production modules (ty, pinned)
+        # The plan's §14.2 list, spelled out as explicit paths (and globs) so a new
+        # module cannot silently slip past the checker. A directory form would also
+        # pull in modules whose diagnostics belong to the lane that owns them, which
+        # is how a shared check turns into a cross-lane edit war.
+        # No global ignore file: a diagnostic is fixed at its source or the build
+        # stays red.
+        run: |
+          uvx --from "ty==${TY_VERSION}" ty check \
+            apps/api/src/revnote_api/api \
+            apps/api/src/revnote_api/security \
+            apps/api/src/revnote_api/models \
+            apps/api/src/revnote_api/services/auth.py \
+            apps/api/src/revnote_api/services/auth_rules.py \
+            apps/api/src/revnote_api/services/sync_push_adapter.py \
+            apps/api/src/revnote_api/services/sync_read.py \
+            apps/api/src/revnote_api/services/sync_write.py \
+            apps/api/src/revnote_api/kernel/results.py \
+            apps/api/src/revnote_api/config.py \
+            apps/api/src/revnote_api/main.py
+
       - name: Unit tests (must pass with no external service)
         # Proves create_app() boots and serves / with /health while PostgreSQL and
         # MinIO are absent — the scaffold's core promise.
-        run: uv run pytest apps/api/tests/unit -v
+        run: uv run pytest apps/api/tests/unit -v --junitxml=api-unit.xml
 
       - name: PostgreSQL sequential behavior tests
         run: uv run pytest apps/api/tests/integration -v -m "integration and not concurrency and not migrations" --junitxml=api-integration.xml
@@ -128,45 +165,110 @@ jobs:
       - name: Migration roundtrips on the separate disposable database
         run: uv run pytest apps/api/tests/integration/test_migrations.py -v --junitxml=api-migrations.xml
 
-      - name: Guard - integration tests must not have been skipped
-        # A skip is NOT a database acceptance check. Parsing the JUnit XML (not
-        # grepping it) avoids `set -o pipefail` failing when there is nothing to
-        # match, and counts real elements rather than lines.
+      - name: HTTP API behaviour (in-process ASGI client, real PostgreSQL)
+        # `api` covers auth, push, pull, snapshot and the read endpoints. The
+        # concurrency and transport proofs have their own groups below, so this
+        # step is the deterministic, sequential tier.
+        run: uv run pytest apps/api/tests/api -v -m "api and not api_concurrency and not transport" --junitxml=api-http.xml
+
+      - name: HTTP API concurrency proofs (independent PostgreSQL connections)
+        # Dense sequence allocation over HTTP, pull during push, the N+1
+        # invisibility rule, the snapshot's REPEATABLE READ view, one winner for a
+        # concurrently replayed refresh token (R1) and one account for a
+        # concurrently registered address.
+        run: uv run pytest apps/api/tests/api -v -m api_concurrency --junitxml=api-http-concurrency.xml
+
+      - name: HTTP transport proofs (real TCP socket served by uvicorn)
+        # A disconnect is only real over a socket: these cases reset a TCP
+        # connection mid-batch and prove what was committed, never claiming a
+        # rollback. ASGITransport cannot produce one, so it is not used here.
+        run: uv run pytest apps/api/tests/api -v -m transport --junitxml=api-transport.xml
+
+      - name: Guard - every PostgreSQL and HTTP group ran, passed, and skipped nothing
+        # A skip is NOT an acceptance check. Parsing the JUnit XML (not grepping
+        # it) avoids `set -o pipefail` failing when there is nothing to match, and
+        # counts real elements rather than lines.
         run: |
           uv run python - <<'PY'
           import sys
           import xml.etree.ElementTree as ET
 
-          try:
-              required = {
-                  "api-integration.xml": {
-                      "test_create_folder_writes_rev1_and_one_event",
-                      "test_note_can_share_a_uuid_with_the_folder_it_lives_in",
-                  },
-                  "api-concurrency.xml": {
-                      "test_eight_producers_allocate_a_dense_sequence",
-                      "test_same_op_from_many_connections_writes_once",
-                      "test_cas_race_has_exactly_one_winner",
-                      "test_ledger_backstop_returning_false_replays_the_recorded_result",
-                      "test_three_connection_visibility_then_commit",
-                      "test_three_connection_visibility_then_rollback_reuses_the_seq",
-                      "test_lost_commit_ack_is_durable_and_retry_replays",
-                  },
-                  "api-migrations.xml": {
-                      "test_full_round_trip_and_reapply",
-                      "test_alembic_check_reports_no_diff",
-                  },
-              }
-              for path, names in required.items():
+          # Names are the load-bearing cases from the phase 3 prompt; an
+          # equivalently named case is acceptable but the *set* below must be
+          # present in the report, or the group silently shrank.
+          required = {
+              "api-unit.xml": set(),
+              "api-integration.xml": {
+                  "test_create_folder_writes_rev1_and_one_event",
+                  "test_note_can_share_a_uuid_with_the_folder_it_lives_in",
+                  "test_statement_timeout_real_57014",
+              },
+              "api-concurrency.xml": {
+                  "test_eight_producers_allocate_a_dense_sequence",
+                  "test_same_op_from_many_connections_writes_once",
+                  "test_cas_race_has_exactly_one_winner",
+                  "test_ledger_backstop_returning_false_replays_the_recorded_result",
+                  "test_three_connection_visibility_then_commit",
+                  "test_three_connection_visibility_then_rollback_reuses_the_seq",
+                  "test_lost_commit_ack_is_durable_and_retry_replays",
+                  "test_lock_timeout_metrics",
+                  "test_cancel_before_commit_rolls_back_and_propagates",
+                  "test_cancel_during_commit_is_cancelled_and_discards_the_connection",
+              },
+              "api-migrations.xml": {
+                  "test_full_round_trip_and_reapply",
+                  "test_alembic_check_reports_no_diff",
+              },
+              "api-http.xml": {
+                  "test_refresh_rotates_the_pair_once",
+                  "test_workspace_access_denies_non_members_with_not_found",
+                  "test_http_push_six_statuses_are_wire_contract",
+                  "test_http_push_per_op_failure_is_an_error_object_not_a_code",
+                  "test_http_push_per_op_membership_loss_is_not_found",
+                  "test_http_push_duplicate_op_id_executes_nothing",
+                  "test_http_push_caps_reject_the_whole_batch",
+                  "test_http_push_lock_timeout_stops_the_batch",
+                  "test_http_push_unknown_is_retried_by_the_same_op_id",
+                  "test_http_push_prebuild_catches_what_the_schema_cannot",
+                  "test_http_push_structural_batch_errors_reject_everything",
+                  "test_http_push_unhashable_discriminator_is_a_400",
+                  "test_http_push_repr_never_leaks_note_content",
+                  "test_id_conflict_origin_hidden",
+                  "test_secrets_never_echo",
+                  "test_pull_since_is_exclusive_and_cursor_chains",
+                  "test_pull_cursor_bounds_and_floor",
+                  "test_pull_objects_are_deduplicated_and_lead_their_events",
+                  "test_snapshot_has_no_partial_success",
+                  "test_snapshot_bootstraps_from_one_watermark",
+                  "test_tree_and_note_reads_hide_content_and_deletions",
+                  "test_a_legacy_oversize_body_is_refused_by_both_reads",
+              },
+              "api-http-concurrency.xml": {
+                  "test_http_push_dense_seq",
+                  "test_http_pull_during_push",
+                  "test_pull_cannot_observe_n_plus_one_first",
+                  "test_snapshot_is_one_rr_view",
+                  "test_concurrent_refresh_same_token_has_one_winner",
+                  "test_concurrent_registration_of_one_address_creates_one_account",
+              },
+              "api-transport.xml": {
+                  "test_socket_disconnect_stops_batch",
+                  "test_commit_survives_a_lost_response",
+                  "test_the_probe_serves_http_on_a_real_socket",
+              },
+          }
+          for path, names in required.items():
+              try:
                   cases = list(ET.parse(path).getroot().iter("testcase"))
-                  rejected = [c for c in cases if any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
-                  missing = names - {c.attrib.get("name") for c in cases}
-                  print(f"{path}: tests={len(cases)} rejected={len(rejected)} missing={sorted(missing)}")
-                  if not cases or rejected or missing:
-                      raise ValueError(f"PostgreSQL acceptance incomplete: {path}")
-          except (OSError, ET.ParseError, ValueError) as exc:
-              print(f"::error::{exc}")
-              sys.exit(1)
+              except (OSError, ET.ParseError) as exc:
+                  print(f"::error::{path}: {exc}")
+                  sys.exit(1)
+              rejected = [c for c in cases if any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
+              missing = names - {c.attrib.get("name") for c in cases}
+              print(f"{path}: tests={len(cases)} rejected={len(rejected)} missing={sorted(missing)}")
+              if not cases or rejected or missing:
+                  print(f"::error::acceptance incomplete: {path}")
+                  sys.exit(1)
           PY
 
       - name: Alembic upgrade head (documented repo-root command)
@@ -186,9 +288,10 @@ jobs:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: uv run alembic -c apps/api/alembic.ini check
 
-      - name: Verify exactly the Phase 2 domain tables exist
-        # Inspect the real catalog; no attachment/revision/outbox tables belong
-        # to this phase. Detailed constraints are verified by PostgreSQL tests.
+      - name: Verify exactly the Phase 3 domain tables exist
+        # Inspect the real catalog; the ten domain tables of phases 2-3 (kernel
+        # six + auth four) and nothing else. Detailed constraints are verified by
+        # PostgreSQL tests.
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: |
@@ -223,11 +326,25 @@ jobs:
               tables = [row["tablename"] for row in rows]
               print(f"tables after 'upgrade head': {tables}")
 
-              expected = {"alembic_version", "users", "workspaces", "folders", "notes", "change_events", "op_ledger"}
+              expected = {
+                  "alembic_version",
+                  # phase 2 kernel
+                  "users",
+                  "workspaces",
+                  "folders",
+                  "notes",
+                  "change_events",
+                  "op_ledger",
+                  # phase 3 auth
+                  "auth_sessions",
+                  "auth_access_tokens",
+                  "auth_refresh_tokens",
+                  "workspace_members",
+              }
               if set(tables) != expected:
                   print(f"::error::schema mismatch: expected {sorted(expected)}, got {tables}")
                   return 1
-              print("OK: Phase 2 schema applied, exactly six domain tables")
+              print("OK: Phase 3 schema applied, exactly ten domain tables")
               return 0
 
 
@@ -240,15 +357,19 @@ jobs:
           DATABASE_URL: ${{ env.TEST_MIGRATION_DATABASE_URL }}
         run: uv run alembic -c apps/api/alembic.ini downgrade base
 
-      - name: Upload integration test report
+      - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: api-integration-report
+          name: api-test-reports
           path: |
+            api-unit.xml
             api-integration.xml
             api-concurrency.xml
             api-migrations.xml
+            api-http.xml
+            api-http-concurrency.xml
+            api-transport.xml
           if-no-files-found: warn
           retention-days: 7
 
@@ -365,7 +486,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=revnote-api
-            org.opencontainers.image.description=Revnote API scaffold (liveness endpoints only)
+            org.opencontainers.image.description=Revnote API (auth + native sync v1)
 
       - name: Build and push
         uses: docker/build-push-action@v7

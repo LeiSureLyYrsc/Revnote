@@ -2,7 +2,7 @@
 
 Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 API；Joplin Server 协议仅是后续兼容适配器，非 Data API、非产品主路径。
 
-**当前不是完整同步产品。** Phase 2 增加六表与 Python 内核事务写入口；没有业务 HTTP、认证或附件业务，Web 未接入内核。编辑器仍仅使用内存，刷新即丢失。API 可达不代表正文已保存。
+**当前不是完整同步产品。** Phase 3 在事务内核上提供认证与原生 HTTP push/pull/snapshot、只读 API；Web 尚未接入这些业务接口，编辑器仍仅使用内存，刷新即丢失。API 可达不代表 Web 正文已保存。附件与完整部署不在本阶段范围内。
 
 当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/MinIO 的镜像拉取与运行也尚未完成验收，详见下文限制。
 
@@ -13,10 +13,12 @@ Python 3.12+、FastAPI、uv、SQLAlchemy 2.x async、asyncpg、Alembic；仅 Pos
 Web：Vite、React 19、TypeScript、TanStack Router/Query、Tailwind CSS v4、TipTap。
 
 ```text
-apps/api/                 FastAPI、六表/迁移、Kernel/service、PG测试、Dockerfile
+apps/api/                 FastAPI、认证/同步内核、迁移、PG/HTTP测试、Dockerfile
 apps/web/                 暗色三栏、空TipTap、API状态与开发代理
 docs/plan-scaffold.md      已确认计划、领域表草图及P0不变量
 docs/plan-phase2.md        Phase 2 已确认领域模型与事务写路径契约
+docs/plan-phase3.md        Phase 3 锁定计划、迁移与验收责任
+docs/phase3-sync-api-spec.md 原生 HTTP API v1 协议
 docs/build-conventions.md Build补充约定
 .github/workflows/        检查与Actions→GHCR
 docker-compose.yml        官方PostgreSQL、MinIO、一次性私有建桶
@@ -24,7 +26,7 @@ pyproject.toml / uv.lock   根Python workspace与唯一锁文件
 pnpm-workspace.yaml       Web workspace，根pnpm锁文件
 ```
 
-Phase 2 范围见 [内核计划](docs/plan-phase2.md)。`0001_baseline` 保持原空基线，`0002_sync_kernel_core` 创建且只创建 `users/workspaces/folders/notes/change_events/op_ledger`。不使用 `create_all()`。
+Phase 2 范围见 [内核计划](docs/plan-phase2.md)。`0001_baseline` 保持原空基线，`0002_sync_kernel_core` 创建六张内核表；`0003_auth_sessions_members` 扩展 users 并新增 auth_sessions/auth_access_tokens/auth_refresh_tokens/workspace_members，总计十张领域表。所有 schema 来自 Alembic，不使用 `create_all()`。
 
 ## 前置条件
 
@@ -70,7 +72,7 @@ uv run --package revnote-api --env-file .env alembic -c apps/api/alembic.ini upg
 uv run --package revnote-api --env-file .env alembic -c apps/api/alembic.ini current
 ```
 
-不要重复执行 `alembic init`。升级 head 会建立 Phase 2 六表；降到 `0001_baseline` 会删除六表及其数据，不得在日常开发库或生产库自动降级。
+不要重复执行 `alembic init`。升级 head 会建立 Phase 3 十表并回填旧 workspace 的 owner member；旧用户 password_hash=NULL，不能本地密码登录。旧邮箱按 lower(btrim(email)) 碰撞时迁移明确失败，不合并账号。0003→0002 保留原笔记/事件，但删除认证数据；降到 `0001_baseline` 会删除所有领域表及其数据，不得在日常开发库或生产库自动降级。
 
 ### 启动 API 与 Web
 
@@ -116,7 +118,19 @@ Remove-Item Env:TEST_MIGRATION_DATABASE_URL
 Remove-Item Env:REQUIRE_POSTGRES_TESTS
 ```
 
-两库须事先存在且相互独立，均必须可丢弃：普通库运行写入与并发，迁移库独占升降级。CI 或 `REQUIRE_POSTGRES_TESTS=1` 缺少任一 URL 直接失败；已配置的连接错误不能跳过。无参数的本地跳过只方便运行单元测试，**不是数据库验收通过**。不使用 SQLite 替代 PG，也不将外层测试回滚当作多连接隔离。
+两库须事先存在且相互独立，均必须可丢弃：普通库运行写入与并发，迁移库独占升降级。CI 或 `REQUIRE_POSTGRES_TESTS=1` 缺少任一 URL 直接失败；已配置的连接错误不能跳过。无 DB 时只运行 `apps/api/tests/unit`；**skip 不是验收通过**。不使用 SQLite 替代 PG，也不将外层测试回滚当作多连接隔离。
+
+### 认证与原生 API
+
+协议和示例见 [API v1 规格](docs/phase3-sync-api-spec.md)，OpenAPI 在 `/docs` 与 `/openapi.json`。注册默认关闭；开发环境可在 .env 显式设 `AUTH_REGISTRATION_OPEN=true`，重启 API 后使用 `/api/v1/auth/register` 原子创建账号和默认 workspace（不自动登录），再 `/auth/login` 获取 token pair。
+
+密码为 **8–256 字符、UTF-8≤1024 字节**，不 trim/截断，Argon2id（64 MiB/time3/parallelism4）。opaque access 默认600s；refresh轮换，session绝对30d、不续期。旧refresh复用会撤销整个session，已签发access也立即失效；客户端应串行刷新并安全存储token，不放URL或日志。
+
+业务请求带 `Authorization: Bearer <access>`。写入仅走 `/api/v1/workspaces/{workspace_id}/sync/push`，每批1–50op、JSON≤2MiB、body_md≤256KiB，每op独立事务、按顺序执行。须逐项处理 applied/replayed/conflict/rejected/unknown/not_attempted；收到unknown或丢失响应时保留同一op_id与payload重试。
+
+pull的since为排他十进制字符串（默认0），保留完整事件并独立去重objects；snapshot单RR事务、不分页，默认最多10,000对象/16MiB，超限409 snapshot_too_large（本阶段大workspace无法bootstrap的已知限制）。先snapshot取得as_of_seq，再pull since=as_of_seq。tree不含正文，note端点返回授权笔记正文。所有seq/rev/cursor使用十进制字符串，避免JavaScript精度损失。
+
+通用错误信封含code/message/request_id/retryable/details；非成员与不存在workspace统一404。合法X-Request-ID原样回传，非法替换。CORS默认空列表、无cookie凭据；真实限流尚未实现，公网部署必须另行配置防护。
 
 浏览器冒烟：
 
@@ -128,6 +142,7 @@ Remove-Item Env:REQUIRE_POSTGRES_TESTS
 
 ### 当前验收与限制
 
+- Phase 3 本地完整验收 **1157 passed、0 skipped、0 failed**；HTTP普通／并发／真实传输组分别64／6／3项，所有组no-skip及承重用例守卫通过。逐提交和命令证据见 [验收记录](docs/phase3-validation.md)；以下脚手架/Phase 2 数字为历史基线，不代替当前验收，远端CI以最终实际运行记录为准。
 - 已用仓库外临时 Playwright 环境实测：真实 API→Vite 代理、桌面三栏、Markdown 输出、刷新清空、API 停止/恢复、无效 JSON 拒绝、390px 栏位切换与内存内容保留，无浏览器运行时错误。没有给仓库加入 E2E 平台依赖。
 - 脚手架阶段已完成 API 56 项测试、Web lint/typecheck/build、7 项 Markdown 检查，并由 [Actions #40777468266](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/40777468266) 验证 API/Web/GHCR 全绿；这是历史版本证据，不替代 Phase 2 验收。
 - Phase 2 schema 提交 `fa99b83` 前，对精确暂存快照完成锁定安装、Ruff、105 项单元测试及 29 项真实 PostgreSQL 迁移测试（无 skip），`alembic check` 无差异，原基线仅版本表、新 head 恰好六张领域表。
@@ -158,7 +173,7 @@ gh run watch <run-id> --exit-status
 gh run view <run-id> --log-failed
 ```
 
-镜像只在 Actions 构建，本地不做替代构建。镜像文件不等于完整生产部署：TLS、代理、认证、密钥、备份和运维仍未实现。
+镜像只在 Actions 构建，本地不做替代构建。镜像文件不等于完整生产部署：TLS、生产反向代理、token安全存储、备份、真实限流和运维仍需配置。
 
 ## 停止与常见故障
 
@@ -174,8 +189,8 @@ gh run view <run-id> --log-failed
 
 Phase 2 只做工作区锁分配 seq、对象/事件/成功账本同事务、DB 唯一 op_id 幂等、rev/CAS、软删除和树移动。Python 命令由调用方提供 entity_id/op_id；修改 base_rev 或业务内容需新 op_id。重放返回首次事件的结果，不能取当前对象冒充旧版本。
 
-新 op 修改/移动/再删已删对象返回 `EntityDeleted`，原删除 op 重放仍返回原结果。非空文件夹拒绝删除；子树移动只更新根并发一条 move 事件，不批量修改后代。合法无值变化更新也递增 rev/seq。跨工作区约束不等于用户授权；仍没有认证。
+新 op 修改/移动/再删已删对象返回 `EntityDeleted`，原删除 op 重放仍返回原结果。非空文件夹拒绝删除；子树移动只更新根并发一条 move 事件，不批量修改后代。合法无值变化更新也递增 rev/seq。HTTP层校验认证和workspace_members，push每op前重查；内核跨workspace约束仍不等于身份授权。
 
-Kernel 内 seq/rev 保持整数，未来对外 JSON 使用十进制字符串。`min_retained_seq` 本阶段固定占位、不推进、不清理；延迟 event FK 和 ledger 会限制未来事件清理，清理策略必须协调引用与幂等窗口。提交确认丢失返回 `CommitOutcomeUnknown`，不能当作已回滚，应使用原 op_id 重试确认。
+Kernel 内 seq/rev 保持整数，对外 JSON 使用十进制字符串。`min_retained_seq` 默认1，不推进、不清理；过期条件since<min_retained_seq-1。延迟event FK和ledger限制未来事件清理，清理策略必须协调引用与幂等窗口。写入顺序及取消/超时语义见 [内核补充](docs/phase2-sync-kernel-spec.md)。不shield业务COMMIT，提交期间取消或确认丢失不能当作回滚，应同op_id+payload重试确认；可疑连接invalidate。
 
-仍未实现：同步读取/推拉协议、客户端队列、独立服务端 Outbox、三方合并、冲突副本、MinIO 附件、搜索、E2EE、认证及 Joplin 桥。预签名 PUT 不天然防覆盖，HEAD/ETag 不等于 SHA-256；这些后续另行设计，不扩入本阶段。
+仍未实现：Web业务接入、客户端队列、独立服务端Outbox、三方合并、冲突副本、MinIO附件、搜索、E2EE及Joplin桥。预签名PUT不天然防覆盖，HEAD/ETag不等于SHA-256；这些后续另行设计，不扩入本阶段。

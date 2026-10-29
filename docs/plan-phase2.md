@@ -116,7 +116,7 @@ hash：带hash_schema_version，包含workspace/type/id/op/base_rev和全部业�
 service接session factory，每调用独立AsyncSession，READ COMMITTED，自己拥有一个事务，不与session_scope双重提交，不共享并发session。
 
 1. 锁外结构校验与hash。
-2. BEGIN；SELECT workspace FOR UPDATE，先于任何业务行锁。
+2. BEGIN；固定READ COMMITTED并SET LOCAL lock_timeout=5s、statement_timeout=10s（Phase3 P2补充）；SELECT workspace FOR UPDATE，先于任何业务行锁。
 3. 查ledger：同hash→由result_seq事件重建结果（早于CAS）；异hash→OpIdConflict。
 4. workspace限定读取实体/父节点；校验存在、deleted、base_rev、循环/非空。
 5. 检查BIGINT溢出，seq=last_seq+1更新工作区。
@@ -130,6 +130,8 @@ service接session factory，每调用独立AsyncSession，READ COMMITTED，自�
 新op错误优先级：结构→工作区→ledger→实体存在→deleted→base_rev→父/树业务校验→分号写。合法no-op也发事件。删除soft标记+rev/seq，不物理删；原delete重放稳定，新op再删EntityDeleted；非空folder拒绝，无恢复、无ID复用。目标parent必须同ws且活动；树检查在ws锁内。
 
 失败在提交前整事务回滚，不留对象/event/ledger/last_seq变化。RevConflict/OpIdConflict/业务错误不自动重试；超时可原命令重试，不加隐藏无限重试。COMMIT确认丢失不等于回滚：CommitOutcomeUnknown，调用方保留原op_id确认结果。锁内不作网络、格式转换、日志正文或外部服务。
+
+Phase3 P2补充：57014/55P03确认失败映射WriteBusy，锁等待指标在finally包含超时/取消/缺失工作区路径。不shield业务COMMIT；CancelledError原样上抛，提交期间取消按unknown处理，可疑连接async invalidate而非归还池。HTTP断开也不证明回滚，客户端保留同op_id+同payload重试。新execute_with_outcome仅额外标记applied/replayed，原execute/WriteResult不变，详见[Phase3计划](plan-phase3.md)。
 
 ## 7. 迁移与保留边界
 

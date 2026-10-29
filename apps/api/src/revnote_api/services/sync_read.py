@@ -55,17 +55,17 @@ What the guard is, and what it is not
     backend real memory to measure, up to roughly its decompressed size. That is
     accepted: the read is bounded in *result* size and does not grow with the number
     of rows considered (the page is limited before sizing), so a pathological row
-    costs one measurement, not an unbounded query. A deployment that must cap
-    backend memory per statement already has ``DB_STATEMENT_TIMEOUT_MS``, which turns
-    a runaway measurement into a cancelled statement rather than a hung request.
+    costs one measurement rather than loading the entire event history. Write-only
+    ``DB_STATEMENT_TIMEOUT_MS`` is not applied to these reads and is not a memory
+    limit; deployment-level read/resource limits require separate configuration.
 
     An earlier revision tried ``octet_length(left(body_md, n))`` to bound the
     detoast. That was wrong: ``left``/``substr`` on pglz-compressed text does not
     guarantee partial decompression - it may detoast the whole value before slicing.
     The bound it advertised was not real, so it was removed rather than restated.
 
-Titles and folder names are measured the same way and are small by construction, so
-they cannot dominate a page. The true wire cost of the page is then re-measured on
+Titles and folder names are measured the same way; HTTP writes are bounded by the
+raw JSON budget, but trusted legacy writers can exceed that. Wire cost is re-measured on
 the serialized JSON by the HTTP layer (below), which is the only figure that includes
 escaping.
 

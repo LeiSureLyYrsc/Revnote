@@ -1,0 +1,5 @@
+export { createRepository, IndexedDbRepository } from './repository'
+export { openDatabase, StorageError, storageError } from './database'
+export { DATABASE_NAME, DATABASE_VERSION, FACT_STORES } from './schema'
+export type { LocalSchema } from './schema'
+export type { RecoveryExport } from './recovery'

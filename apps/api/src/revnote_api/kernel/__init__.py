@@ -56,7 +56,7 @@ from revnote_api.kernel.fingerprint import (
     request_hash,
 )
 from revnote_api.kernel.ids import new_entity_id, new_id, new_op_id, uuid7
-from revnote_api.kernel.results import WriteResult
+from revnote_api.kernel.results import ExecutedWrite, WriteResult
 
 __all__ = [
     "ALL_OPS",
@@ -81,6 +81,7 @@ __all__ = [
     "EntityDeleted",
     "EntityIdConflict",
     "EntityNotFound",
+    "ExecutedWrite",
     "FolderCycle",
     "FolderNotEmpty",
     "InvalidCommand",

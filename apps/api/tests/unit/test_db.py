@@ -193,6 +193,21 @@ def test_create_engine_for_url_uses_asyncpg() -> None:
     assert engine.dialect.driver == "asyncpg"
 
 
+def test_engines_hide_bound_parameters(settings: Settings) -> None:
+    """SQL echo/logging must never render a note body or a password hash.
+
+    ``hide_parameters`` is set on every engine this module builds, including the
+    one used with ``DB_ECHO=true``: statement logging is a debugging aid, not a
+    licence to print user content (plan §11.1).
+    """
+    configured = get_engine(settings)
+    throwaway = create_engine_for_url("postgresql+asyncpg://u:p@127.0.0.1:1/x")
+
+    # ``hide_parameters`` lives on the sync engine that ``AsyncEngine`` wraps.
+    assert configured.sync_engine.hide_parameters is True
+    assert throwaway.sync_engine.hide_parameters is True
+
+
 @pytest.mark.anyio
 async def test_dispose_engines_is_safe_when_never_created() -> None:
     await dispose_engines()  # must not raise

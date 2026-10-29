@@ -53,6 +53,9 @@ markers = [
     "integration: needs a real PostgreSQL server (set TEST_DATABASE_URL, else skipped)",
     "concurrency: independent PostgreSQL connections verify write invariants",
     "migrations: destructive migration roundtrips on TEST_MIGRATION_DATABASE_URL only",
+    "api: HTTP API behaviour over an in-process ASGI client",
+    "api_concurrency: HTTP API behaviour with independent PostgreSQL connections",
+    "transport: real socket / uvicorn transport behaviour (disconnects, cancellation)",
 ]
 
 # --------------------------------------------------------------------------- #

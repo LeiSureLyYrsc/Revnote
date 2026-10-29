@@ -69,11 +69,26 @@ async def test_unknown_path_is_404(client: AsyncClient) -> None:
 
 
 async def test_openapi_exposes_only_scaffold_routes(client: AsyncClient) -> None:
-    """Guardrail: the scaffold ships no business/auth/sync endpoints."""
+    """Guardrail: the contract skeleton ships with no business endpoint.
+
+    The expected set is a **precise whitelist**. ``GET /`` and ``GET /health`` are
+    the liveness routes; nothing under ``/api/v1`` may appear until the commit that
+    implements it. When an endpoint lands, its path is added here deliberately, so
+    a half-built route can never reach a published contract by accident.
+    """
     schema = (await client.get("/openapi.json")).json()
 
     assert set(schema["paths"]) == {"/", "/health"}
     assert schema["info"]["title"] == "Revnote API"
+
+    # The versioned surface is empty in this commit; the prefix itself is declared
+    # in ``api.router`` and is asserted there.
+    assert not any(path.startswith("/api/v1") for path in schema["paths"])
+
+    # The cross-cutting pieces are published even before the first v1 endpoint:
+    # a generated client gets the error shape and the bearer scheme now.
+    assert "BearerAuth" in schema["components"]["securitySchemes"]
+    assert {"ErrorBody", "ErrorEnvelope"} <= set(schema["components"]["schemas"])
 
 
 def test_create_app_is_side_effect_free(settings: Settings) -> None:

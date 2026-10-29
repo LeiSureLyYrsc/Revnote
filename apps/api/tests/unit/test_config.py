@@ -154,3 +154,171 @@ def test_masked_url_hides_password(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert "sup3rs3cret" not in settings.masked_database_url
     assert "db:5432/revnote" in settings.masked_database_url
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 settings: locked defaults
+# --------------------------------------------------------------------------- #
+
+
+def test_phase3_defaults_match_the_locked_decision_table() -> None:
+    """Every budget below is a protocol number: a silent drift is a bug."""
+    settings = Settings(_env_file=None)
+
+    # Auth (D1, D2, D6) and the locked password override: 8-256, not 15.
+    assert settings.auth_access_ttl_s == 600
+    assert settings.auth_session_ttl_s == 30 * 24 * 60 * 60
+    assert settings.auth_registration_open is False
+    assert settings.auth_password_min_chars == 8
+    assert settings.auth_password_max_chars == 256
+    # Argon2id cost recorded in the hash, so a change stays migratable.
+    assert settings.argon2_memory_kib == 65_536
+    assert settings.argon2_time_cost == 3
+    assert settings.argon2_parallelism == 4
+    assert settings.auth_hash_max_concurrency == 2
+
+    # Push (D9): 1-50 ops, 2 MiB raw JSON, 256 KiB note body, 30 s batch budget.
+    assert settings.sync_push_max_ops == 50
+    assert settings.sync_push_max_bytes == 2 * 1024 * 1024
+    assert settings.sync_note_max_bytes == 256 * 1024
+    assert settings.sync_push_budget_ms == 30_000
+
+    # Pull (D14) and snapshot (D15).
+    assert settings.sync_pull_default_limit == 100
+    assert settings.sync_pull_max_limit == 500
+    assert settings.sync_pull_max_bytes == 4 * 1024 * 1024
+    assert settings.sync_snapshot_max_objects == 10_000
+    assert settings.sync_snapshot_max_bytes == 16 * 1024 * 1024
+
+    # Timeouts (D17) and CORS.
+    assert settings.db_lock_timeout_ms == 5_000
+    assert settings.db_statement_timeout_ms == 10_000
+    assert settings.cors_allow_origins == []
+
+
+def test_lock_timeout_leaves_room_for_a_configured_statement_timeout() -> None:
+    """The service constant and the config default must not contradict each other."""
+    from revnote_api.services.sync_write import LOCK_TIMEOUT_MS
+
+    settings = Settings(_env_file=None)
+
+    assert settings.db_lock_timeout_ms == LOCK_TIMEOUT_MS
+
+
+def test_the_password_minimum_is_eight_not_fifteen() -> None:
+    """The locked override: plan D7's 15 was superseded by the build prompt."""
+    settings = Settings(_env_file=None)
+
+    assert settings.auth_password_min_chars == 8
+    assert settings.auth_password_min_chars < 15
+
+
+def test_a_password_policy_below_the_hard_floor_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_PASSWORD_MIN_CHARS", "4")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_an_inverted_password_range_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH_PASSWORD_MIN_CHARS", "64")
+    monkeypatch.setenv("AUTH_PASSWORD_MAX_CHARS", "32")
+
+    with pytest.raises(ValidationError, match="MAX_CHARS"):
+        Settings(_env_file=None)
+
+
+def test_a_pull_default_above_its_ceiling_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYNC_PULL_DEFAULT_LIMIT", "600")
+
+    with pytest.raises(ValidationError, match="SYNC_PULL_DEFAULT_LIMIT"):
+        Settings(_env_file=None)
+
+
+def test_a_lock_timeout_above_the_statement_timeout_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lock wait longer than the statement budget could never be reported."""
+    monkeypatch.setenv("DB_LOCK_TIMEOUT_MS", "20000")
+
+    with pytest.raises(ValidationError, match="DB_LOCK_TIMEOUT_MS"):
+        Settings(_env_file=None)
+
+
+def test_phase3_settings_are_read_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYNC_PUSH_MAX_OPS", "10")
+    monkeypatch.setenv("AUTH_REGISTRATION_OPEN", "true")
+    monkeypatch.setenv("SYNC_PULL_DEFAULT_LIMIT", "25")
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", '["https://app.example.test"]')
+
+    settings = Settings(_env_file=None)
+
+    assert settings.sync_push_max_ops == 10
+    assert settings.auth_registration_open is True
+    assert settings.sync_pull_default_limit == 25
+    assert settings.cors_allow_origins == ["https://app.example.test"]
+
+
+def test_argon2_memory_uses_the_protocol_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan/spec spell it ``ARGON2_MEMORY_COST``; a verbatim copy must work."""
+    monkeypatch.setenv("ARGON2_MEMORY_COST", "32768")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.argon2_memory_kib == 32_768
+
+
+def test_argon2_memory_also_accepts_the_field_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The alias must not break the auto-derived name (``ARGON2_MEMORY_KIB``)."""
+    monkeypatch.delenv("ARGON2_MEMORY_COST", raising=False)
+    monkeypatch.setenv("ARGON2_MEMORY_KIB", "16384")
+
+    assert Settings(_env_file=None).argon2_memory_kib == 16_384
+
+
+def test_rate_limiting_is_declared_but_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Placeholder only: no limiter exists, so the documented default is ``false``."""
+    monkeypatch.delenv("RATE_LIMIT_ENABLED", raising=False)
+
+    assert Settings(_env_file=None).rate_limit_enabled is False
+
+
+def test_registration_is_closed_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D6: a fresh deployment has no self-service signup."""
+    monkeypatch.delenv("AUTH_REGISTRATION_OPEN", raising=False)
+
+    assert Settings(_env_file=None).auth_registration_open is False
+
+
+def test_no_auth_secret_is_declared() -> None:
+    """Opaque tokens make a signing secret unnecessary; adding one invites misuse."""
+    declared = set(Settings.model_fields)
+
+    assert not {name for name in declared if "secret" in name}
+    assert "auth_secret" not in declared
+
+
+def test_phase3_settings_repr_shows_no_credential_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Settings`` is often logged at boot; the DSN password must not be in it.
+
+    Field *names* like ``auth_password_max_chars`` are policy, not credentials;
+    what must never appear is a secret *value*.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:sup3rs3cret@db:5432/revnote")
+
+    rendered = repr(Settings(_env_file=None))
+
+    assert "sup3rs3cret" not in rendered
+    # No field carries a password/secret/token value at all.
+    credential_fields = {
+        name for name in Settings.model_fields if name.endswith(("_secret", "_password", "_token"))
+    }
+    assert credential_fields == set()

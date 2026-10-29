@@ -38,6 +38,10 @@ def create_engine_for_url(url: str, *, echo: bool = False) -> AsyncEngine:
     return create_async_engine(
         url,
         echo=echo,
+        # Even with ``echo`` off, SQLAlchemy can emit statement logs through the
+        # ``sqlalchemy.engine`` logger. Bound parameters of this service include
+        # note bodies and password hashes, so they are never rendered.
+        hide_parameters=True,
         pool_pre_ping=True,
         future=True,
     )
@@ -47,6 +51,9 @@ def _build_engine(settings: Settings) -> AsyncEngine:
     return create_async_engine(
         settings.database_url,
         echo=settings.db_echo,
+        # ``hide_parameters`` applies to ``echo=True`` as well: enabling SQL echo
+        # for debugging must not print note bodies (plan §11.1 / §14.1).
+        hide_parameters=True,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_timeout=settings.db_pool_timeout_seconds,
@@ -71,7 +78,7 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
     if _engine is not None and _engine_url == url:
         return _engine
 
-    if _engine is not None:
+    if _engine is not None and _engine_url is not None:
         logger.debug(
             "DSN changed: switching engine (%s -> %s); the old engine stays tracked until dispose",
             make_url(_engine_url).render_as_string(hide_password=True),

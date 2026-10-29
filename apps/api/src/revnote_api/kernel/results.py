@@ -15,8 +15,9 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
-__all__ = ["WriteResult"]
+__all__ = ["ExecutedWrite", "WriteDisposition", "WriteResult"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,3 +47,37 @@ class WriteResult:
             f"op_id={self.op_id}, seq={self.seq}, rev={self.rev}, "
             f"created_at={self.created_at.isoformat()})"
         )
+
+
+#: How an accepted command reached its result.
+#:
+#: ``applied``  - this call performed the write and committed it.
+#: ``replayed`` - the ``op_id`` was already recorded with the same payload, so the
+#:                recorded first result was returned and nothing was written.
+#:
+#: Deliberately a plain string literal rather than an ``Enum``: it crosses into
+#: the HTTP layer as a JSON value, and a new member would otherwise require a
+#: serialiser change on both sides.
+WriteDisposition = Literal["applied", "replayed"]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutedWrite:
+    """A :class:`WriteResult` plus how it was produced.
+
+    This is the richer outcome the sync endpoint needs in order to answer
+    ``applied`` vs ``replayed`` per op (plan §9.1). It is **additive**: the
+    original :meth:`SyncWriteService.execute` keeps returning a bare
+    :class:`WriteResult`, and :class:`WriteResult` itself is unchanged, so no
+    Phase 2 caller or invariant moves.
+
+    ``result`` is the same value object either way - a replay returns the
+    recorded first result, never a recomputed one.
+    """
+
+    result: WriteResult
+    disposition: WriteDisposition
+
+    def __repr__(self) -> str:
+        # Same rule as WriteResult: coordinates only, never content.
+        return f"ExecutedWrite(disposition={self.disposition}, result={self.result!r})"

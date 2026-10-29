@@ -27,7 +27,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -83,6 +83,75 @@ class Settings(BaseSettings):
     db_pool_timeout_seconds: float = Field(default=30.0, gt=0)
     db_pool_recycle_seconds: int = Field(default=1800, gt=0)
 
+    #: ``SET LOCAL lock_timeout`` for every kernel write transaction. On expiry
+    #: PostgreSQL raises ``55P03`` and the service reports ``WriteBusy`` with
+    #: nothing written (plan D17). Kept below the statement timeout so "the row
+    #: was busy" is distinguishable from "the statement was too slow".
+    db_lock_timeout_ms: int = Field(default=5_000, gt=0, le=60_000)
+
+    #: ``SET LOCAL statement_timeout`` for every kernel write transaction.
+    #: ``57014`` also maps to ``WriteBusy`` when it is a confirmed failure;
+    #: a lost commit acknowledgement stays ``outcome_unknown``.
+    db_statement_timeout_ms: int = Field(default=10_000, gt=0, le=300_000)
+
+    # -- auth (Phase 3) ----------------------------------------------------- #
+    #: Opaque access token lifetime (D1). Short by design: it bounds how long a
+    #: token that is *no longer accepted* could still be presented. It is **not** a
+    #: revocation grace period - every request re-checks the token, its session and
+    #: the workspace membership, so revoking a session invalidates its access tokens
+    #: immediately rather than at expiry.
+    auth_access_ttl_s: int = Field(default=600, gt=0)
+    #: Absolute session lifetime (30 days). Refreshing never extends it.
+    auth_session_ttl_s: int = Field(default=2_592_000, gt=0)
+    #: Closed by default: a fresh deployment has no self-service signup (D6).
+    auth_registration_open: bool = False
+    #: Password length policy. The locked override is 8-256 characters; UTF-8 is
+    #: additionally capped at 1024 bytes (never trimmed or truncated).
+    auth_password_min_chars: int = Field(default=8, ge=8, le=1_024)
+    auth_password_max_chars: int = Field(default=256, ge=8, le=1_024)
+    #: Argon2id cost parameters; recorded in the hash, so a change is migratable
+    #: through ``check_needs_rehash`` rather than invalidating passwords.
+    #: ``ARGON2_MEMORY_COST`` is the protocol name (plan §7); the field reads in
+    #: KiB because that is the unit Argon2 itself takes. Both spellings are
+    #: accepted so an operator copying the plan verbatim works.
+    argon2_memory_kib: int = Field(
+        default=65_536,
+        ge=8_192,
+        validation_alias=AliasChoices("ARGON2_MEMORY_COST", "ARGON2_MEMORY_KIB"),
+    )
+    argon2_time_cost: int = Field(default=3, ge=1)
+    argon2_parallelism: int = Field(default=4, ge=1)
+    #: Hashing is CPU-bound: cap concurrent hashes so a login burst cannot
+    #: starve the event loop. A resource guard, not a brute-force defence.
+    auth_hash_max_concurrency: int = Field(default=2, ge=1)
+
+    # -- sync (Phase 3) ----------------------------------------------------- #
+    #: A push carries 1-50 ops (D9).
+    sync_push_max_ops: int = Field(default=50, ge=1)
+    #: Raw JSON body budget for a push request (D9: 2 MiB).
+    sync_push_max_bytes: int = Field(default=2_097_152, ge=1_024)
+    #: HTTP-layer note body budget (D9). The kernel's own CHECK is untouched.
+    sync_note_max_bytes: int = Field(default=262_144, ge=1)
+    #: Wall-clock budget for one push batch, checked **between** ops only (D17).
+    sync_push_budget_ms: int = Field(default=30_000, ge=1)
+    #: Pull page size: default and ceiling (D14).
+    sync_pull_default_limit: int = Field(default=100, ge=1)
+    sync_pull_max_limit: int = Field(default=500, ge=1)
+    #: Approximate pull response budget (D14: ~4 MiB).
+    sync_pull_max_bytes: int = Field(default=4_194_304, ge=1_024)
+    #: Full-bootstrap limits: one ``REPEATABLE READ`` view, no pagination (D15).
+    sync_snapshot_max_objects: int = Field(default=10_000, ge=1)
+    sync_snapshot_max_bytes: int = Field(default=16_777_216, ge=1_024)
+
+    # -- HTTP cross-cutting ------------------------------------------------- #
+    #: Explicit origins only; empty means no CORS headers at all. CORS is not
+    #: an authorization mechanism - credentials are never allowed.
+    cors_allow_origins: list[str] = Field(default_factory=list)
+    #: Reserved switch. Nothing enforces it in this phase: a real limiter needs
+    #: shared state (Redis) that v1 deliberately does not have. Declared here so
+    #: the name in the plan/spec is not invented later by someone else.
+    rate_limit_enabled: bool = False
+
     # -- dev server (used by ``uv run revnote-api``) ------------------------ #
     server_host: str = "127.0.0.1"
     server_port: int = Field(default=8000, ge=1, le=65_535)
@@ -112,10 +181,39 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL must include a database name")
         return raw
 
+    @model_validator(mode="after")
+    def _validate_cross_field_invariants(self) -> Settings:
+        """Refuse configurations whose numbers would contradict each other."""
+        if self.auth_password_max_chars < self.auth_password_min_chars:
+            raise ValueError(
+                "AUTH_PASSWORD_MAX_CHARS must be greater than or equal to AUTH_PASSWORD_MIN_CHARS"
+            )
+        if self.sync_pull_default_limit > self.sync_pull_max_limit:
+            raise ValueError("SYNC_PULL_DEFAULT_LIMIT must not exceed SYNC_PULL_MAX_LIMIT")
+        if self.db_lock_timeout_ms > self.db_statement_timeout_ms:
+            raise ValueError("DB_LOCK_TIMEOUT_MS must not exceed DB_STATEMENT_TIMEOUT_MS")
+        return self
+
     @property
     def masked_database_url(self) -> str:
         """DSN with the password hidden — safe to log."""
         return make_url(self.database_url).render_as_string(hide_password=True)
+
+    def __repr__(self) -> str:
+        """Field list with the DSN password masked.
+
+        pydantic's generated ``repr`` prints ``database_url`` verbatim, i.e. with
+        the password, and a settings object is exactly the thing people log at
+        boot ("effective configuration"). Masking here means an accidental
+        ``logger.info(settings)`` cannot leak a credential.
+        """
+        fields = ", ".join(
+            f"{name}={self.masked_database_url!r}"
+            if name == "database_url"
+            else f"{name}={getattr(self, name)!r}"
+            for name in type(self).model_fields
+        )
+        return f"Settings({fields})"
 
 
 @lru_cache(maxsize=1)

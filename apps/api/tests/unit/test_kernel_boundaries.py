@@ -164,17 +164,41 @@ def test_service_takes_a_session_factory_positionally() -> None:
 
 
 def test_service_has_exactly_one_async_entry_point() -> None:
-    expected = {"execute", "write", "_run", "_replay_after_race", "_commit"}
+    expected = {
+        "execute",
+        "write",
+        "execute_with_outcome",
+        "_run",
+        "_replay_after_race",
+        "_commit",
+        "_lock_workspace",
+    }
     public_async = {
         name
         for name, member in inspect.getmembers(SyncWriteService, inspect.isfunction)
         if inspect.iscoroutinefunction(member) and not name.startswith("_")
     }
 
-    assert public_async == {"execute", "write"}
+    # One write entry point, plus the one approved exception (plan §9.1/§12.1):
+    # ``execute_with_outcome`` returns the same result enriched with
+    # applied/replayed. It is the implementation; ``execute`` is its projection,
+    # so both spellings share a single code path rather than a second one.
+    assert public_async == {"execute", "write", "execute_with_outcome"}
     # ``write`` is the same coroutine, so both spellings are one entry point.
     assert SyncWriteService.write is SyncWriteService.execute
     assert expected <= set(dir(SyncWriteService))
+
+
+def test_outcome_entry_point_is_the_implementation_execute_projects() -> None:
+    """``execute`` must delegate to ``execute_with_outcome``, not duplicate it."""
+    source = inspect.getsource(SyncWriteService.execute)
+    other = inspect.getsource(SyncWriteService.execute_with_outcome)
+
+    assert "execute_with_outcome(" in source
+    assert "self._validate_structure(command)" in other
+    # Exactly one implementation of the write body: ``_run`` is called once.
+    assert other.count("self._run(") == 1
+    assert "self._run(" not in source
 
 
 @pytest.mark.anyio
@@ -320,22 +344,24 @@ def test_lock_timeout_is_a_bounded_constant() -> None:
     assert 0 < LOCK_TIMEOUT_MS <= 30_000
 
 
-def test_isolation_and_lock_timeout_are_pinned_per_transaction() -> None:
-    """The statements actually issued: one READ COMMITTED pin plus a bounded lock wait."""
+def test_isolation_and_timeouts_are_pinned_per_transaction() -> None:
+    """The statements actually issued: one READ COMMITTED pin plus two bounded waits."""
     isolation_sql = str(service_module._SET_READ_COMMITTED)
     lock_sql = str(service_module._SET_LOCK_TIMEOUT)
+    statement_sql = str(service_module._SET_STATEMENT_TIMEOUT)
 
     assert isolation_sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
     assert lock_sql == f"SET LOCAL lock_timeout = {LOCK_TIMEOUT_MS}"
+    assert statement_sql == f"SET LOCAL statement_timeout = {service_module.STATEMENT_TIMEOUT_MS}"
 
-    # Only these two SET statements exist in the module, so no second, silently
+    # Only these three SET statements exist in the module, so no second, silently
     # different isolation level or unbounded wait can be introduced.
     set_values = [
         str(value)
         for value in vars(service_module).values()
         if hasattr(value, "text") and str(value).startswith("SET ")
     ]
-    assert sorted(set_values) == sorted([isolation_sql, lock_sql])
+    assert sorted(set_values) == sorted([isolation_sql, lock_sql, statement_sql])
 
 
 def test_no_retry_loop_and_no_production_failpoint_hook() -> None:
@@ -376,11 +402,24 @@ def test_service_logs_categories_and_timings_but_never_content() -> None:
 
 
 def test_cancellation_is_never_wrapped() -> None:
-    """``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate untouched."""
+    """``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate untouched.
+
+    The entry point catches all three and re-raises. The commit path catches
+    ``CancelledError`` *alone* so it can invalidate the suspect connection first, and
+    then raises bare: replacing it with a kernel error would let an adapter swallow a
+    live cancellation. ``KeyboardInterrupt``/``SystemExit`` are never reinterpreted at
+    all.
+    """
     source = (SERVICES_DIR / "sync_write.py").read_text(encoding="utf-8")
 
     assert "except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):" in source
-    assert source.count("except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):") >= 2
+    # The commit path keeps its own, narrower handler plus a bare exit guard.
+    assert "except asyncio.CancelledError:" in source
+    assert "except (KeyboardInterrupt, SystemExit):" in source
+    # No cancellation is ever converted into a kernel error on the commit path.
+    commit_body = source.split("async def _commit", 1)[1]
+    assert "raise CommitOutcomeUnknown" not in commit_body
+    assert "raise WriteBusy" not in commit_body
 
 
 def test_commands_module_declares_the_eight_types() -> None:
@@ -547,6 +586,8 @@ class FakeSession:
     opens the transaction implicitly (autobegin), and ``commit``/``rollback`` are
     the only ways to end it. ``commit`` is what a test wraps to simulate a lost
     acknowledgement, exactly like the integration lane's ``CommitLoss``.
+    ``invalidate`` is recorded separately from ``close``: after an unknown commit
+    outcome the connection must be *discarded*, never merely closed and recycled.
     """
 
     def __init__(
@@ -563,6 +604,7 @@ class FakeSession:
         self.statements: list[str] = []
         self.committed = 0
         self.rolled_back = 0
+        self.invalidated = 0
         self.closed = False
         self._isolation_level = isolation_level
         self._raise_on = raise_on
@@ -592,6 +634,9 @@ class FakeSession:
 
     async def rollback(self) -> None:
         self.rolled_back += 1
+
+    async def invalidate(self) -> None:
+        self.invalidated += 1
 
     async def __aenter__(self) -> FakeSession:
         return self
@@ -725,8 +770,9 @@ async def test_create_follows_the_documented_step_order() -> None:
     statements = session.statements
     assert statements[0].startswith("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
     assert statements[1].startswith("SET LOCAL lock_timeout")
-    assert "FOR UPDATE" in statements[2] and "workspaces" in statements[2]
-    assert "FROM op_ledger" in statements[3]  # the ledger is read before any object/CAS
+    assert statements[2].startswith("SET LOCAL statement_timeout")
+    assert "FOR UPDATE" in statements[3] and "workspaces" in statements[3]
+    assert "FROM op_ledger" in statements[4]  # ledger read before any object/CAS
 
     inserts = [sql for sql in statements if sql.startswith("INSERT")]
     assert inserts[0].startswith("INSERT INTO folders")

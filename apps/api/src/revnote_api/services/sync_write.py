@@ -9,9 +9,12 @@ a successful ``COMMIT`` produces a result (plan section 6).
 The write path in order
 -----------------------
 
-1. structural validation + request hash - outside the transaction, no I/O.
+1. structural validation + request hash + timeout budgets - outside the
+   transaction, no I/O.
 2. ``BEGIN``; ``SET TRANSACTION ISOLATION LEVEL READ COMMITTED`` (the first
-   statement) and a bounded ``SET LOCAL lock_timeout``.
+   statement), then the bounded ``SET LOCAL lock_timeout`` and
+   ``SET LOCAL statement_timeout`` budgets (defaults 5 s / 10 s, injectable per
+   call through :meth:`SyncWriteService.execute_with_outcome`).
 3. ``SELECT ... FOR UPDATE`` on ``workspaces`` (always before any business row,
    and held until ``COMMIT``).
 4. ledger lookup for ``(workspace_id, op_id)`` *before* the CAS: same hash means
@@ -27,6 +30,29 @@ The write path in order
 9. complete ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` of the ledger row.
 10. ``COMMIT``; the deferred object-to-event foreign key is validated here, so no
     result exists before the database has accepted the whole write.
+
+Timeouts, cancellation and an unknown outcome
+---------------------------------------------
+Every transaction carries a bounded lock wait **and** a bounded statement budget
+(``DB_LOCK_TIMEOUT_MS`` / ``DB_STATEMENT_TIMEOUT_MS`` by default, overridable per
+call). PostgreSQL reports the first as ``55P03`` and the second as ``57014``; both
+mean *the server cancelled the statement before it produced a result*, so both map
+to :class:`WriteBusy` — nothing was committed and the identical command may be
+retried. This mapping is deliberately restricted to an error the server actually
+raised; a lost connection or a lost ``COMMIT`` acknowledgement has no SQLSTATE to
+trust and stays :class:`CommitOutcomeUnknown`.
+
+Cancellation is never converted. A :class:`asyncio.CancelledError` raised before
+``COMMIT`` unwinds normally (the session rolls back, which is a local close and not
+a claim about the server), and one that lands *during* ``COMMIT`` is re-raised
+unchanged after the connection has been invalidated: the server may have committed,
+so the caller must never treat it as a rollback, but a cancellation must also never
+be dressed up as a :class:`SyncKernelError` - an adapter that catches kernel errors
+would then swallow the cancellation and keep serving a request whose task is gone.
+There is no ``shield`` around the business ``COMMIT``: shielding would pin the task
+open past its own deadline. The **cleanup** around it is protected instead, so a
+second cancellation cannot abandon an invalidation and hand a broken protocol state
+back to the pool.
 
 The one non-retry "second attempt"
 ----------------------------------
@@ -76,34 +102,57 @@ from revnote_api.kernel.errors import (
     WriteBusy,
 )
 from revnote_api.kernel.fingerprint import command_hash
-from revnote_api.kernel.results import WriteResult
-from revnote_api.services.sync_repository import EntityRow, EventRow, SyncRepository
+from revnote_api.kernel.results import ExecutedWrite, WriteResult
+from revnote_api.services.sync_repository import (
+    EntityRow,
+    EventRow,
+    SyncRepository,
+    WorkspaceRow,
+)
 
-__all__ = ["LOCK_TIMEOUT_MS", "SyncWriteService"]
+__all__ = ["LOCK_TIMEOUT_MS", "STATEMENT_TIMEOUT_MS", "SyncWriteService"]
 
 logger = logging.getLogger(__name__)
 
-#: Bound on the workspace lock wait (plan section 11: bounded, and deliberately not
-#: a new configuration surface). On expiry PostgreSQL cancels the statement and the
-#: caller sees :class:`WriteBusy` with nothing written.
+#: Default bound on the workspace lock wait, matching ``DB_LOCK_TIMEOUT_MS``.
+#: On expiry PostgreSQL cancels the statement with ``55P03`` and the caller sees
+#: :class:`WriteBusy` with nothing written.
 LOCK_TIMEOUT_MS = 5_000
+
+#: Default bound on any single statement (and on the implicit ``COMMIT`` that
+#: flushes the deferred FK), matching ``DB_STATEMENT_TIMEOUT_MS``. On expiry
+#: PostgreSQL cancels with ``57014`` — also :class:`WriteBusy`, because the server
+#: confirmed it did not complete the statement. Kept above the lock timeout so "the
+#: row was busy" stays distinguishable from "the statement was too slow".
+STATEMENT_TIMEOUT_MS = 10_000
 
 #: Pinning isolation per transaction - rather than trusting an engine default that
 #: someone could have widened to REPEATABLE READ - is what makes the documented
 #: "after the lock wait, READ COMMITTED sees the freshly committed row" guarantee
 #: hold, which the entity/parent reads of step 5 depend on.
 _SET_READ_COMMITTED = text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+#: The two module-level statements keep the *defaults*; a call that injects its own
+#: budgets emits equivalent ``SET LOCAL`` statements built by :func:`_set_budgets`.
 _SET_LOCK_TIMEOUT = text(f"SET LOCAL lock_timeout = {int(LOCK_TIMEOUT_MS)}")
+_SET_STATEMENT_TIMEOUT = text(f"SET LOCAL statement_timeout = {int(STATEMENT_TIMEOUT_MS)}")
 
 #: Engine defaults this service accepts. ``None`` means "the driver default", which
 #: for PostgreSQL is READ COMMITTED anyway; anything wider would violate the
 #: kernel's documented isolation, so it is rejected before any write happens.
 _ACCEPTED_ENGINE_ISOLATION = frozenset({None, "READ COMMITTED"})
 
-#: SQLSTATEs meaning "nothing was written, re-send the identical command".
+#: SQLSTATEs meaning "the server cancelled this statement, nothing was written,
+#: re-send the identical command".
+#:
+#: ``57014`` (``query_canceled``) is what ``statement_timeout`` raises, and also what
+#: an operator's ``pg_cancel_backend`` raises. It is only trusted *before* a result
+#: exists (see ``_classify_commit_failure``): once the client has issued ``COMMIT``,
+#: a cancellation cannot prove the server rejected the transaction, so it is
+#: classified as unknown instead.
 _RETRYABLE_SQLSTATES = frozenset(
     {
         "55P03",  # lock_not_available - our lock_timeout fired
+        "57014",  # query_canceled - our statement_timeout fired
         "40001",  # serialization_failure
         "40P01",  # deadlock_detected
     }
@@ -136,6 +185,52 @@ class _Metrics:
 
     lock_wait_ms: float = 0.0
     category: str = "success"
+
+
+@dataclass(frozen=True, slots=True)
+class _TimeBudget:
+    """The two PostgreSQL timeouts one transaction runs under, in milliseconds.
+
+    Injected per call rather than stored on the service, so a single instance stays
+    reusable and stateless: ``execute`` uses the module defaults, while a caller
+    that owns a stricter outer deadline (the push lane's per-op slice of the batch
+    budget) passes its own values.
+    """
+
+    lock_timeout_ms: int = LOCK_TIMEOUT_MS
+    statement_timeout_ms: int = STATEMENT_TIMEOUT_MS
+
+    def statements(self) -> tuple[Any, Any]:
+        """The two ``SET LOCAL`` statements for this budget, in issue order.
+
+        The module-level statements are reused for the defaults, so the common path
+        builds nothing and the emitted SQL is byte-identical to the tested text.
+        """
+        if (self.lock_timeout_ms, self.statement_timeout_ms) == (
+            LOCK_TIMEOUT_MS,
+            STATEMENT_TIMEOUT_MS,
+        ):
+            return _SET_LOCK_TIMEOUT, _SET_STATEMENT_TIMEOUT
+        return (
+            text(f"SET LOCAL lock_timeout = {int(self.lock_timeout_ms)}"),
+            text(f"SET LOCAL statement_timeout = {int(self.statement_timeout_ms)}"),
+        )
+
+
+def _validated_budget(lock_timeout_ms: int | None, statement_timeout_ms: int | None) -> _TimeBudget:
+    """Resolve the caller's overrides, rejecting a budget PostgreSQL cannot honour.
+
+    Only positivity is checked. The lock/statement *ordering* is deliberately not
+    enforced here: a caller may reasonably inject a short statement budget to prove
+    the ``57014`` path while the lock budget stays at its default, and PostgreSQL
+    then simply reports whichever bound fires first.
+    """
+    lock = LOCK_TIMEOUT_MS if lock_timeout_ms is None else lock_timeout_ms
+    statement = STATEMENT_TIMEOUT_MS if statement_timeout_ms is None else statement_timeout_ms
+    for name, value in (("lock_timeout_ms", lock), ("statement_timeout_ms", statement)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise InvalidCommand(f"{name} must be a positive integer number of milliseconds")
+    return _TimeBudget(lock_timeout_ms=lock, statement_timeout_ms=statement)
 
 
 def _sqlstate(exc: BaseException) -> str:
@@ -290,26 +385,70 @@ class SyncWriteService:
         Safe to retry with the identical command on :class:`WriteBusy` and
         :class:`CommitOutcomeUnknown`. Every other error means the command was
         rejected and nothing was committed.
+
+        This signature and return type are the Phase 2 contract and do not change.
+        Callers that need to know whether *this* call wrote or replayed, or that
+        must impose their own timeout budget, use :meth:`execute_with_outcome`.
+        """
+        executed = await self.execute_with_outcome(command)
+        return executed.result
+
+    async def execute_with_outcome(
+        self,
+        command: Command,
+        *,
+        lock_timeout_ms: int | None = None,
+        statement_timeout_ms: int | None = None,
+    ) -> ExecutedWrite:
+        """Apply ``command`` and report the result **plus** how it was produced.
+
+        The write path, the transaction boundaries, the replay rule and every
+        error are identical to :meth:`execute` - this method is the real
+        implementation and ``execute`` is its projection, so the two can never
+        drift. What it adds is one bit of information the HTTP layer needs and the
+        kernel deliberately does not store in a result: whether this call
+        committed a new write (``applied``) or returned a recorded first result
+        (``replayed``).
+
+        ``lock_timeout_ms`` / ``statement_timeout_ms`` override the bounded
+        ``SET LOCAL`` budgets for **this call only**; ``None`` means the module
+        default. They are keyword-only and optional, so every existing call site
+        keeps working, and they touch nothing but the two ``SET LOCAL`` statements:
+        no fingerprint, seq allocation, CAS, ledger or object rule depends on them.
+
+        The disposition is carried in the **return value**, never on the service:
+        a service instance stays reusable and holds no per-call state. It is also
+        not a retry signal - ``replayed`` means the ``op_id`` had already been
+        accepted with exactly this payload, which is precisely what makes a
+        client's retry-after-unknown-outcome safe.
         """
         self._validate_structure(command)
+        budget = _validated_budget(lock_timeout_ms, statement_timeout_ms)
         metrics = _Metrics()
         started = time.perf_counter()
         try:
             try:
-                return await self._run(command, metrics)
+                return await self._run(command, metrics, budget)
             except _LedgerRace:
                 metrics.category = "replayed_after_race"
-                return await self._replay_after_race(command)
+                return await self._replay_after_race(command, metrics, budget)
         except SyncKernelError as exc:
             metrics.category = type(exc).__name__
             raise
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            # Cancellation is never wrapped or reclassified (plan section 6).
-            metrics.category = "cancelled"
+            # Cancellation is never wrapped or reclassified (plan section 6). A more
+            # specific category (e.g. an interrupted COMMIT) is kept: it is the one
+            # diagnostic that distinguishes "cancelled before writing" from "cancelled
+            # while the commit was on the wire".
+            if metrics.category == "success":
+                metrics.category = "cancelled"
             raise
         except Exception as exc:  # translated, never swallowed
-            metrics.category = "StorageFailure"
-            raise self._as_storage_failure(exc, command) from exc
+            failure = self._as_storage_failure(exc, command)
+            # Log the *contract* outcome, not the generic bucket: a lock/statement
+            # timeout is a WriteBusy and an operator must be able to see that.
+            metrics.category = type(failure).__name__
+            raise failure from exc
         finally:
             logger.info(
                 "sync_write category=%s entity_type=%s op=%s "
@@ -327,19 +466,21 @@ class SyncWriteService:
     # ------------------------------------------------------------------ #
     # the candidate transaction
     # ------------------------------------------------------------------ #
-    async def _run(self, command: Command, metrics: _Metrics) -> WriteResult:
+    async def _run(
+        self,
+        command: Command,
+        metrics: _Metrics,
+        budget: _TimeBudget | None = None,
+    ) -> ExecutedWrite:
         request_hash = command_hash(command)
         async with self._session_factory() as session:
             self._check_engine_isolation(session)
             try:
-                await session.execute(_SET_READ_COMMITTED)
-                await session.execute(_SET_LOCK_TIMEOUT)
+                await self._apply_budgets(session, budget or _TimeBudget())
                 repository = SyncRepository(session)
 
                 # -- step 3: workspace lock, before any business row -------- #
-                lock_started = time.perf_counter()
-                workspace = await repository.lock_workspace(command.workspace_id)
-                metrics.lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
+                workspace = await self._lock_workspace(repository, command, metrics)
                 if workspace is None:
                     raise WorkspaceNotFound(command.workspace_id)
 
@@ -350,7 +491,7 @@ class SyncWriteService:
                     # The workspace lock is held and nothing was written: end the read
                     # transaction explicitly rather than letting ``close()`` decide.
                     await self._end_read_only(session)
-                    return replayed
+                    return ExecutedWrite(result=replayed, disposition="replayed")
 
                 # -- step 5: business rules (all inside the lock) ---------- #
                 current: EntityRow | None = None
@@ -427,34 +568,96 @@ class SyncWriteService:
                 )
 
                 # -- step 10: COMMIT; the deferred FK is validated here ---- #
-                await self._commit(session, command)
+                await self._commit(session, command, metrics)
                 metrics.category = "committed"
-                return result
+                return ExecutedWrite(result=result, disposition="applied")
             except BaseException:
-                # Release local transaction state. After an unknown COMMIT outcome,
-                # rollback cannot undo a transaction the server already committed;
-                # the original CommitOutcomeUnknown must still reach the caller.
-                with contextlib.suppress(Exception):
+                # Local cleanup only. A rollback here cannot undo a transaction the
+                # server already committed, so it is never reported as one; after an
+                # unknown outcome the connection has already been discarded and this
+                # is a no-op. ``CancelledError`` is suppressed around the cleanup so a
+                # cancelled task surfaces *its* cancellation, not the cleanup's.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
                     await session.rollback()
                 raise
 
-    async def _commit(self, session: AsyncSession, command: Command) -> None:
+    async def _commit(
+        self,
+        session: AsyncSession,
+        command: Command,
+        metrics: _Metrics,
+    ) -> None:
         """``COMMIT`` with an honest classification of its failure modes.
 
         ``AsyncSession.commit`` is used (not the transaction handle) so a test can wrap
         the one and only commit call and prove durability without production growing a
         hook. Everything raised here is either "definitely rejected" (a server error
-        with a SQLSTATE) or "we do not know whether it committed" (a lost
-        acknowledgement, a dead connection). Catching broadly is deliberate: an
-        unclassified commit exception must become
+        with a SQLSTATE, e.g. the deferred FK or a cancelled statement) or "we do not
+        know whether it committed" (a lost acknowledgement, a dead connection, or a
+        cancellation that landed while the commit was in flight). Catching broadly is
+        deliberate: an unclassified commit exception becomes
         :class:`CommitOutcomeUnknown`, never an implied rollback.
+
+        There is **no** ``shield`` here: shielding the business commit would keep a
+        cancelled request alive past its deadline, which is exactly what the plan
+        forbids. The honest handling is the opposite - stop waiting, tell the caller
+        the outcome is unknown, and make sure the connection never goes back to the
+        pool.
         """
         try:
             await session.commit()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        except asyncio.CancelledError:
+            # The COMMIT request was already on the wire, so the server may well have
+            # committed; the one thing we must not do is let the caller conclude the
+            # write was rolled back. What we must also NOT do is replace the
+            # cancellation with a SyncKernelError: an adapter that maps kernel errors
+            # (`except SyncKernelError`) would then swallow a real cancellation and
+            # keep serving a request whose task is already dead.
+            #
+            # So the original CancelledError is re-raised unchanged. The connection is
+            # invalidated first, and the caller learns "unknown" from the fact that a
+            # cancellation is never a rollback (plan D18: no shield, propagate up,
+            # retry the same op_id).
+            metrics.category = "cancelled_during_commit"
+            await self._discard_connection(session)
+            raise
+        except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:  # classified below, never swallowed
-            raise _classify_commit_failure(exc, command) from exc
+            failure = _classify_commit_failure(exc, command)
+            if isinstance(failure, CommitOutcomeUnknown):
+                # No trustworthy answer from the server: the connection's state is
+                # suspect, so it is invalidated rather than returned to the pool.
+                await self._discard_connection(session)
+            raise failure from exc
+
+    @staticmethod
+    async def _discard_connection(session: AsyncSession) -> None:
+        """Invalidate a suspect connection so it can never be reused.
+
+        ``AsyncSession.invalidate`` is *awaited*: touching the sync session directly on
+        an async driver is a ``MissingGreenlet`` bug waiting to happen. It is a local
+        close that tells the pool to discard the connection instead of recycling it,
+        which is exactly what a half-finished ``COMMIT`` requires - a protocol state we
+        can no longer trust must never serve the next writer.
+
+        Only this **cleanup** is protected, never the business ``COMMIT``: the
+        transaction is already lost, and the one thing worth defending is that a
+        second cancellation cannot abandon the invalidation and quietly hand the
+        suspect connection back to the pool. Nothing about the failure is logged -
+        a discard error's cause chain can carry driver parameters, and no diagnostic
+        here is worth a leak.
+        """
+        discard = asyncio.ensure_future(session.invalidate())
+        try:
+            await asyncio.shield(discard)
+        except asyncio.CancelledError:
+            # A second cancellation must not abandon the invalidation and let the
+            # driver hand the half-committed connection back to the pool.
+            with contextlib.suppress(BaseException):
+                await discard
+        except Exception:
+            return  # already unusable; never mask the commit classification
 
     # ------------------------------------------------------------------ #
     # replay: step 4 and the uniqueness fallback of step 9
@@ -479,22 +682,35 @@ class SyncWriteService:
             )
         return self._result_from_event(command, event)
 
-    async def _replay_after_race(self, command: Command) -> WriteResult:
+    async def _replay_after_race(
+        self,
+        command: Command,
+        metrics: _Metrics,
+        budget: _TimeBudget | None = None,
+    ) -> ExecutedWrite:
         """Re-read the ledger in a **new** transaction after losing the op-id race.
 
         A single pass: this is the conflict resolution mandated by plan section 6
         step 8, not a retry loop. If the winner recorded a different fingerprint the
         caller gets ``OpIdConflict``; if nothing is visible the stored state is
         inconsistent.
+
+        The returned disposition is ``replayed``: this call wrote nothing and the
+        result is the winner's recorded first result, so a client retrying an
+        unknown outcome learns its op is already durable.
+
+        The recovery transaction runs under the *same* injected budget as the candidate
+        that lost, and its wait is added to ``lock_wait_ms``. A lost race therefore
+        reports the total time this call spent queued for the workspace - the metric
+        must not silently report only the second (usually instant) half.
         """
         request_hash = command_hash(command)
         async with self._session_factory() as session:
             self._check_engine_isolation(session)
             try:
-                await session.execute(_SET_READ_COMMITTED)
-                await session.execute(_SET_LOCK_TIMEOUT)
+                await self._apply_budgets(session, budget or _TimeBudget())
                 repository = SyncRepository(session)
-                workspace = await repository.lock_workspace(command.workspace_id)
+                workspace = await self._lock_workspace(repository, command, metrics)
                 if workspace is None:
                     raise WorkspaceNotFound(command.workspace_id)
                 replayed = await self._replay_if_recorded(repository, command, request_hash)
@@ -504,13 +720,50 @@ class SyncWriteService:
                         "is visible; stored state is inconsistent"
                     )
             except BaseException:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(Exception, asyncio.CancelledError):
                     await session.rollback()
                 raise
             # Success on a read-only path: end the transaction explicitly. Never commit
             # one that wrote nothing, and never leave it open for ``close()`` to decide.
             await self._end_read_only(session)
-            return replayed
+            return ExecutedWrite(result=replayed, disposition="replayed")
+
+    @staticmethod
+    async def _apply_budgets(session: AsyncSession, budget: _TimeBudget) -> None:
+        """Pin isolation, then this call's ``lock_timeout`` and ``statement_timeout``.
+
+        All three are transaction-local and issued before the first row is touched, so
+        no statement - including the workspace lock wait and the ``COMMIT`` that
+        validates the deferred FK - can run unbounded. The order is fixed: a wider
+        isolation level would invalidate the read-after-lock guarantee, and both
+        timeouts must be in force before the lock is requested.
+        """
+        await session.execute(_SET_READ_COMMITTED)
+        for statement in budget.statements():
+            await session.execute(statement)
+
+    @staticmethod
+    async def _lock_workspace(
+        repository: SyncRepository,
+        command: Command,
+        metrics: _Metrics | None,
+    ) -> WorkspaceRow | None:
+        """Take the workspace row lock and always record how long it took.
+
+        ``lock_wait_ms`` is measured with ``try/finally``, so the value is recorded
+        on **every** outcome - acquired, timed out, cancelled, or the workspace
+        missing. A ``WriteBusy`` row that reported ``0.0`` would hide exactly the
+        condition the metric exists to show (plan §5 P2 #2). The value accumulates
+        across the two transactions of the lost-race path, so it stays "total time
+        this call spent waiting for the workspace", never a per-attempt figure that
+        silently replaces the wait that actually happened.
+        """
+        started = time.perf_counter()
+        try:
+            return await repository.lock_workspace(command.workspace_id)
+        finally:
+            if metrics is not None:
+                metrics.lock_wait_ms += (time.perf_counter() - started) * 1000.0
 
     @staticmethod
     async def _end_read_only(session: AsyncSession) -> None:
@@ -726,7 +979,23 @@ class SyncWriteService:
 
 
 def _classify_commit_failure(exc: BaseException, command: Command) -> SyncKernelError:
-    """Map a failed ``COMMIT`` without ever claiming a rollback we cannot prove."""
+    """Map a failed ``COMMIT`` without ever claiming a rollback we cannot prove.
+
+    Two classes of failure are distinguishable, and the distinction decides whether
+    the client may be told "nothing was written":
+
+    * **A lost acknowledgement** - no SQLSTATE, a connection-class error, or any
+      error the server did not raise about this transaction. The server may have
+      committed, so the answer is :class:`CommitOutcomeUnknown`.
+    * **A confirmed rejection** - the server answered the ``COMMIT`` with a SQLSTATE
+      that aborts the transaction (a deferred FK, a lock/statement timeout, a
+      serialization or deadlock abort). Those are :class:`WriteBusy` /
+      :class:`StorageFailure`, and re-sending the identical command is safe
+      (plan D17).
+
+    The branch order matters: "no SQLSTATE at all" is checked first, so an error we
+    cannot attribute to the server is never promoted into a retryable verdict.
+    """
     sqlstate = _sqlstate(exc)
     if not sqlstate or sqlstate in _UNKNOWN_COMMIT_SQLSTATES or sqlstate.startswith("08"):
         # The acknowledgement was lost: the server may well have committed.

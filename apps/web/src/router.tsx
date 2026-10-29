@@ -4,7 +4,7 @@ import {
   createRouter,
   Outlet,
 } from '@tanstack/react-router'
-import { AppLayout } from './components/layout/AppLayout'
+import { WorkspaceScreen } from './workspace/WorkspaceScreen'
 
 // Code-based TanStack Router (no CLI/plugin route-generation required)
 const rootRoute = createRootRoute({
@@ -14,7 +14,7 @@ const rootRoute = createRootRoute({
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
-  component: AppLayout,
+  component: WorkspaceScreen,
 })
 
 const routeTree = rootRoute.addChildren([indexRoute])

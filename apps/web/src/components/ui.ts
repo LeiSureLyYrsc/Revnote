@@ -1,0 +1,2 @@
+export const buttonClass = 'inline-flex min-h-9 items-center justify-center gap-1.5 rounded-md border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-zinc-200 transition-colors hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-indigo-400 disabled:cursor-not-allowed disabled:opacity-40'
+export const inputClass = 'w-full min-w-0 rounded-md border border-white/10 bg-[#101319] px-3 py-2 text-sm text-zinc-100 focus-visible:outline-2 focus-visible:outline-indigo-400 disabled:opacity-50'

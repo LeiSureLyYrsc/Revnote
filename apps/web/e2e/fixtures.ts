@@ -376,22 +376,104 @@ export async function followerReady(page: Page): Promise<void> {
 }
 
 /**
- * A crashed renderer never resolves `Page.crash` and keeps the page object open
- * with all further calls rejected. Send it un-awaited, confirm the real crash
- * event, then close the page so the renderer (and its Web Lock) is truly gone.
- * Both steps are bounded: a hung protocol call must fail this case, not silently
- * stall the suite.
+ * Kill the writer renderer for real, and wait for evidence that it is gone
+ * rather than for one particular notification.
+ *
+ * `Page.crash` does tear the renderer down, but two platform details made the
+ * old version of this helper assert something weaker than "the writer died":
+ * the notification is a protocol event that has to reach the client, and the
+ * command itself can be refused. Linux CI showed the first half of that: the
+ * command was sent, the process tree was healthy, and no Playwright `crash`
+ * event arrived within 20s. Waiting for that single event therefore tested a
+ * transport detail rather than the property this scenario needs ("the writer
+ * can no longer run code, so its Web Lock is released").
+ *
+ * Note that a rejected `page.evaluate` is *not* an independent witness either:
+ * Playwright only marks a session crashed from that same `Inspector.targetCrashed`
+ * event, so when the event is lost the page's calls hang instead of failing.
+ * Liveness is therefore judged by "cannot complete a trivial evaluation", and a
+ * page that still answers is escalated to a real renderer abort:
+ *   1. CDP `Page.crash` -- a real renderer kill, the strongest form;
+ *   2. if the page still answers, `chrome://crash` -- the browser aborts that
+ *      renderer instead of closing it gracefully;
+ *   3. the bounded `page.close({ runBeforeUnload: false })` afterwards destroys
+ *      the target through the browser process: no unload handler, no flush, so
+ *      the in-flight command still cannot be acknowledged.
+ *
+ * Confirmation is first-come: the page's `crash` event, `Inspector.targetCrashed`
+ * on the target's own session, or two consecutive bounded probes that never
+ * report `alive`. A live renderer answers in milliseconds, so two consecutive
+ * non-answers cannot come from a healthy page.
+ *
+ * Crucially this helper is not the last word on death: `expectWriterLockFree`
+ * still proves, from a separate live page, that the exclusive lock is actually
+ * free before the follower takes over. A renderer that survived all three steps
+ * would keep its lock and fail there -- the guarantee is observed, not assumed.
  */
 export async function crashPage(context: BrowserContext, page: Page): Promise<void> {
   stage('crash_enter')
-  const crashed = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Writer renderer did not report a crash')), 20_000)
-    page.once('crash', () => { clearTimeout(timer); resolve() })
-  })
   const cdp = await context.newCDPSession(page)
+  let signalled = false
+  const mark = (): void => { signalled = true }
+  page.on('crash', mark)
+  cdp.on('Inspector.targetCrashed', mark)
+
+  /**
+   * One bounded liveness probe.
+   * `alive`: the renderer ran our script. `dead`: the call was rejected, which
+   * is how a crashed target answers. `silent`: no answer inside the bound -- a
+   * renderer that cannot run script and therefore cannot be executing app code.
+   */
+  const probe = async (): Promise<'alive' | 'dead' | 'silent'> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const bound = new Promise<'silent'>((resolve) => { timer = setTimeout(() => resolve('silent'), 1_500) })
+    // Both outcomes are consumed, so a probe that loses the race cannot surface
+    // later as an unhandled rejection.
+    const answer = page.evaluate(() => 0).then(() => 'alive' as const, () => 'dead' as const)
+    try { return await Promise.race([answer, bound]) } finally { clearTimeout(timer) }
+  }
+
+  /** Two bounded non-answers in a row; one alone could be a teardown artefact. */
+  const unresponsive = async (): Promise<boolean> => {
+    if (await probe() === 'alive') return false
+    return await probe() !== 'alive'
+  }
+
   void cdp.send('Page.crash').catch(() => undefined)
   stage('crash_sent')
-  await crashed
+
+  const started = Date.now()
+  const deadline = started + 20_000
+  const expired = (): boolean => Date.now() >= deadline
+  let escalated = false
+  let confirmed = false
+  /** Abort this renderer without needing the page's cooperation; once only. */
+  const escalate = (): void => {
+    escalated = true
+    void page.goto('chrome://crash').catch(() => undefined)
+  }
+  try {
+    while (!signalled && !expired()) {
+      if (await unresponsive()) {
+        // Not executing app code. Throw the strongest available kill at it once
+        // so a wedged renderer is really aborted, then accept the death.
+        if (!escalated) { escalate(); await new Promise((resolve) => setTimeout(resolve, 250)); continue }
+        confirmed = true
+        break
+      }
+      // Still executing: `Page.crash` was refused or did not take effect. Give it
+      // a short grace period, then force the renderer to abort.
+      if (!escalated && Date.now() - started > 3_000) escalate()
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    if (signalled) confirmed = true
+  } finally {
+    // Never leave listeners behind: the runtime guard keeps observing this page
+    // object for the rest of the case.
+    page.off('crash', mark)
+    try { cdp.off('Inspector.targetCrashed', mark) } catch { /* Session already disposed. */ }
+  }
+  expect(confirmed, 'Writer renderer did not report a crash').toBe(true)
   stage('crash_confirmed')
   await Promise.race([
     page.close({ runBeforeUnload: false }),

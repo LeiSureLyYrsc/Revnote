@@ -653,6 +653,35 @@ def print_lifecycle_diagnostics(
         print(control.describe(), file=sys.stderr)
 
 
+def safe_assertion(case: dict[str, object]) -> str | None:
+    """The whitelisted ``e2e/<spec>.spec.ts:<line>`` of a failing assertion.
+
+    Only the two locating fields are read. A message, stack, snippet or value
+    living beside them in the same report object is never touched, so no
+    assertion text can reach the log. A location that does not name a real line
+    of a real owned spec is dropped rather than printed: a wrong pointer is
+    worse evidence than none.
+    """
+    assertion = case.get("assertion")
+    line = case.get("assertionLine")
+    if not isinstance(assertion, str) or not re.fullmatch(
+        r"e2e/[a-zA-Z0-9_-]+\.spec\.ts", assertion
+    ):
+        return None
+    if type(line) is not int or not 1 <= line <= 1_000_000:
+        return None
+    e2e_root = (WEB_ROOT / "e2e").resolve()
+    target = (WEB_ROOT / assertion).resolve()
+    if target.parent != e2e_root or not target.is_file():
+        return None
+    try:
+        if line > len(target.read_text(encoding="utf-8").split("\n")):
+            return None
+    except OSError:
+        return None
+    return f"{assertion}:{line}"
+
+
 def print_safe_browser_failures(report_path: Path, run_id: str, scope: str) -> None:
     """Print only schema-restricted locating metadata, never child error values."""
     labels = {
@@ -711,13 +740,16 @@ def print_safe_browser_failures(report_path: Path, run_id: str, scope: str) -> N
                 # instead of trusting the number the browser reported.
                 if line > len(spec.read_text(encoding="utf-8").split("\n")):
                     continue
+                assertion = safe_assertion(case)
             except OSError:
                 continue
             safe_labels = sorted(
                 label for label in case_labels if isinstance(label, str) and label in labels
             )
+            where = f"assertion={assertion}" if assertion else "assertion=unknown"
             print(
-                f"Browser failure: {source}:{line} labels={','.join(safe_labels)} case={case_id}",
+                f"Browser failure: {source}:{line} {where} "
+                f"labels={','.join(safe_labels)} case={case_id}",
                 file=sys.stderr,
             )
             printed += 1

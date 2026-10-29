@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  caseId, E2E_LABELS, junit, labelsIn, parseReportArgs, reportScope, safeSource, UNIT_LABELS, validateReport, type SafeReport,
+  caseId, E2E_LABELS, junit, labelsIn, parseReportArgs, reportScope, safeAssertion, safeSource, UNIT_LABELS, validateReport, type SafeReport,
 } from '../../../scripts/check-test-reports'
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -138,6 +138,84 @@ describe('acceptance evidence guard', () => {
     ]) expect(() => validateReport({ ...report(), ...change }, 'vitest', 'focused', [])).toThrow()
     const located = { ...report(), cases: [{ ...report().cases[0], source: 'e2e/workspace.spec.ts', line: 12 }] }
     expect(validateReport(located, 'vitest', 'focused', []).cases[0]).toMatchObject({ source: 'e2e/workspace.spec.ts', line: 12 })
+  })
+
+  it('records only the failing assertion file and line, never the message beside it', () => {
+    // The runner hands the location out inside the same object as message,
+    // stack and value; the guard must accept the two locating fields and must
+    // keep refusing everything else that object carries.
+    const specFile = path.join(specDir, 'conflicts.spec.ts')
+    const specLineCount = readFileSync(specFile, 'utf8').split('\n').length
+    expect(safeAssertion(specFile, 31)).toEqual({ assertion: 'e2e/conflicts.spec.ts', assertionLine: 31 })
+    // Line numbers must be real: this case fails at an assertion, so an index
+    // beyond the file (or a non-integer) cannot be printed as a location.
+    expect(safeAssertion(specFile, specLineCount + 1)).toEqual({})
+    expect(safeAssertion(specFile, 0)).toEqual({})
+    expect(safeAssertion(specFile, -3)).toEqual({})
+    expect(safeAssertion(specFile, 1.5)).toEqual({})
+    expect(safeAssertion(specFile, Number.NaN)).toEqual({})
+    expect(safeAssertion(specFile, Number.POSITIVE_INFINITY)).toEqual({})
+    expect(safeAssertion(specFile, '31')).toEqual({})
+    expect(safeAssertion(specFile, undefined)).toEqual({})
+    // Only test-owned absolute paths: relative paths, escapes, sources and
+    // suites that merely look like specs are refused exactly as before.
+    for (const file of [
+      'e2e/conflicts.spec.ts',
+      path.join(webRoot, 'e2e', '..', 'scripts', 'check-test-reports.ts'),
+      path.join(webRoot, 'src', 'App.tsx'),
+      path.join(webRoot, 'playwright.config.ts'),
+      path.join(webRoot, 'e2e', 'fixtures.ts'),
+      path.join(webRoot, 'e2e', 'nested', 'conflicts.spec.ts'),
+      // A name that satisfies the pattern but has no file behind it cannot
+      // supply a line, so no location is reported.
+      path.join(webRoot, 'e2e', 'nonexistent.spec.ts'),
+      'https://example.test/conflicts.spec.ts',
+      '',
+    ]) expect(safeAssertion(file, 1)).toEqual({})
+    expect(safeAssertion(undefined, 1)).toEqual({})
+    expect(safeAssertion(31, 31)).toEqual({})
+
+    const failing = {
+      ...report(),
+      cases: [{ ...report().cases[0], status: 'failed' as const, source: 'e2e/conflicts.spec.ts', line: 6, assertion: 'e2e/conflicts.spec.ts', assertionLine: 31 }],
+    }
+    // A failed case is still rejected as evidence; only the shape is asserted
+    // here so the guard's acceptance rule is what is being tested.
+    expect(() => validateReport(failing, 'vitest', 'focused', [])).toThrow()
+    // Same restricted shape accepted into a passing report (the real reports
+    // never mix the two: a case with an assertion location has failed).
+    const located = { ...report(), cases: [{ ...report().cases[0], assertion: 'e2e/conflicts.spec.ts', assertionLine: 31 }] }
+    expect(validateReport(located, 'vitest', 'focused', []).cases[0])
+      .toMatchObject({ assertion: 'e2e/conflicts.spec.ts', assertionLine: 31 })
+  })
+
+  it('rejects assertion metadata that is partial, out of range, borrowed or text-bearing', () => {
+    const base = report().cases[0]
+    for (const change of [
+      // Half a location proves nothing about where the failure happened.
+      { assertion: 'e2e/conflicts.spec.ts' },
+      { assertionLine: 31 },
+      // A line that does not exist in that file would point at unrelated text.
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 100_000 },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 0 },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 1.5 },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: '31' },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 1_000_001 },
+      // Paths outside the whitelist, relative paths and escapes.
+      { assertion: 'src/App.tsx', assertionLine: 4 },
+      { assertion: 'e2e/../../secret.ts', assertionLine: 4 },
+      // A plausible-looking name with no file behind it must not be accepted.
+      { assertion: 'e2e/nonexistent.spec.ts', assertionLine: 4 },
+      { assertion: 'tests/unit/nonexistent.test.ts', assertionLine: 4 },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 4, assertionFile: 'e2e/conflicts.spec.ts' },
+      // The message, stack, value and snippet from the very same error object
+      // must never be persitable beside a location.
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, message: 'Expect failed' },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, stack: 'at spec.ts:31' },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, value: 'retained-local' },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, snippet: '> 31 | expect(x).toBe(y)' },
+      { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, attachments: ['trace.zip'] },
+    ]) expect(() => validateReport({ ...report(), cases: [{ ...base, ...change }] }, 'vitest', 'focused', [])).toThrow()
   })
 
   it('enforces the frozen load-bearing inventory without a hardcoded total count', () => {

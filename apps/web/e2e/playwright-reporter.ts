@@ -1,5 +1,5 @@
 import type { FullConfig, FullResult, Reporter, Suite, TestCase } from '@playwright/test/reporter'
-import { caseId, labelsIn, reportScope, safeSource, writeReport, type CaseStatus, type SafeReport } from '../scripts/check-test-reports'
+import { caseId, labelsIn, reportScope, safeAssertion, safeSource, writeReport, type CaseStatus, type SafeReport } from '../scripts/check-test-reports'
 
 export default class SafePlaywrightReporter implements Reporter {
   private suite?: Suite
@@ -15,12 +15,19 @@ export default class SafePlaywrightReporter implements Reporter {
 
   /** Only hashed ids, frozen labels and whitelisted test locations leave here. */
   private locate(collect: (test: TestCase) => { status: CaseStatus; attempts: number }): void {
-    this.report.cases = (this.suite?.allTests() ?? []).map((test) => ({
-      id: caseId(test.id),
-      labels: labelsIn([...test.titlePath(), ...test.tags].join(' ')),
-      ...collect(test),
-      ...safeSource(test.location.file, test.location.line, test.title),
-    }))
+    this.report.cases = (this.suite?.allTests() ?? []).map((test) => {
+      const collected = collect(test)
+      return {
+        id: caseId(test.id),
+        labels: labelsIn([...test.titlePath(), ...test.tags].join(' ')),
+        ...collected,
+        ...safeSource(test.location.file, test.location.line, test.title),
+        // Only the failing case carries an assertion location: the error object
+        // also holds the message, stack and value, so exactly two of its
+        // properties are read and re-validated by the guard before persisting.
+        ...(collected.status === 'failed' ? failingAssertion(test) : {}),
+      }
+    })
   }
 
   onBegin(_config: FullConfig, suite: Suite): void {
@@ -51,4 +58,19 @@ export default class SafePlaywrightReporter implements Reporter {
     writeReport(this.report)
     console.log(`playwright/${this.report.scope}: cases=${this.report.cases.length}; errors=${this.report.errors}; details redacted`)
   }
+}
+
+/**
+ * File + line of the assertion that failed, or nothing.
+ *
+ * Deliberately reads only `error.location`: `message`, `stack`, `value` and
+ * `attachments` live on the same objects and must never be touched here. The
+ * value is unchecked on the way out, so the report guard re-validates the
+ * whitelisted file and the real on-disk line before it is persisted.
+ */
+function failingAssertion(test: TestCase): ReturnType<typeof safeAssertion> {
+  const failure = test.results.at(-1)?.error
+  const location = failure?.location
+  if (!location) return {}
+  return safeAssertion(location.file, location.line)
 }

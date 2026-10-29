@@ -31,8 +31,12 @@ export interface SafeCase {
   labels: string[]
   status: CaseStatus
   attempts: number
+  /** Declaration location of the test itself (always present for a located case). */
   source?: string
   line?: number
+  /** Location of the failing assertion, when the runner reported a test-owned one. */
+  assertion?: string
+  assertionLine?: number
 }
 export interface SafeReport {
   schemaVersion: 1
@@ -56,7 +60,7 @@ const runnerLabels: Record<Runner, ReadonlySet<string>> = {
 // messages, stacks or request bodies may ever reach a persisted report.
 const safeSourcePattern = /^(?:e2e\/[a-zA-Z0-9_-]+\.spec\.ts|tests\/(?:unit|components)\/[a-zA-Z0-9_./-]+\.(?:test|spec)\.tsx?)$/
 const reportKeys = new Set(['schemaVersion', 'runner', 'scope', 'runId', 'complete', 'errors', 'cases'])
-const caseKeys = new Set(['id', 'labels', 'status', 'attempts', 'source', 'line'])
+const caseKeys = new Set(['id', 'labels', 'status', 'attempts', 'source', 'line', 'assertion', 'assertionLine'])
 
 export function caseId(name: string): string {
   return createHash('sha256').update(name).digest('hex')
@@ -73,23 +77,51 @@ export function labelsIn(title: string): string[] {
   return E2E_LABELS.filter((label) => new RegExp(`(?:^|[\\s@\\[])${label}(?=$|[\\s\\]])`).test(title))
 }
 
-export function safeSource(file: string, line: number, title?: string): { source: string; line: number } | Record<string, never> {
+/**
+ * Resolves an absolute path onto a test-owned file, or refuses it outright.
+ * Requiring an absolute path keeps the result independent of the cwd; the
+ * remaining rules keep arbitrary paths, source excerpts and dynamically
+ * supplied annotations out of a persisted report.
+ */
+function testOwnedLocation(file: unknown): { absolute: string; relative: string } | undefined {
   // Only reporters feed this, and they always pass an absolute module path.
-  // Requiring an absolute path keeps the result independent of the cwd.
-  if (typeof file !== 'string' || !path.isAbsolute(file)) return {}
+  if (typeof file !== 'string' || !path.isAbsolute(file)) return undefined
   const relative = path.relative(root, file).replaceAll('\\', '/')
-  // Source metadata is restricted to test-owned filenames, never arbitrary
-  // paths, source excerpts or dynamically supplied annotations/error messages.
-  if (!safeSourcePattern.test(relative) || relative.split('/').includes('..')) return {}
+  if (!safeSourcePattern.test(relative) || relative.split('/').includes('..')) return undefined
+  return { absolute: file, relative }
+}
+
+export function safeSource(file: string, line: number, title?: string): { source: string; line: number } | Record<string, never> {
+  const owned = testOwnedLocation(file)
+  if (owned === undefined) return {}
   // Exact declaration line read from the file wins: a runner-reported index can
   // drift from the on-disk source. The runner index is only a fallback, and only
   // when it can name a real line in this file; otherwise metadata is omitted.
-  const text = readTestFile(file)
+  const text = readTestFile(owned.absolute)
   if (text === undefined) return {}
   const candidate = text.lineOf(title)
     ?? (Number.isSafeInteger(line) && line >= 1 && line <= text.lineCount ? line : undefined)
   if (candidate === undefined || candidate < 1 || candidate > 1_000_000) return {}
-  return { source: relative, line: candidate }
+  return { source: owned.relative, line: candidate }
+}
+
+/**
+ * Keeps only the *file and line of a failing assertion*, never its message.
+ *
+ * Playwright hands the location out inside the same error object as `message`,
+ * `stack` and `value`; this function reads exactly two properties so the rest
+ * cannot be carried along by accident. The file must pass the same whitelist as
+ * a declaration location and the line must really exist in that file: a drifted
+ * or invented index would point the reader at unrelated content, which is worse
+ * than no evidence at all.
+ */
+export function safeAssertion(file: unknown, line: unknown): { assertion: string; assertionLine: number } | Record<string, never> {
+  const owned = testOwnedLocation(file)
+  if (owned === undefined) return {}
+  if (typeof line !== 'number' || !Number.isSafeInteger(line) || line < 1 || line > 1_000_000) return {}
+  const text = readTestFile(owned.absolute)
+  if (text === undefined || line > text.lineCount) return {}
+  return { assertion: owned.relative, assertionLine: line }
 }
 
 /** Reads a test-owned file once per call: these files are small and bounded. */
@@ -113,6 +145,12 @@ function readTestFile(file: string): { lineCount: number; lineOf(title?: string)
       return matches.length === 1 ? matches[0] : undefined
     },
   }
+}
+
+/** True only when a report-supplied relative test path really has that line. */
+function lineExists(relative: string, line: number): boolean {
+  const text = readTestFile(path.join(root, relative))
+  return text !== undefined && line <= text.lineCount
 }
 
 export function junit(report: SafeReport): string {
@@ -164,7 +202,18 @@ export function validateReport(value: unknown, runner: Runner, scope: Scope, req
         typeof item.source !== 'string' || !safeSourcePattern.test(item.source)
         || item.source.split('/').includes('..')))
       || (item.source === undefined) !== (item.line === undefined)
-      || (item.line !== undefined && (!Number.isSafeInteger(item.line) || item.line < 1 || item.line > 1_000_000))) {
+      || (item.line !== undefined && (!Number.isSafeInteger(item.line) || item.line < 1 || item.line > 1_000_000))
+      // A failing-assertion location is the same restricted kind of evidence: a
+      // whitelisted test file plus a line that really exists inside it. It is
+      // all-or-nothing, so a half-populated location cannot look trustworthy,
+      // and no message, stack, value, snippet or attachment may ride along.
+      || (item.assertion === undefined) !== (item.assertionLine === undefined)
+      || (item.assertion !== undefined && (
+        typeof item.assertion !== 'string' || !safeSourcePattern.test(item.assertion)
+        || item.assertion.split('/').includes('..')
+        || typeof item.assertionLine !== 'number'
+        || !Number.isSafeInteger(item.assertionLine) || item.assertionLine < 1 || item.assertionLine > 1_000_000
+        || !lineExists(item.assertion, item.assertionLine)))) {
       throw new Error('A case failed, was omitted/retried, or has invalid metadata')
     }
     ids.add(item.id)

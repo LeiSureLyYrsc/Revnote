@@ -25,6 +25,7 @@ from fastapi import APIRouter
 from revnote_api.api.routes.auth import me_router
 from revnote_api.api.routes.auth import router as auth_router
 from revnote_api.api.routes.health import liveness_router
+from revnote_api.api.routes.sync_push import sync_push_router
 
 __all__ = ["API_V1_PREFIX", "api_v1", "router"]
 
@@ -36,6 +37,7 @@ API_V1_PREFIX = "/api/v1"
 api_v1 = APIRouter(prefix=API_V1_PREFIX)
 api_v1.include_router(auth_router)
 api_v1.include_router(me_router)
+api_v1.include_router(sync_push_router)
 
 #: What the app mounts. Liveness first (it must answer even if a later route's
 #: import is broken), then the versioned group.

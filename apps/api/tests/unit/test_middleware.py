@@ -197,7 +197,7 @@ async def test_an_app_built_from_settings_enforces_the_configured_push_budget(
     tight = settings.model_copy(update={"sync_push_max_bytes": 1024})
     app = create_app(tight)
 
-    @app.post("/api/v1/workspaces/w/sync/push")
+    @app.post("/api/v1/workspaces/w/budget-probe")
     async def push_probe(request: Request) -> dict[str, int]:
         return {"length": len(await request.body())}
 
@@ -205,8 +205,8 @@ async def test_an_app_built_from_settings_enforces_the_configured_push_budget(
         app.router.lifespan_context(app),
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
     ):
-        small = await client.post("/api/v1/workspaces/w/sync/push", content=b"{}")
-        large = await client.post("/api/v1/workspaces/w/sync/push", content=b"x" * 2048)
+        small = await client.post("/api/v1/workspaces/w/budget-probe", content=b"{}")
+        large = await client.post("/api/v1/workspaces/w/budget-probe", content=b"x" * 2048)
 
     assert small.status_code == 200, small.text
     assert large.status_code == 413

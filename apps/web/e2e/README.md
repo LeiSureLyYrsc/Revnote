@@ -114,10 +114,27 @@ disable implicit env-file settings.
 The browser child process never receives `DATABASE_URL` or
 `WEB_E2E_DATABASE_URL`; only the runner and the owned API do. A failure prints at
 most 25 lines of the form
-`Browser failure: e2e/<file>.spec.ts:<line> labels=<fixed labels> case=<sha256>`
+`Browser failure: e2e/<file>.spec.ts:<line> assertion=<where> stage=<name> labels=<fixed labels> case=<sha256>`
 — always `source:line`, never a message, stack, request body or credential. The
 same restricted output is printed when the browser exits zero but the report
 guard rejects the evidence.
+
+`stage` answers "which helper phase did the case reach?" when the failure has no
+in-file assertion location: a helper's own bounded guard (`Writer renderer did
+not report a crash`), a lock that never became free, a `poll` timeout. The names
+are a frozen vocabulary declared in `scripts/check-test-reports.ts` (mirrored in
+`apps/api/scripts/run_web_e2e.py`) and are matched by identifier pattern *and*
+membership before printing; anything else becomes `unknown`. A stage is only
+recorded for a failed case that has no assertion location, because with a real
+location it would add nothing.
+
+`assertion` may name `e2e/fixtures.ts` in addition to a spec. Playwright reports
+the deepest user frame that threw, and every bounded guard this evidence exists
+for lives in the shared helper module, so refusing that file was itself a cause
+of `assertion=unknown`. The relaxation is one exact file inside `e2e/`: relative
+paths, nested helpers, `..` segments, product source and configs are still
+refused, and the line must still exist in the file. A test *declaration*
+(`source`) is never taken from the helper module — a case is declared in a spec.
 
 Manifest wiring owned by the orchestrator:
 
@@ -174,6 +191,19 @@ runner index only as a fallback. A case therefore either carries a verifiable
 `source:line` or no location at all. `line` is present exactly when `source` is,
 and `validateReport` rejects unknown keys so a message, stack or attachment
 field cannot be appended to a report and pass the gate.
+
+`assertion` follows the same rules plus one addition: `e2e/fixtures.ts` is
+allowed, because Playwright reports the deepest user frame that threw and the
+bounded guards (crash timer, writer-lock poll, follower visibility) live in that
+helper module. It is still a single exact file directly inside `e2e/`, and the
+line must exist there. `source` is *not* relaxed: a case is declared in a spec.
+
+A failing case that has **no** assertion location additionally carries `stage`,
+the last bounded helper phase it reached (see `STAGES` in
+`scripts/check-test-reports.ts`). It is a fallback locator, never a second
+opinion: `validateReport` rejects a `stage` that is off-vocabulary, wrongly
+typed, or present together with an `assertion`. `junit()` does not serialize it,
+so the strict JSON/XML equality check is unchanged.
 
 CI job-local full gates use `check:reports --unit` and `check:reports --e2e`.
 The root `check:web-reports` without arguments requires both full reports.

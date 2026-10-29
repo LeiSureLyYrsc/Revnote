@@ -1,5 +1,8 @@
 import type { FullConfig, FullResult, Reporter, Suite, TestCase } from '@playwright/test/reporter'
-import { caseId, labelsIn, reportScope, safeAssertion, safeSource, writeReport, type CaseStatus, type SafeReport } from '../scripts/check-test-reports'
+import {
+  caseId, labelsIn, reportScope, safeAssertion, safeSource, safeStage, STAGE_ANNOTATION, writeReport,
+  type CaseStatus, type SafeReport,
+} from '../scripts/check-test-reports'
 
 export default class SafePlaywrightReporter implements Reporter {
   private suite?: Suite
@@ -22,10 +25,7 @@ export default class SafePlaywrightReporter implements Reporter {
         labels: labelsIn([...test.titlePath(), ...test.tags].join(' ')),
         ...collected,
         ...safeSource(test.location.file, test.location.line, test.title),
-        // Only the failing case carries an assertion location: the error object
-        // also holds the message, stack and value, so exactly two of its
-        // properties are read and re-validated by the guard before persisting.
-        ...(collected.status === 'failed' ? failingAssertion(test) : {}),
+        ...failureLocation(test, collected.status),
       }
     })
   }
@@ -61,6 +61,25 @@ export default class SafePlaywrightReporter implements Reporter {
 }
 
 /**
+ * What can be said about *where a failing case got stuck*.
+ *
+ * Two mutually exclusive kinds of evidence:
+ * - a real assertion location (`source:line` inside a test-owned spec), or
+ * - the last bounded stage marker when Playwright reports no in-file location
+ *   at all (timeout, fixture phase, a helper's own guard).
+ *
+ * The assertion wins when present: it is strictly more precise. A stage marker
+ * is never mixed with a location, and a passing case carries neither. Message,
+ * stack, value, snippet and attachments are never read.
+ */
+function failureLocation(test: TestCase, status: CaseStatus): ReturnType<typeof safeAssertion> | ReturnType<typeof safeStage> {
+  if (status !== 'failed') return {}
+  const assertion = failingAssertion(test)
+  if ('assertion' in assertion) return assertion
+  return failingStage(test)
+}
+
+/**
  * File + line of the assertion that failed, or nothing.
  *
  * Deliberately reads only `error.location`: `message`, `stack`, `value` and
@@ -73,4 +92,20 @@ function failingAssertion(test: TestCase): ReturnType<typeof safeAssertion> {
   const location = failure?.location
   if (!location) return {}
   return safeAssertion(location.file, location.line)
+}
+
+/**
+ * The last stage marker the worker announced, or nothing.
+ *
+ * `fixtures.stage()` appends exactly one `stage` annotation to the running
+ * test, and Playwright ships annotations to the reporter as structured data
+ * (`{ type, description }`), unlike the error text this reporter never reads.
+ * The description is re-validated against the frozen vocabulary: a marker that
+ * is not in it yields no stage rather than an arbitrary string in the report.
+ */
+function failingStage(test: TestCase): ReturnType<typeof safeStage> {
+  const annotations = test.results.at(-1)?.annotations ?? []
+  const marker = annotations.filter((annotation) => annotation.type === STAGE_ANNOTATION).at(-1)
+  if (marker === undefined) return {}
+  return safeStage(marker.description)
 }

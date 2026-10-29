@@ -2,6 +2,46 @@ import { createHash, randomUUID } from 'node:crypto'
 import { test as base, expect, type APIRequestContext, type BrowserContext, type Page, type Route } from '@playwright/test'
 import type { WorkspaceState } from '../src/domain/contracts'
 import type { ServerObject, WireOperation } from '../src/api/contracts'
+import { STAGE_ANNOTATION, stageName, type StageName } from '../scripts/check-test-reports'
+
+/**
+ * Bounded failure-stage evidence.
+ *
+ * A case can fail where Playwright reports no in-file assertion location: a
+ * helper's own `expect.poll` times out, a renderer never emits its crash event,
+ * a guarded `new Error` is rejected inside a fixture. The report then said
+ * `assertion=unknown`, which is true but useless. These markers record which
+ * helper phase the case actually reached, using a frozen vocabulary from
+ * `scripts/check-test-reports.ts`, so an unroutable failure becomes a specific
+ * phase instead of a guess.
+ *
+ * Two sinks, because a worker and the reporter live in different processes:
+ * a module variable for the executing worker, and one `stage` annotation that
+ * Playwright ships to the reporter in the test-end payload. Neither carries
+ * text: `stageName` maps anything outside the vocabulary to `unknown`.
+ */
+let lastStage: StageName = 'unknown'
+
+export function stage(name: string): void {
+  lastStage = stageName(name)
+  // Only the newest marker is kept: a stack of annotations would grow with
+  // every helper call and annotate a passing case with stale phases.
+  try {
+    const annotations = test.info().annotations
+    for (let index = annotations.length - 1; index >= 0; index -= 1) {
+      if (annotations[index].type === STAGE_ANNOTATION) annotations.splice(index, 1)
+    }
+    annotations.push({ type: STAGE_ANNOTATION, description: lastStage })
+  } catch {
+    // Outside a running test there is no info object; the module variable above
+    // is still the truthful answer for the current worker.
+  }
+}
+
+/** Latest phase this worker reached (diagnostic only; never asserted on). */
+export function currentStage(): StageName {
+  return lastStage
+}
 
 export const test = base.extend<{ runtimeGuard: void; apiGuard: void }>({
   runtimeGuard: [async ({ context }, use) => {
@@ -60,12 +100,14 @@ export async function login(page: Page, identity: Account, remember = true): Pro
  * disabled there, so this helper must not assert editability.
  */
 export async function enterLogin(page: Page, identity: Account, remember = true): Promise<void> {
+  stage('login_view')
   await page.getByLabel('登录邮箱', { exact: true }).fill(identity.email)
   await page.getByLabel('登录密码', { exact: true }).fill(identity.secret_password)
   await page.getByLabel('记住登录', { exact: true }).setChecked(remember)
   await page.getByRole('button', { name: '登录', exact: true }).click()
   await expect(page.getByRole('combobox', { name: '选择工作区' })).toHaveValue(identity.workspaceId)
   await expect(page.getByLabel('登录邮箱', { exact: true })).toHaveCount(0)
+  stage('login_ok')
 }
 
 export async function reauthenticate(page: Page, identity: Account): Promise<void> {
@@ -91,6 +133,7 @@ export async function createNote(page: Page, title: string, body = ''): Promise<
   // Self-sufficient: creating a note is only legal once the workspace is loaded,
   // so a caller that just authenticated never races the bootstrap.
   await expectWorkspaceReady(page)
+  stage('note_create_enter')
   await page.getByRole('button', { name: '新建笔记', exact: true }).click()
   const region = page.getByRole('region', { name: '新建笔记', exact: true })
   await region.getByLabel('笔记名称', { exact: true }).fill(title)
@@ -100,6 +143,7 @@ export async function createNote(page: Page, title: string, body = ''): Promise<
   const state = await localState(page)
   const note = Object.values(state.drafts).find(item => item.entityType === 'note' && item.title === title)
   expect(!!note, 'UI-created note has a durable local identity').toBe(true)
+  stage('note_created')
   return note!.entityId
 }
 
@@ -124,16 +168,20 @@ export async function createFolder(page: Page, title: string): Promise<string> {
 }
 
 export async function edit(page: Page, body: string): Promise<void> {
+  stage('edit_enter')
   await page.getByTestId('note-source').fill(body)
   await expect(page.getByTestId('local-save-status')).toHaveText('已写入本地')
+  stage('edit_filled')
   // Footer may have still represented the previous version before React flushed.
   await expect.poll(async () => {
     const state = await localState(page)
     return Object.values(state.drafts).some(draft => hash(draft.bodyMd) === hash(body))
   }).toBe(true)
+  stage('edit_durable')
 }
 
 export async function openNote(page: Page, title: string): Promise<void> {
+  stage('note_open')
   await page.getByRole('button', { name: `打开笔记 ${title}`, exact: true }).click()
   await expect(page.getByTestId('note-source')).toBeVisible()
 }
@@ -142,16 +190,20 @@ export async function retry(page: Page): Promise<void> {
   // `重试同步` is gated on a loaded workspace state (not on a completed
   // bootstrap), and Playwright's click already waits for it to be actionable, so
   // a case may deliberately retry a workspace that can never finish bootstrap.
+  stage('retry_enter')
   await page.getByRole('button', { name: '重试同步', exact: true }).click()
+  stage('retry_clicked')
 }
 
 export async function idle(page: Page): Promise<void> {
+  stage('idle_enter')
   await expect.poll(async () => {
     const state = await localState(page)
     return state.bootstrapped && state.status === 'idle'
       && state.intents.every(intent => intent.state === 'done')
       && Object.values(state.drafts).every(draft => !draft.dirty)
   }, { timeout: 45_000 }).toBe(true)
+  stage('idle_ok')
 }
 
 export async function localState(page: Page): Promise<WorkspaceState> {
@@ -272,7 +324,9 @@ export async function stats(request: APIRequestContext, identity: Account, entit
 }
 
 export async function serverBody(request: APIRequestContext, identity: Account, id: string, body: string): Promise<void> {
+  stage('server_body_enter')
   await expect.poll(async () => (await stats(request, identity, id)).bodyHash, { timeout: 45_000 }).toBe(hash(body))
+  stage('server_body_ok')
 }
 
 export async function secretAccess(request: APIRequestContext, identity: Account): Promise<string> {
@@ -315,8 +369,10 @@ export async function blockSync(context: BrowserContext): Promise<() => Promise<
 
 /** Wait until the page reports itself as a read-only follower, not merely rendering. */
 export async function followerReady(page: Page): Promise<void> {
+  stage('follower_enter')
   await expect(page.getByText('另一个标签页持有写入权限，此页只读。关闭原标签页后可接管。')).toBeVisible()
   await expect(page.getByRole('button', { name: '接管写入', exact: true })).toBeEnabled()
+  stage('follower_ready')
 }
 
 /**
@@ -327,23 +383,36 @@ export async function followerReady(page: Page): Promise<void> {
  * stall the suite.
  */
 export async function crashPage(context: BrowserContext, page: Page): Promise<void> {
+  stage('crash_enter')
   const crashed = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Writer renderer did not report a crash')), 20_000)
     page.once('crash', () => { clearTimeout(timer); resolve() })
   })
   const cdp = await context.newCDPSession(page)
   void cdp.send('Page.crash').catch(() => undefined)
+  stage('crash_sent')
   await crashed
+  stage('crash_confirmed')
   await Promise.race([
     page.close({ runBeforeUnload: false }),
     new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Crashed writer page did not close')), 20_000)),
   ]).catch(() => undefined)
+  stage('crash_closed')
 }
 
 /** The exclusive origin-wide writer lock must be free before a takeover is real. */
 export async function expectWriterLockFree(page: Page): Promise<void> {
-  await expect.poll(async () => page.evaluate(async () => {
-    const snapshot = await navigator.locks.query()
-    return (snapshot.held ?? []).filter(lock => lock.name === 'revnote-writer-v1').length
-  }), { timeout: 20_000 }).toBe(0)
+  stage('lock_free_enter')
+  try {
+    await expect.poll(async () => page.evaluate(async () => {
+      const snapshot = await navigator.locks.query()
+      return (snapshot.held ?? []).filter(lock => lock.name === 'revnote-writer-v1').length
+    }), { timeout: 20_000 }).toBe(0)
+    stage('lock_free_ok')
+  } catch (error) {
+    // Record the phase before rethrowing the very same failure: the assertion
+    // text and the spec's control flow stay untouched.
+    stage('lock_free_timeout')
+    throw error
+  }
 }

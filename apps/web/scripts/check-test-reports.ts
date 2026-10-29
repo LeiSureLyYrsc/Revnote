@@ -26,6 +26,61 @@ export const E2E_LABELS = [
 export type Runner = 'vitest' | 'playwright'
 export type Scope = 'full' | 'focused'
 export type CaseStatus = 'passed' | 'failed' | 'skipped' | 'todo' | 'pending'
+
+/**
+ * Frozen vocabulary of bounded failure-stage markers.
+ *
+ * A case can fail *outside* any assertion: a renderer that never reports its
+ * crash, a writer lock that is still held, a helper poll that timed out. Such
+ * a failure has no in-file location, so the useful evidence is which helper
+ * phase was reached. Only these identifiers may be recorded, and only these
+ * may be released: the value is test-authored (an annotation description, or
+ * a case key in a report), so the guard re-validates it instead of trusting it.
+ * `run_web_e2e.py` mirrors this set when printing diagnostics.
+ */
+export const STAGES = [
+  'unknown',
+  'login_view',
+  'login_ok',
+  'note_create_enter',
+  'note_created',
+  'note_open',
+  'idle_enter',
+  'idle_ok',
+  'edit_enter',
+  'edit_filled',
+  'edit_durable',
+  'retry_enter',
+  'retry_clicked',
+  'follower_enter',
+  'follower_ready',
+  'crash_enter',
+  'crash_sent',
+  'crash_confirmed',
+  'crash_closed',
+  'lock_free_enter',
+  'lock_free_ok',
+  'lock_free_timeout',
+  'server_body_enter',
+  'server_body_ok',
+] as const
+export type StageName = (typeof STAGES)[number]
+/** Annotation type carrying one stage marker from a worker to the reporter. */
+export const STAGE_ANNOTATION = 'stage'
+const stagePattern = /^[a-z][a-z0-9_]{0,63}$/
+const stageNames = new Set<string>(STAGES)
+
+/** Fixed stage identifier, or `unknown`; the input itself is never echoed. */
+export function stageName(value: unknown): StageName {
+  return typeof value === 'string' && stageNames.has(value) ? (value as StageName) : 'unknown'
+}
+
+/** A report-ready stage entry, or nothing when the value is not in the vocabulary. */
+export function safeStage(value: unknown): { stage: StageName } | Record<string, never> {
+  if (typeof value !== 'string' || !stagePattern.test(value) || !stageNames.has(value)) return {}
+  return { stage: value as StageName }
+}
+
 export interface SafeCase {
   id: string
   labels: string[]
@@ -37,6 +92,8 @@ export interface SafeCase {
   /** Location of the failing assertion, when the runner reported a test-owned one. */
   assertion?: string
   assertionLine?: number
+  /** Last bounded helper stage reached, when the failure had no assertion location. */
+  stage?: StageName
 }
 export interface SafeReport {
   schemaVersion: 1
@@ -59,8 +116,16 @@ const runnerLabels: Record<Runner, ReadonlySet<string>> = {
 // Test-owned filenames only: no arbitrary paths, source excerpts, annotations,
 // messages, stacks or request bodies may ever reach a persisted report.
 const safeSourcePattern = /^(?:e2e\/[a-zA-Z0-9_-]+\.spec\.ts|tests\/(?:unit|components)\/[a-zA-Z0-9_./-]+\.(?:test|spec)\.tsx?)$/
+// A *failing assertion* may additionally live in the shared browser helpers.
+// Playwright reports the deepest user frame that threw, and the bounded guards
+// this report exists for — the 20s crash timer, the writer-lock poll, the
+// follower visibility check — are in `e2e/fixtures.ts`, not in a spec. Refusing
+// that file turned a known failing line into `assertion=unknown`. The pattern
+// still names one exact file inside `e2e/`, so nothing is opened up: no
+// directory, no `..`, no arbitrary helper, no product source.
+const safeAssertionPattern = /^(?:e2e\/[a-zA-Z0-9_-]+\.spec\.ts|e2e\/fixtures\.ts|tests\/(?:unit|components)\/[a-zA-Z0-9_./-]+\.(?:test|spec)\.tsx?)$/
 const reportKeys = new Set(['schemaVersion', 'runner', 'scope', 'runId', 'complete', 'errors', 'cases'])
-const caseKeys = new Set(['id', 'labels', 'status', 'attempts', 'source', 'line', 'assertion', 'assertionLine'])
+const caseKeys = new Set(['id', 'labels', 'status', 'attempts', 'source', 'line', 'assertion', 'assertionLine', 'stage'])
 
 export function caseId(name: string): string {
   return createHash('sha256').update(name).digest('hex')
@@ -83,11 +148,14 @@ export function labelsIn(title: string): string[] {
  * remaining rules keep arbitrary paths, source excerpts and dynamically
  * supplied annotations out of a persisted report.
  */
-function testOwnedLocation(file: unknown): { absolute: string; relative: string } | undefined {
+function testOwnedLocation(
+  file: unknown,
+  pattern: RegExp = safeSourcePattern,
+): { absolute: string; relative: string } | undefined {
   // Only reporters feed this, and they always pass an absolute module path.
   if (typeof file !== 'string' || !path.isAbsolute(file)) return undefined
   const relative = path.relative(root, file).replaceAll('\\', '/')
-  if (!safeSourcePattern.test(relative) || relative.split('/').includes('..')) return undefined
+  if (!pattern.test(relative) || relative.split('/').includes('..')) return undefined
   return { absolute: file, relative }
 }
 
@@ -110,13 +178,14 @@ export function safeSource(file: string, line: number, title?: string): { source
  *
  * Playwright hands the location out inside the same error object as `message`,
  * `stack` and `value`; this function reads exactly two properties so the rest
- * cannot be carried along by accident. The file must pass the same whitelist as
- * a declaration location and the line must really exist in that file: a drifted
- * or invented index would point the reader at unrelated content, which is worse
- * than no evidence at all.
+ * cannot be carried along by accident. The file must pass the assertion
+ * whitelist — a spec, a unit test, or the shared `e2e/fixtures.ts` helpers,
+ * which is where a bounded guard throws — and the line must really exist in
+ * that file: a drifted or invented index would point the reader at unrelated
+ * content, which is worse than no evidence at all.
  */
 export function safeAssertion(file: unknown, line: unknown): { assertion: string; assertionLine: number } | Record<string, never> {
-  const owned = testOwnedLocation(file)
+  const owned = testOwnedLocation(file, safeAssertionPattern)
   if (owned === undefined) return {}
   if (typeof line !== 'number' || !Number.isSafeInteger(line) || line < 1 || line > 1_000_000) return {}
   const text = readTestFile(owned.absolute)
@@ -204,16 +273,27 @@ export function validateReport(value: unknown, runner: Runner, scope: Scope, req
       || (item.source === undefined) !== (item.line === undefined)
       || (item.line !== undefined && (!Number.isSafeInteger(item.line) || item.line < 1 || item.line > 1_000_000))
       // A failing-assertion location is the same restricted kind of evidence: a
-      // whitelisted test file plus a line that really exists inside it. It is
-      // all-or-nothing, so a half-populated location cannot look trustworthy,
-      // and no message, stack, value, snippet or attachment may ride along.
+      // whitelisted test file (or the shared `e2e/fixtures.ts` helper module,
+      // where the bounded guards throw) plus a line that really exists inside
+      // it. It is all-or-nothing, so a half-populated location cannot look
+      // trustworthy, and no message, stack, value, snippet or attachment may
+      // ride along.
       || (item.assertion === undefined) !== (item.assertionLine === undefined)
       || (item.assertion !== undefined && (
-        typeof item.assertion !== 'string' || !safeSourcePattern.test(item.assertion)
+        typeof item.assertion !== 'string' || !safeAssertionPattern.test(item.assertion)
         || item.assertion.split('/').includes('..')
         || typeof item.assertionLine !== 'number'
         || !Number.isSafeInteger(item.assertionLine) || item.assertionLine < 1 || item.assertionLine > 1_000_000
-        || !lineExists(item.assertion, item.assertionLine)))) {
+        || !lineExists(item.assertion, item.assertionLine)))
+      // A stage marker is only ever a frozen identifier: the pattern rejects
+      // anything that is not an identifier, and the vocabulary rejects an
+      // identifier that no helper emits, so a test-authored string cannot carry
+      // note text or a path into the report. It is the *fallback* locator, so it
+      // may not accompany a real assertion location: claiming both would let a
+      // report look more precise than the run actually was.
+      || (item.stage !== undefined && (
+        typeof item.stage !== 'string' || !stagePattern.test(item.stage) || !stageNames.has(item.stage)))
+      || (item.stage !== undefined && item.assertion !== undefined)) {
       throw new Error('A case failed, was omitted/retried, or has invalid metadata')
     }
     ids.add(item.id)

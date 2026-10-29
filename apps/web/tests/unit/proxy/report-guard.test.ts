@@ -3,7 +3,8 @@ import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  caseId, E2E_LABELS, junit, labelsIn, parseReportArgs, reportScope, safeAssertion, safeSource, UNIT_LABELS, validateReport, type SafeReport,
+  caseId, E2E_LABELS, junit, labelsIn, parseReportArgs, reportScope, safeAssertion, safeSource, safeStage, STAGES,
+  stageName, UNIT_LABELS, validateReport, type SafeReport,
 } from '../../../scripts/check-test-reports'
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -164,7 +165,6 @@ describe('acceptance evidence guard', () => {
       path.join(webRoot, 'e2e', '..', 'scripts', 'check-test-reports.ts'),
       path.join(webRoot, 'src', 'App.tsx'),
       path.join(webRoot, 'playwright.config.ts'),
-      path.join(webRoot, 'e2e', 'fixtures.ts'),
       path.join(webRoot, 'e2e', 'nested', 'conflicts.spec.ts'),
       // A name that satisfies the pattern but has no file behind it cannot
       // supply a line, so no location is reported.
@@ -187,6 +187,64 @@ describe('acceptance evidence guard', () => {
     const located = { ...report(), cases: [{ ...report().cases[0], assertion: 'e2e/conflicts.spec.ts', assertionLine: 31 }] }
     expect(validateReport(located, 'vitest', 'focused', []).cases[0])
       .toMatchObject({ assertion: 'e2e/conflicts.spec.ts', assertionLine: 31 })
+  })
+
+  it('accepts the shared e2e/fixtures.ts helper as an assertion location and nothing looser', () => {
+    // Playwright reports the deepest user frame that threw. The bounded guards
+    // this report exists for (crash timer, writer-lock poll, follower check) are
+    // in the shared helper module, so refusing it turned a known line into
+    // `assertion=unknown`. Accept exactly that one file, still by real line.
+    const fixtures = path.join(specDir, 'fixtures.ts')
+    const fixtureLines = readFileSync(fixtures, 'utf8').split('\n')
+    const fixtureLineCount = fixtureLines.length
+    // A line that really exists is accepted and names the helper file.
+    expect(safeAssertion(fixtures, 1)).toEqual({ assertion: 'e2e/fixtures.ts', assertionLine: 1 })
+    expect(safeAssertion(fixtures, fixtureLineCount)).toEqual({ assertion: 'e2e/fixtures.ts', assertionLine: fixtureLineCount })
+    // The exact line of the crash guard is what a real failure would name, and
+    // it must be reported rather than dropped.
+    const crashLine = fixtureLines.findIndex((text) => text.includes("'Writer renderer did not report a crash'")) + 1
+    expect(crashLine, 'the crash guard must exist in the real file').toBeGreaterThan(0)
+    expect(safeAssertion(fixtures, crashLine)).toEqual({ assertion: 'e2e/fixtures.ts', assertionLine: crashLine })
+    // Beyond the file, zero, negative, fractional, non-numeric and absent lines.
+    for (const line of [fixtureLineCount + 1, 0, -3, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1', undefined]) {
+      expect(safeAssertion(fixtures, line), String(line)).toEqual({})
+    }
+    // Product code, configs, scripts, relative paths and escapes stay refused:
+    // the relaxation names one file, it does not open the e2e directory.
+    for (const file of [
+      path.join(webRoot, 'src', 'App.tsx'),
+      path.join(webRoot, 'scripts', 'check-test-reports.ts'),
+      path.join(webRoot, 'playwright.config.ts'),
+      path.join(webRoot, 'e2e', 'playwright-reporter.ts'),
+      path.join(webRoot, 'e2e', 'nested', 'fixtures.ts'),
+      // A path that escapes the web root must be refused; `path.join` would
+      // normalize a `..` back onto the real file, so this one really escapes.
+      path.resolve(webRoot, '..', 'e2e', 'fixtures.ts'),
+      // A near-miss name is not the helper module.
+      path.join(webRoot, 'e2e', 'fixture.ts'),
+      path.join(webRoot, 'e2e', 'fixtures.ts.bak'),
+      'e2e/fixtures.ts',
+      './e2e/fixtures.ts',
+      'https://example.test/e2e/fixtures.ts',
+      '',
+    ]) expect(safeAssertion(file, 1), file).toEqual({})
+    // `safeSource` (the test DECLARATION) is untouched by this relaxation: a
+    // case is still declared in a spec, never in a helper module.
+    expect(safeSource(fixtures, 1)).toEqual({})
+    // The report guard accepts the helper location and still requires a real line.
+    const helperLocated = { ...report(), cases: [{ ...report().cases[0], assertion: 'e2e/fixtures.ts', assertionLine: crashLine }] }
+    expect(validateReport(helperLocated, 'vitest', 'focused', []).cases[0])
+      .toMatchObject({ assertion: 'e2e/fixtures.ts', assertionLine: crashLine })
+    const helperOutOfRange = { ...report(), cases: [{ ...report().cases[0], assertion: 'e2e/fixtures.ts', assertionLine: fixtureLineCount + 1 }] }
+    expect(() => validateReport(helperOutOfRange, 'vitest', 'focused', [])).toThrow()
+    const helperRelative = { ...report(), cases: [{ ...report().cases[0], assertion: 'e2e/fixtures.ts' }] }
+    expect(() => validateReport(helperRelative, 'vitest', 'focused', [])).toThrow()
+    // A helper location may not smuggle error text beside it either.
+    const helperWithMessage = {
+      ...report(),
+      cases: [{ ...report().cases[0], assertion: 'e2e/fixtures.ts', assertionLine: crashLine, message: 'Writer renderer did not report a crash' }],
+    }
+    expect(() => validateReport(helperWithMessage, 'vitest', 'focused', [])).toThrow()
   })
 
   it('rejects assertion metadata that is partial, out of range, borrowed or text-bearing', () => {
@@ -216,6 +274,71 @@ describe('acceptance evidence guard', () => {
       { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, snippet: '> 31 | expect(x).toBe(y)' },
       { assertion: 'e2e/conflicts.spec.ts', assertionLine: 31, attachments: ['trace.zip'] },
     ]) expect(() => validateReport({ ...report(), cases: [{ ...base, ...change }] }, 'vitest', 'focused', [])).toThrow()
+  })
+
+  it('accepts only frozen stage identifiers and never the text around them', () => {
+    // A failure with no assertion location (timeout, fixture phase, a helper's
+    // own guard) is located by the last bounded stage marker instead.
+    expect(safeStage('crash_confirmed')).toEqual({ stage: 'crash_confirmed' })
+    expect(safeStage('lock_free_timeout')).toEqual({ stage: 'lock_free_timeout' })
+    expect(safeStage('unknown')).toEqual({ stage: 'unknown' })
+    // Every frozen name is accepted exactly, and none is accepted with padding.
+    for (const name of STAGES) expect(safeStage(name), name).toEqual({ stage: name })
+    for (const value of [
+      // Identifiers that no helper emits are not evidence: the vocabulary, not
+      // just the pattern, decides.
+      'not_a_real_stage', 'crash_confirm', 'CRASH_SENT', 'crash-sent', 'crash sent',
+      // Text that would leak a note body, path, message or markup is refused by
+      // the identifier pattern long before the vocabulary is consulted.
+      '', ' crash_sent', 'crash_sent ', 'crash_sent\n', 'crash_sent; rm -rf', 'note body',
+      'e2e/durability.spec.ts', 'expect(x).toBe(y)', '<script>', 'é', 'x'.repeat(64), 'a'.repeat(65),
+      // Non-strings, including numbers and null, never become a stage.
+      undefined, null, 0, 1, 1.5, true, {}, [], Symbol('stage'),
+    ]) expect(safeStage(value)).toEqual({})
+    expect(stageName('crash_sent')).toBe('crash_sent')
+    expect(stageName('note body')).toBe('unknown')
+    expect(stageName(undefined)).toBe('unknown')
+    expect(stageName(null)).toBe('unknown')
+    expect(stageName(42)).toBe('unknown')
+  })
+
+  it('rejects stage metadata that is off-vocabulary or shaped like other evidence', () => {
+    const base = report().cases[0]
+    for (const change of [
+      // Not in the frozen inventory.
+      { stage: 'crash_confirm' },
+      { stage: 'not_a_real_stage' },
+      { stage: 'lock_free' },
+      // Wrong type or wrong shape: an object or array could smuggle structure.
+      { stage: 1 },
+      { stage: null },
+      { stage: true },
+      { stage: ['crash_sent'] },
+      { stage: { name: 'crash_sent' } },
+      // Text-bearing or path-like values, and identifier-shaped non-members.
+      { stage: 'note body' },
+      { stage: 'crash sent' },
+      { stage: 'crash_sent\n' },
+      { stage: 'e2e/durability.spec.ts' },
+      { stage: 'x'.repeat(65) },
+      // A stage may not arrive together with a fake locator or an error field.
+      { stage: 'crash_sent', message: 'Expect failed' },
+      { stage: 'crash_sent', stack: 'at spec.ts:31' },
+      { stage: 'crash_sent', value: 'retained-local' },
+      { stage: 'crash_sent', snippet: '> 122 | await crashPage(context, page)' },
+      { stage: 'crash_sent', attachments: ['trace.zip'] },
+      // Half-identifying pairs stay refused: a stage is not a location, and it
+      // may not be claimed alongside one, because it is the fallback locator.
+      { stage: 'crash_sent', assertion: 'e2e/durability.spec.ts' },
+      { stage: 'crash_sent', assertionLine: 157 },
+      { stage: 'crash_sent', assertion: 'e2e/durability.spec.ts', assertionLine: 157 },
+    ]) expect(() => validateReport({ ...report(), cases: [{ ...base, ...change }] }, 'vitest', 'focused', [])).toThrow()
+    // The accepted shape is one frozen identifier, and it survives a round trip.
+    const accepted = { ...report(), cases: [{ ...base, stage: 'lock_free_timeout' as const }] }
+    expect(validateReport(accepted, 'vitest', 'focused', []).cases[0]).toMatchObject({ stage: 'lock_free_timeout' })
+    // JUnit serialization keeps exactly the same redacted shape: the stage is
+    // not written into the XML, so JSON and XML still compare byte for byte.
+    expect(junit(accepted)).toBe(junit(report()))
   })
 
   it('enforces the frozen load-bearing inventory without a hardcoded total count', () => {

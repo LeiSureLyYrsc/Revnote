@@ -661,11 +661,17 @@ def safe_assertion(case: dict[str, object]) -> str | None:
     assertion text can reach the log. A location that does not name a real line
     of a real owned spec is dropped rather than printed: a wrong pointer is
     worse evidence than none.
+
+    ``e2e/fixtures.ts`` is accepted as well, because Playwright reports the
+    deepest user frame that threw and the bounded guards this diagnostic exists
+    for (the crash timer, the writer-lock poll, the follower check) live there.
+    It is still one exact file directly inside ``e2e/``: no directory, no
+    ``..`` segment and no product source can pass.
     """
     assertion = case.get("assertion")
     line = case.get("assertionLine")
     if not isinstance(assertion, str) or not re.fullmatch(
-        r"e2e/[a-zA-Z0-9_-]+\.spec\.ts", assertion
+        r"e2e/(?:[a-zA-Z0-9_-]+\.spec\.ts|fixtures\.ts)", assertion
     ):
         return None
     if type(line) is not int or not 1 <= line <= 1_000_000:
@@ -680,6 +686,52 @@ def safe_assertion(case: dict[str, object]) -> str | None:
     except OSError:
         return None
     return f"{assertion}:{line}"
+
+
+#: Frozen stage vocabulary; keep in sync with ``STAGES`` in check-test-reports.ts.
+STAGES = frozenset(
+    {
+        "unknown",
+        "login_view",
+        "login_ok",
+        "note_create_enter",
+        "note_created",
+        "note_open",
+        "idle_enter",
+        "idle_ok",
+        "edit_enter",
+        "edit_filled",
+        "edit_durable",
+        "retry_enter",
+        "retry_clicked",
+        "follower_enter",
+        "follower_ready",
+        "crash_enter",
+        "crash_sent",
+        "crash_confirmed",
+        "crash_closed",
+        "lock_free_enter",
+        "lock_free_ok",
+        "lock_free_timeout",
+        "server_body_enter",
+        "server_body_ok",
+    }
+)
+
+
+def safe_stage(case: dict[str, object]) -> str:
+    """The bounded ``stage`` marker of a failing case, or ``unknown``.
+
+    Mirrors the frozen vocabulary in ``apps/web/scripts/check-test-reports.ts``.
+    The value is test-authored, so it is matched against the same identifier
+    pattern *and* an explicit list here: a corrupted or hand-edited report can
+    therefore never inject text into a CI log, and an absent marker degrades to
+    ``unknown`` rather than to an empty field.
+    """
+    value = case.get("stage")
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+        return "unknown"
+    return value if value in STAGES else "unknown"
 
 
 def print_safe_browser_failures(report_path: Path, run_id: str, scope: str) -> None:
@@ -748,7 +800,7 @@ def print_safe_browser_failures(report_path: Path, run_id: str, scope: str) -> N
             )
             where = f"assertion={assertion}" if assertion else "assertion=unknown"
             print(
-                f"Browser failure: {source}:{line} {where} "
+                f"Browser failure: {source}:{line} {where} stage={safe_stage(case)} "
                 f"labels={','.join(safe_labels)} case={case_id}",
                 file=sys.stderr,
             )

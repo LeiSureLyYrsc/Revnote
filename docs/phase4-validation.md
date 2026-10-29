@@ -122,7 +122,7 @@ api/full: passed=1157 required=46; zero skips/failures/errors
 | `uv run ruff format --check apps/api/scripts` | 0 |
 | `uvx --from ty==0.0.94 ty check <runner> <report script>` | 0 |
 
-诊断输出格式为 `Browser failure: e2e/<file>.spec.ts:<line> labels=<label> case=<sha256>`，上限 25 行；不输出 message、stack、正文、请求体或凭据。报告目录 `apps/web/reports/` 已被忽略，仓库中无任何报告、HAR 或认证状态被跟踪。
+诊断输出格式为 `Browser failure: e2e/<file>.spec.ts:<line> assertion=<位置或 unknown> stage=<阶段名或 unknown> labels=<label> case=<sha256>`，上限 25 行；不输出 message、stack、正文、请求体或凭据。`assertion` 位置除各 spec 外还允许 `e2e/fixtures.ts`（Playwright 报告最深的用户抛错帧，而崩溃定时器、写锁轮询、follower 可见性等有界守卫都在该共享 helper 中，此前拒绝该文件本身就是 `assertion=unknown` 的成因之一）；放宽范围仅为 `e2e/` 下这一个确切文件，相对路径、嵌套目录、`..`、产品源码与配置仍全部拒绝，行号必须在文件中真实存在，且 `source`（用例声明位置）不随之放宽。`stage` 只在用例没有断言行号时出现，取值来自固定词表（`apps/web/scripts/check-test-reports.ts` 的 `STAGES`，`run_web_e2e.py` 中有同序镜像），先按标识符正则、再按词表成员双重校验，非法值一律降级为 `unknown`。报告目录 `apps/web/reports/` 已被忽略，仓库中无任何报告、HAR 或认证状态被跟踪。
 
 ## 真实浏览器 E2E（首次运行，未通过）
 

@@ -11,8 +11,10 @@ are repo-root relative)::
     uv run alembic -c apps/api/alembic.ini upgrade head
     uv run alembic -c apps/api/alembic.ini downgrade base
 
-The scaffold ships one empty baseline revision: it creates **no** business
-tables and this module never mass-creates schema from ORM metadata.
+Schema is owned by the revisions. This module imports the model package **only**
+so ``Base.metadata`` is populated for autogenerate/``alembic check`` comparison
+and so constraint names resolve identically in ``op.*`` calls; it never creates
+schema from the ORM (no ``create_all`` anywhere).
 """
 
 from __future__ import annotations
@@ -25,6 +27,10 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# Explicit registration: the six Phase 2 tables must be on Base.metadata
+# regardless of which modules the rest of the process happened to import.
+# (Also read below for ``TARGET_TABLES``, so this is a real use, not a side-effect.)
+import revnote_api.models
 from revnote_api.config import get_settings
 from revnote_api.db.base import Base
 
@@ -33,8 +39,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# Target metadata for future autogenerate. It is intentionally **empty** today
-# (no models are declared in the scaffold); autogenerate must produce nothing.
+#: Tables this phase owns, asserted against by the migration tests.
+TARGET_TABLES: frozenset[str] = frozenset(revnote_api.models.MODEL_TABLES)
+
+# Target metadata for autogenerate. Populated by the model package above; the
+# migration revisions, not the ORM, are what actually create the schema.
 target_metadata = Base.metadata
 
 settings = get_settings()

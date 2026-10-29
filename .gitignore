@@ -99,3 +99,6 @@ temp/
 # Local task prompts are not part of the published scaffold.
 /plan-prompt.md
 /build-prompt.md
+
+# Local orchestration state.
+.slim/deepwork/

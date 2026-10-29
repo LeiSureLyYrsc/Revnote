@@ -17,6 +17,7 @@ from revnote_api.db import session as session_module
 from revnote_api.db.base import Base
 from revnote_api.db.engine import create_engine_for_url, dispose_engines, get_engine
 from revnote_api.db.session import get_sessionmaker, reset_session_state, session_scope
+from revnote_api.models import MODEL_TABLES
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +37,22 @@ def _clean_db_state():
     _reset()
 
 
-def test_base_metadata_is_empty() -> None:
-    """No business tables in the scaffold; schema comes from Alembic only."""
-    assert list(Base.metadata.tables) == []
+def test_base_metadata_declares_the_six_kernel_tables() -> None:
+    """Phase 2: the six domain tables are declared, and nothing else.
+
+    Schema is still owned by Alembic (``create_all`` is never called), so this
+    asserts *declared metadata*, not a live database.
+    """
+    assert tuple(sorted(Base.metadata.tables)) == tuple(sorted(MODEL_TABLES))
+    # Pinned literally too: MODEL_TABLES must not silently drift.
+    assert tuple(sorted(MODEL_TABLES)) == (
+        "change_events",
+        "folders",
+        "notes",
+        "op_ledger",
+        "users",
+        "workspaces",
+    )
 
 
 def test_naming_convention_is_configured() -> None:
@@ -46,6 +60,11 @@ def test_naming_convention_is_configured() -> None:
 
     assert convention["pk"] == "pk_%(table_name)s"
     assert convention["fk"] == "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s"
+    # Regression: `column_0_list_name` is not a SQLAlchemy token (it raised
+    # KeyError for every composite index/unique constraint); `column_0_N_name` is.
+    assert convention["ix"] == "ix_%(table_name)s_%(column_0_N_name)s"
+    assert convention["uq"] == "uq_%(table_name)s_%(column_0_N_name)s"
+    assert convention["ck"] == "ck_%(table_name)s_%(constraint_name)s"
 
 
 def test_engine_is_created_lazily(settings: Settings) -> None:

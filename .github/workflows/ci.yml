@@ -67,6 +67,8 @@ jobs:
       # set here — the unit tests assert their defaults, so a job-wide value
       # would break unrelated assertions. They are injected per step instead.
       TEST_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_ci
+      TEST_MIGRATION_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_ci_migrations
+      REQUIRE_POSTGRES_TESTS: "1"
 
     steps:
       - name: Checkout
@@ -87,6 +89,24 @@ jobs:
         # --locked fails when uv.lock disagrees with pyproject.toml rather than
         # quietly re-resolving.
         run: uv sync --locked
+
+      - name: Prepare a separate disposable migration database
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          async def main():
+              url = os.environ["TEST_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
+              conn = await asyncpg.connect(url)
+              try:
+                  await conn.execute("CREATE DATABASE revnote_ci_migrations")
+              finally:
+                  await conn.close()
+
+          asyncio.run(main())
+          PY
 
       - name: Lint (ruff check)
         run: uv run ruff check apps/api
@@ -146,11 +166,9 @@ jobs:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: uv run alembic -c apps/api/alembic.ini current
 
-      - name: Verify the baseline created no business tables
-        # Inspect the live catalog instead of trusting the migration exit code.
-        # Only Alembic's bookkeeping table may exist: any note / workspace /
-        # change_event / attachment table is a scaffold regression. asyncpg comes
-        # from the project venv, so no runner-level psql client is required.
+      - name: Verify exactly the Phase 2 domain tables exist
+        # Inspect the real catalog; no attachment/revision/outbox tables belong
+        # to this phase. Detailed constraints are verified by PostgreSQL tests.
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: |
@@ -185,14 +203,11 @@ jobs:
               tables = [row["tablename"] for row in rows]
               print(f"tables after 'upgrade head': {tables}")
 
-              unexpected = [t for t in tables if t != "alembic_version"]
-              if unexpected:
-                  print(f"::error::baseline created unexpected tables: {unexpected}")
+              expected = {"alembic_version", "users", "workspaces", "folders", "notes", "change_events", "op_ledger"}
+              if set(tables) != expected:
+                  print(f"::error::schema mismatch: expected {sorted(expected)}, got {tables}")
                   return 1
-              if "alembic_version" not in tables:
-                  print("::error::alembic_version missing: the migration did not apply")
-                  return 1
-              print("OK: baseline applied, no business tables created")
+              print("OK: Phase 2 schema applied, exactly six domain tables")
               return 0
 
 
@@ -200,9 +215,9 @@ jobs:
           PY
           uv run python "$helper"
 
-      - name: Alembic downgrade base (baseline must be reversible)
+      - name: Alembic downgrade base on migration database only
         env:
-          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+          DATABASE_URL: ${{ env.TEST_MIGRATION_DATABASE_URL }}
         run: uv run alembic -c apps/api/alembic.ini downgrade base
 
       - name: Upload integration test report

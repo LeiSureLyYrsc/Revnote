@@ -14,6 +14,7 @@ Real ``upgrade``/``downgrade`` execution lives in
 
 from __future__ import annotations
 
+import ast
 import configparser
 from pathlib import Path
 
@@ -29,6 +30,26 @@ def _raw_ini() -> configparser.RawConfigParser:
     parser = configparser.RawConfigParser()
     parser.read(ALEMBIC_INI, encoding="utf-8")
     return parser
+
+
+def _called_names(source: str) -> set[str]:
+    """Attribute names actually called in a module (so docstrings never match)."""
+    return {
+        node.func.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """First-party modules a file imports (``import a.b`` / ``from a.b import x``)."""
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    return {module for module in modules if module.startswith("revnote_api")}
 
 
 def test_alembic_ini_exists() -> None:
@@ -66,9 +87,20 @@ def test_ini_is_reachable_from_repo_root_invocation() -> None:
 def test_env_py_never_mass_creates_schema() -> None:
     """Schema is owned by revisions; bulk metadata creation must not appear."""
     env_source = (API_DIR / "migrations" / "env.py").read_text(encoding="utf-8")
+    called = _called_names(env_source)
 
-    for forbidden in ("create_all", "drop_all", "CheckConstraint"):
-        assert forbidden not in env_source
+    assert not called & {"create_all", "drop_all"}
+    assert "CheckConstraint" not in env_source
+
+
+def test_env_py_imports_models_for_target_metadata() -> None:
+    """Phase 2: ``env.py`` explicitly imports the model package (plan §3)."""
+    env_source = (API_DIR / "migrations" / "env.py").read_text(encoding="utf-8")
+
+    assert "import revnote_api.models" in env_source
+    assert env_source.index("import revnote_api.models") < env_source.index(
+        "target_metadata = Base.metadata"
+    )
 
 
 def test_env_py_is_async_and_uses_settings() -> None:
@@ -80,23 +112,90 @@ def test_env_py_is_async_and_uses_settings() -> None:
     assert "target_metadata = Base.metadata" in env_source
 
 
-def test_single_baseline_revision_is_empty() -> None:
+def test_revision_chain_is_baseline_then_kernel_core() -> None:
+    """One head: 0001_baseline (empty) -> 0002_sync_kernel_core (six tables)."""
     versions = sorted((API_DIR / "migrations" / "versions").glob("*.py"))
 
-    assert [path.name for path in versions] == ["0001_baseline.py"]
+    assert [path.name for path in versions] == [
+        "0001_baseline.py",
+        "0002_sync_kernel_core.py",
+    ]
 
-    source = versions[0].read_text(encoding="utf-8")
-    assert 'revision: str = "0001_baseline"' in source
-    assert "down_revision: str | None = None" in source
-    assert "op.create_table" not in source
-    assert "op.execute" not in source
+    baseline = versions[0].read_text(encoding="utf-8")
+    assert 'revision: str = "0001_baseline"' in baseline
+    assert "down_revision: str | None = None" in baseline
+    assert "op.create_table" not in baseline
+    assert "op.execute" not in baseline
+
+    kernel = versions[1].read_text(encoding="utf-8")
+    assert 'revision: str = "0002_sync_kernel_core"' in kernel
+    assert 'down_revision: str | None = "0001_baseline"' in kernel
+    assert kernel.count("def upgrade") == 1
+    assert kernel.count("def downgrade") == 1
 
 
-def test_scaffold_has_no_models_package() -> None:
-    """Guardrail: no ORM models / CRUD surface in this scaffold."""
-    assert not (API_DIR / "src" / "revnote_api" / "models").exists()
-    assert not (API_DIR / "src" / "revnote_api" / "kernel").exists()
-    assert not (API_DIR / "src" / "revnote_api" / "adapters").exists()
+def test_models_package_exists_and_declares_only_the_kernel_tables() -> None:
+    """Phase 2 flips the old "no models" guardrail: models exist, kernel/adapter don't."""
+    models_dir = API_DIR / "src" / "revnote_api" / "models"
+
+    assert (models_dir / "__init__.py").is_file()
+    assert sorted(path.name for path in models_dir.glob("*.py")) == [
+        "__init__.py",
+        "change_event.py",
+        "folder.py",
+        "note.py",
+        "op_ledger.py",
+        "user.py",
+        "workspace.py",
+    ]
+
+    imported = _imported_modules(models_dir / "__init__.py")
+    assert imported == {
+        "revnote_api.db.base",
+        "revnote_api.models.change_event",
+        "revnote_api.models.folder",
+        "revnote_api.models.note",
+        "revnote_api.models.op_ledger",
+        "revnote_api.models.user",
+        "revnote_api.models.workspace",
+    }
+
+
+def test_models_package_is_layered_below_services_and_transport() -> None:
+    """Models are pure schema: no FastAPI/HTTP/engine/session/service imports.
+
+    This replaces the scaffold's "no models package" guardrail with the Phase 2
+    rule from plan §3 (models must stay importable without a server or web stack),
+    which stays true no matter what the kernel/service layer grows into.
+    """
+    models_dir = API_DIR / "src" / "revnote_api" / "models"
+    forbidden = {
+        "fastapi",
+        "starlette",
+        "httpx",
+        "uvicorn",
+        "revnote_api.api",
+        "revnote_api.app",
+        "revnote_api.main",
+        "revnote_api.services",
+        "revnote_api.kernel",
+        "revnote_api.adapters",
+        "revnote_api.db.engine",
+        "revnote_api.db.session",
+        "revnote_api.config",
+    }
+
+    for path in sorted(models_dir.glob("*.py")):
+        imported = _imported_modules(path)
+        assert not imported & forbidden, f"{path.name} imports {imported & forbidden}"
+
+
+def test_models_never_open_connections_or_create_schema() -> None:
+    models_dir = API_DIR / "src" / "revnote_api" / "models"
+
+    for path in sorted(models_dir.glob("*.py")):
+        called = _called_names(path.read_text(encoding="utf-8"))
+        assert not called & {"create_all", "drop_all", "execute", "commit"}, path.name
 
 
 @pytest.mark.parametrize("path", ["migrations/env.py", "migrations/script.py.mako"])

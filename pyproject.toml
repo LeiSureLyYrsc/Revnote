@@ -51,6 +51,8 @@ testpaths = ["apps/api/tests"]
 addopts = "-ra --strict-markers --strict-config"
 markers = [
     "integration: needs a real PostgreSQL server (set TEST_DATABASE_URL, else skipped)",
+    "concurrency: independent PostgreSQL connections verify write invariants",
+    "migrations: destructive migration roundtrips on TEST_MIGRATION_DATABASE_URL only",
 ]
 
 # --------------------------------------------------------------------------- #

@@ -105,15 +105,21 @@ class Settings(BaseSettings):
     auth_session_ttl_s: int = Field(default=2_592_000, gt=0)
     #: Closed by default: a fresh deployment has no self-service signup (D6).
     auth_registration_open: bool = False
-    #: Password length policy. The locked override is 8-256 characters; UTF-8 is
-    #: additionally capped at 1024 bytes (never trimmed or truncated).
-    auth_password_min_chars: int = Field(default=8, ge=8, le=1_024)
-    auth_password_max_chars: int = Field(default=256, ge=8, le=1_024)
-    #: Argon2id cost parameters; recorded in the hash, so a change is migratable
-    #: through ``check_needs_rehash`` rather than invalidating passwords.
-    #: ``ARGON2_MEMORY_COST`` is the protocol name (plan §7); the field reads in
-    #: KiB because that is the unit Argon2 itself takes. Both spellings are
-    #: accepted so an operator copying the plan verbatim works.
+    #: Password length policy. Locked to **8-256 characters** (D7 override), and
+    #: UTF-8 additionally capped at 1024 bytes (never trimmed or truncated). The
+    #: bounds are clamped here, not merely documented: a deployment must not be able
+    #: to widen the policy past the locked ceiling, because the byte cap alone would
+    #: then allow a request to force unbounded Argon2 input.
+    auth_password_min_chars: int = Field(default=8, ge=8, le=256)
+    auth_password_max_chars: int = Field(default=256, ge=8, le=256)
+    #: Argon2id cost parameters. These are **informational only**: the hasher's
+    #: costs are locked module constants in :mod:`revnote_api.security.passwords`
+    #: (D7: 64 MiB / t=3 / p=4), and ``AuthService`` refuses to start if these
+    #: values disagree with it. They are declared (and documented in §7) so the
+    #: protocol numbers are visible in configuration, not so they can be tuned.
+    #: ``ARGON2_MEMORY_COST`` is the protocol name; the field reads in KiB because
+    #: that is the unit Argon2 itself takes. Both spellings are accepted so an
+    #: operator copying the plan verbatim works.
     argon2_memory_kib: int = Field(
         default=65_536,
         ge=8_192,
@@ -127,7 +133,7 @@ class Settings(BaseSettings):
 
     # -- sync (Phase 3) ----------------------------------------------------- #
     #: A push carries 1-50 ops (D9).
-    sync_push_max_ops: int = Field(default=50, ge=1)
+    sync_push_max_ops: int = Field(default=50, ge=1, le=50)
     #: Raw JSON body budget for a push request (D9: 2 MiB).
     sync_push_max_bytes: int = Field(default=2_097_152, ge=1_024)
     #: HTTP-layer note body budget (D9). The kernel's own CHECK is untouched.
@@ -214,6 +220,8 @@ class Settings(BaseSettings):
             for name in type(self).model_fields
         )
         return f"Settings({fields})"
+
+    __str__ = __repr__
 
 
 @lru_cache(maxsize=1)

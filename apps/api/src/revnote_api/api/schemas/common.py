@@ -69,7 +69,7 @@ def _validate_decimal(value: str) -> str:
         raise ValueError("decimal_string_required")
     if not _DECIMAL_RE.fullmatch(value):
         raise ValueError("decimal_string_required")
-    if int(value) > BIGINT_MAX:
+    if len(value) > 19 or int(value) > BIGINT_MAX:
         raise ValueError("decimal_string_out_of_range")
     return value
 

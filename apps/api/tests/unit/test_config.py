@@ -322,3 +322,122 @@ def test_phase3_settings_repr_shows_no_credential_value(
         name for name in Settings.model_fields if name.endswith(("_secret", "_password", "_token"))
     }
     assert credential_fields == set()
+
+
+def test_settings_str_is_the_masked_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``str(settings)`` must be as safe as ``repr``.
+
+    Most logging paths use ``%s``, and pydantic's default ``__str__`` is not the
+    custom ``__repr__``. Without ``__str__ = __repr__`` a ``logger.info("%s",
+    settings)`` would print the DSN with its password.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:sup3rs3cret@db:5432/revnote")
+    settings = Settings(_env_file=None)
+
+    assert str(settings) == repr(settings)
+    assert "sup3rs3cret" not in str(settings)
+    assert "db:5432/revnote" in str(settings)
+    # The masking does not degrade into "everything is X": non-secret fields stay
+    # readable, otherwise the log line would be useless.
+    assert str(settings.auth_password_min_chars) in str(settings)
+
+
+def test_settings_log_format_does_not_leak_the_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The actual logging idiom (``%s``) is what gets asserted, not ``repr``."""
+    import logging
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:sup3rs3cret@db:5432/revnote")
+
+    record = logging.LogRecord(
+        name="revnote_api.main",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="starting with %s",
+        args=(Settings(_env_file=None),),
+        exc_info=None,
+    )
+
+    assert "sup3rs3cret" not in record.getMessage()
+
+
+# --------------------------------------------------------------------------- #
+# password policy: clamped to the locked 8-256 range
+# --------------------------------------------------------------------------- #
+
+
+def test_the_password_bounds_cannot_be_widened_past_the_locked_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1024 would let a request force far more Argon2 input than D7 allows.
+
+    The byte cap alone does not bound the work: 1024 characters of multi-byte
+    UTF-8 still has to be hashed, and the locked decision is 256 characters.
+    """
+    monkeypatch.setenv("AUTH_PASSWORD_MAX_CHARS", "1024")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_the_password_maximum_accepts_the_locked_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_PASSWORD_MAX_CHARS", "256")
+
+    assert Settings(_env_file=None).auth_password_max_chars == 256
+
+
+def test_the_password_minimum_cannot_exceed_the_locked_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A minimum above 256 could never be satisfied by a valid password."""
+    monkeypatch.setenv("AUTH_PASSWORD_MIN_CHARS", "300")
+    monkeypatch.delenv("AUTH_PASSWORD_MAX_CHARS", raising=False)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_the_password_minimum_still_has_the_locked_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """8 is the floor; the plan's original 15 is superseded, 4 is refused."""
+    monkeypatch.setenv("AUTH_PASSWORD_MIN_CHARS", "8")
+    assert Settings(_env_file=None).auth_password_min_chars == 8
+
+    monkeypatch.setenv("AUTH_PASSWORD_MIN_CHARS", "7")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_argon2_settings_are_declared_as_the_locked_costs_and_fixed() -> None:
+    """D7 costs are locked in the hasher; the settings mirror them, not tune them.
+
+    They exist so the protocol numbers are visible in configuration, and
+    ``AuthService`` refuses to start on a mismatch. This test pins the mirror so a
+    drifting default is caught here rather than at login time.
+    """
+    settings = Settings(_env_file=None)
+
+    assert settings.argon2_memory_kib == 65_536  # 64 MiB
+    assert settings.argon2_time_cost == 3
+    assert settings.argon2_parallelism == 4
+
+
+def test_the_argon2_field_documents_that_it_cannot_tune_the_hasher() -> None:
+    """The comment is part of the contract: it must not promise tunability.
+
+    A reader who believes ``ARGON2_TIME_COST=1`` takes effect would deploy weaker
+    hashing than they think. The real guard is :func:`AuthService.__init__`, which
+    refuses a mismatch; this pins the documentation next to it.
+    """
+    import inspect
+
+    from revnote_api import config as config_module
+
+    source = inspect.getsource(config_module)
+
+    assert "informational only" in source
+    assert "locked module constants" in source
+    assert "refuses to start" in source

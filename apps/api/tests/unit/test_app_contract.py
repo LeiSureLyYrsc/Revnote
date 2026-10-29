@@ -43,11 +43,6 @@ pytestmark = pytest.mark.anyio
 
 #: What ``/api/v1`` must NOT advertise yet: these are added by later commits.
 FORBIDDEN_V1_PATHS = {
-    "/api/v1/auth/register",
-    "/api/v1/auth/login",
-    "/api/v1/auth/refresh",
-    "/api/v1/auth/logout",
-    "/api/v1/me",
     "/api/v1/me/sessions",
     "/api/v1/workspaces/{ws}/sync/push",
     "/api/v1/workspaces/{ws}/sync/pull",
@@ -57,7 +52,15 @@ FORBIDDEN_V1_PATHS = {
 }
 
 #: The exact route set this commit publishes.
-EXPECTED_PATHS = {"/", "/health"}
+EXPECTED_PATHS = {
+    "/",
+    "/health",
+    "/api/v1/auth/register",
+    "/api/v1/auth/login",
+    "/api/v1/auth/refresh",
+    "/api/v1/auth/logout",
+    "/api/v1/me",
+}
 
 
 class _ValidationProbe(BaseModel):
@@ -516,18 +519,16 @@ async def test_a_500_raised_above_the_request_id_middleware_still_has_a_legal_id
 # --------------------------------------------------------------------------- #
 
 
-async def test_openapi_publishes_only_the_liveness_routes(http: AsyncClient) -> None:
+async def test_openapi_publishes_only_implemented_routes(http: AsyncClient) -> None:
     """Guardrail: no half-built business endpoint may be advertised.
 
-    The versioned surface is added endpoint-by-endpoint in later commits; until
-    then the document must contain exactly the two liveness paths. This is a
-    whitelist, not a blacklist, so a route added by accident fails here.
+    The exact approved whitelist grows only when each endpoint is implemented.
     """
     schema = (await http.get("/openapi.json")).json()
 
     assert set(schema["paths"]) == EXPECTED_PATHS
     assert not set(schema["paths"]) & FORBIDDEN_V1_PATHS
-    assert not any(path.startswith("/api/") for path in schema["paths"])
+    assert all(path.startswith("/api/v1/") for path in schema["paths"] if path.startswith("/api/"))
 
 
 async def test_openapi_documents_the_contract_skeleton(http: AsyncClient) -> None:
@@ -608,10 +609,11 @@ def test_every_versioned_route_lives_under_the_v1_prefix() -> None:
     router_module = importlib.import_module("revnote_api.api.router")
 
     assert router_module.api_v1.prefix == "/api/v1"
-    # Nothing is published under ``/api/v1`` yet; when endpoints land, every route
-    # on the versioned router must carry the prefix (it does by construction).
-    for route in router_module.api_v1.routes:  # pragma: no cover
-        assert route.path_format.startswith("/api/v1")
+    # Inspect the resolved published paths: recent FastAPI keeps nested routers
+    # lazy, so its private _IncludedRouter is not itself an APIRoute.
+    paths = create_app().openapi()["paths"]
+    assert set(paths) == EXPECTED_PATHS
+    assert all(path.startswith("/api/v1/") for path in paths if path not in {"/", "/health"})
 
 
 def test_routes_module_is_a_package_not_a_module() -> None:

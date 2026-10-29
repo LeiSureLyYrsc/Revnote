@@ -34,6 +34,10 @@ from revnote_api._version import __version__
 from revnote_api.api.errors import install_error_handlers
 from revnote_api.api.middleware.request_id import RequestIdMiddleware
 from revnote_api.api.middleware.request_limits import BodyLimitMiddleware
+from revnote_api.api.middleware.safe_logging import (
+    RouteTemplateMiddleware,
+    install_log_redaction,
+)
 from revnote_api.api.router import router
 from revnote_api.config import Settings, get_settings
 from revnote_api.db.engine import dispose_engines
@@ -63,6 +67,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
+        auth_service = getattr(app.state, "auth_service", None)
+        if auth_service is not None:
+            auth_service.close()
         # Best-effort: dispose pooled DB connections even if shutdown is noisy.
         reset_session_state()
         try:
@@ -86,6 +93,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         swagger_ui_parameters={"persistAuthorization": True},
     )
     app.state.settings = settings
+
+    # Before any request can be logged: the uvicorn access line and the server's
+    # exception line are the two sinks that would otherwise print a raw query
+    # string and a SQL-bearing traceback. Narrow filters, no global disable.
+    install_log_redaction()
 
     install_error_handlers(app)
     app.include_router(router)
@@ -112,6 +124,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         push_limit=settings.sync_push_max_bytes,
     )
     app.add_middleware(RequestIdMiddleware)
+    # Outermost: it reads ``scope["state"]["request_id"]`` (populated by the
+    # middleware it wraps) and the matched route, then publishes both for the log
+    # filters. Must be added last to sit outside everything it observes.
+    app.add_middleware(RouteTemplateMiddleware)
 
     # FastAPI treats ``openapi`` as a method; replacing it is the documented way
     # to extend the generated document. ``cast`` keeps the checker honest about

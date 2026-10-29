@@ -2,7 +2,7 @@
 
 Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 API；Joplin Server 协议仅是后续兼容适配器，非 Data API、非产品主路径。
 
-**当前为受控预览，不是公网生产部署。** Phase 4 正在把 Web 接入 Phase 3 的认证与原生 HTTP push/pull/snapshot；已实现本机持久化与会话模块，完整浏览器及发布门禁仍以 [Phase 4 实际验收记录](docs/phase4-validation.md) 为准。API 可达不代表 Web 正文已保存。附件与完整部署不在本阶段范围内。
+**当前为受控预览，不是公网生产部署。** Phase 4 已将 Web 接入 Phase 3 的认证与原生 HTTP push/pull/snapshot：本机持久化（IndexedDB）、会话轮换、冻结命令队列、离线可恢复、人工冲突处理与真实浏览器验收均已完成，验收证据见 [Phase 4 实际验收记录](docs/phase4-validation.md)。仍不提供完全离线冷启动、后台同步、附件、Joplin 桥与自动合并。API 可达不代表 Web 正文已保存；本地缓存不是备份。附件与完整部署不在本阶段范围内。
 
 当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/MinIO 的镜像拉取与运行也尚未完成验收，详见下文限制。
 

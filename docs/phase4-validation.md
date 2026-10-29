@@ -186,22 +186,47 @@ api/full: passed=1157 required=46; zero skips/failures/errors
 
 另修正两处自身问题：报告守卫用例不再硬编码 spec 行号（改为从文件解析，保持严格但不受无关编辑影响）；`resync_preservation` 标题按 Oracle A 项改为「保留」语义。
 
-## 全量真实浏览器验收（最终通过）
+## 全量真实浏览器验收（本地最终通过）
 
-第三轮门禁运行（已提交代码状态，全新一次性数据库）：`pnpm test:e2e` →
+本地门禁（已提交代码状态，全新一次性数据库）：`pnpm test:e2e` →
 
 ```text
 Web E2E full: passed; browser report guarded; child output redacted.
 Owned API/Vite/browser groups stopped; external PostgreSQL remains caller-owned.
 ```
 
-报告核对（`apps/web/reports/full/playwright.json`）：`scope=full`、`complete=true`、`errors=0`、`cases=16`、**16 passed**；16 个固定承重标签全部覆盖；`attempts` 全为 1（无重试）；报告中无 `message`/`stack`/正文/凭据字段。
+报告核对（`apps/web/reports/full/playwright.json`）：`scope=full`、`complete=true`、`errors=0`、`cases=16`、**16 passed**；16 个固定承重标签全部覆盖；`attempts` 全为 1（无重试）；报告中无 `message`/`stack`/正文/凭据字段。崩溃注入修复后连跑两次真实 E2E 均 `cases=16 passed=16 errors=0`、退出码 0。
 
 拓扑为真实 Chromium → Vite 同源代理 → 真实 uvicorn → Alembic 迁移的真实临时 PostgreSQL（第三个一次性库，与 pytest 业务库、迁移库相互独立）。响应丢失用例先在真实服务端完成提交并确认 event/ledger 各 1 条，再丢弃响应。
 
-## 提交与推送前门禁
+## 远端 CI 最终结果
 
-六个提交（`77a20c2` 之后）：
+`origin/main = b92f70cb7ac742cbc837fb1558c2fdfff4c4cd65`，对应 run **40974724185**（`push` 事件，headSha 精确匹配）：
+
+| 作业 | 结果 |
+|---|---|
+| api（lint + types + unit + postgres integration + http + migrations） | **success** |
+| web（lint + typecheck + build + markdown + unit + components） | **success** |
+| web-e2e（Chromium + native API + real PostgreSQL） | **success** |
+| image（build + push to GHCR） | **success** |
+
+为排除不稳定用例造成的假绿，对同一 SHA 重跑一次（`attempt 2`），同样四个作业全部 success。因此**连续两轮 CI 全绿**，且镜像发布被全部检查门禁阻挡后才允许。
+
+## 本轮 CI 失败的真实原因与修复（全部为平台差异，逐条有证据）
+
+初次推送后 CI 连续失败三轮，每次都用 `gh run view --log-failed` 取真实原因后修复，而非猜测：
+
+| 失败 | 真实原因 | 修复 |
+|---|---|---|
+| api / ty | `error[unresolved-attribute]: Module ctypes has no member WinDLL`：新增 runner 使用 win32 专属成员，Linux 类型桩下不可判定 | 按平台拆分 `load_kernel32()`，非 Windows 抛固定错误；以 `ty check --python-platform linux` 覆盖完整 CI 路径清单验证 |
+| web / 单测 | 171 项用例全过，失败在报告守卫：`replaceAll('/', '\\')` 在 POSIX 下是相对路径，被守卫正确拒绝 | 断言按平台分支；POSIX 下断言守卫必须拒绝该形式。守卫严格性未放宽 |
+| web-e2e（14 例） | 诊断给出 `Control: last_failure=start/port_unavailable`：API 重启无法重绑同端口 | POSIX 设 `SO_REUSEADDR` + 有界重试，Windows 保持 `SO_EXCLUSIVEADDRUSE`。实测确认仅「双方都设 SO_REUSEADDR」时才会抢占活跃端口，故必须平台二选一 |
+| web-e2e（2 例） | `manual_conflict` 不稳定；`single_writer_takeover` 报 `assertion=unknown` | 先把断言位置与阶段标记纳入受限诊断，再据实定位 |
+| web-e2e（1 例） | 诊断给出 `assertion=e2e/fixtures.ts:388`：`crashPage()` 等待 Playwright `crash` 事件 20s 超时。源码依据：Playwright 由 CDP `Inspector.targetCrashed` 驱动该事件，事件丢失时 `evaluate` 不会快速报错而是挂住 | 注入仍用 CDP `Page.crash`，确认改为三路先到者胜（事件 / `Inspector.targetCrashed` / 连续两次有界无响应），必要时升级 `chrome://crash`。承重保证由跟随页独立观测 `revnote-writer-v1` 持有者为 0 断言，不依赖夹具自述 |
+
+`manual_conflict` 曾在一次运行中失败、后续运行通过且期间无代码变更，因此按 **flaky** 记录；最终稳定性以连续两轮 CI 全绿为准。
+
+### 提交列表（`77a20c2` 之后，共 11 个）
 
 ```text
 8d84523 chore(web): define phase4 client contracts and verification tooling
@@ -209,10 +234,21 @@ Owned API/Vite/browser groups stopped; external PostgreSQL remains caller-owned.
 9902730 feat(web): add coordinated login and rotating sessions
 5c2f391 feat(web): implement durable native sync and safe reconciliation
 023f21e feat(web): connect workspace editing and manual conflict recovery
-5896473 test(web): enforce phase4 postgres e2e and release gates
+afeb521 test(web): enforce phase4 postgres e2e and release gates
+b3bd704 fix(web): keep phase4 gates portable across ci platforms
+9189094 fix(web): rebind the e2e api port on linux after restart
+9dcb857 test(web): record the failing assertion location without error text
+e4058c3 test(web): locate failures inside e2e helpers and record stage markers
+b92f70c test(web): confirm the writer crash for real on linux ci
 ```
 
-提交后状态门禁：`uv sync --locked` 0、`pnpm install --frozen-lockfile` 0、`ruff check` 0、`ruff format --check` 0、`lint:web` 0（0 error / 2 既有 Fast Refresh 提示）、`typecheck:web` 0、`test:markdown` 7/7、`build:web` 0、`test:web` 171 passed、报告守卫 `vitest/full 171` 与 `playwright/full 16` 均零 skip/retry/error。
+前 6 个为计划规定的提交；后 5 个为 CI 真实失败暴露的平台差异修复，均为追加提交，未改写已发布历史、未强推。
+
+## 提交与推送前门禁
+
+提交后状态门禁：`uv sync --locked` 0、`pnpm install --frozen-lockfile` 0、`ruff check` 0、`ruff format --check` 0、`lint:web` 0（0 error / 2 既有 Fast Refresh 提示）、`typecheck:web` 0、`test:markdown` 7/7、`build:web` 0、`test:web` 176 passed、报告守卫 `vitest/full 176` 与 `playwright/full 16` 均零 skip/retry/error。
+
+范围核验：`apps/api/src` 与 `alembic/versions` 零改动；禁词扫描 0 命中；无 `.env`、HAR、storageState、报告产物被跟踪；仓库根用户提示文件保持未跟踪且未删除。
 
 ## 首次整合 Web 检查（浏览器前）
 

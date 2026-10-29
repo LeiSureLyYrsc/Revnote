@@ -28,11 +28,15 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
-        // Strip /api prefix before forwarding to FastAPI root routes (e.g. /health)
-        '/api': {
+        // Health is the only root route; business API v1 keeps its prefix.
+        '^/api/health$': {
           target: apiProxyTarget,
           changeOrigin: true,
-          rewrite: (requestPath) => requestPath.replace(/^\/api/, ''),
+          rewrite: () => '/health',
+        },
+        '/api/v1': {
+          target: apiProxyTarget,
+          changeOrigin: true,
         },
       },
     },

@@ -13,6 +13,10 @@
     "lint:web": "pnpm --filter @revnote/web lint",
     "typecheck:web": "pnpm --filter @revnote/web typecheck",
     "check:markdown": "pnpm --filter @revnote/web check:markdown",
-    "test:markdown": "pnpm --filter @revnote/web check:markdown"
+    "test:markdown": "pnpm --filter @revnote/web check:markdown",
+    "test:web": "pnpm --filter @revnote/web test",
+    "test:e2e": "uv run python apps/api/scripts/run_web_e2e.py",
+    "check:web-reports": "pnpm --filter @revnote/web check:reports",
+    "check:api-reports": "uv run python apps/api/scripts/check_test_reports.py"
   }
 }

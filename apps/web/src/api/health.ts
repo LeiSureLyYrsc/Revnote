@@ -15,7 +15,7 @@ export interface HealthCheckResult {
   checkedAt: Date
 }
 
-// Default to /api, which Vite proxies to API_PROXY_TARGET (127.0.0.1:8000) stripping the /api prefix
+// Only /api/health maps to /health; business /api/v1 paths retain their prefix.
 const API_BASE_PATH = import.meta.env.VITE_API_BASE_PATH || '/api'
 
 export async function fetchHealth(): Promise<HealthCheckResult> {

@@ -102,3 +102,11 @@ temp/
 
 # Local orchestration state.
 .slim/deepwork/
+
+# Test reports must not carry browser content or authentication state to git.
+test-results/
+playwright-report/
+reports/
+.reports/
+*-full.xml
+api-*.xml

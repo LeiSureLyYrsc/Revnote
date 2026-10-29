@@ -90,11 +90,13 @@ pnpm --filter @revnote/web dev --host 127.0.0.1
 
 打开 `http://127.0.0.1:5173`；API hello 在 `http://127.0.0.1:8000/`，存活检查在 `/health`。
 
-Web 请求 `/api/health`，Vite 转发至 API `/health`，去掉 `/api`。`API_PROXY_TARGET` 只由开发服务器读取；默认目标为 `http://127.0.0.1:8000`。不使用通配 CORS。
+Web 请求 `/api/health` 时，Vite **仅精确将该路径**转发至 API `/health`；业务 `/api/v1/...` 保留完整前缀原样转发。`API_PROXY_TARGET` 只由开发服务器读取；默认目标为 `http://127.0.0.1:8000`。不使用通配 CORS。生产静态构建不包含 Vite 代理，部署仍需同源反向代理。
 
 `/health` 只证明进程存活，**不检查 PG 或 MinIO**。依赖未启动仍可体验空编辑器，但迁移和数据库测试需要真实 PG。
 
 ## 检查与验收
+
+Phase 4 的批准范围见 [实施计划](docs/plan-phase4.md)，进行中的实际运行结果见 [Phase 4 验收记录](docs/phase4-validation.md)。记录中的专项通过不等于整个阶段或发布已通过。
 
 ```powershell
 uv run ruff check apps/api

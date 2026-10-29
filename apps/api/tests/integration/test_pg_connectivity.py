@@ -8,7 +8,7 @@ is genuinely about connecting, plus the schema promise the harness must deliver:
 * ``NullPool`` opens a fresh server connection per checkout, sessions roll back,
   and an uncommitted write is invisible to a second connection;
 * the business schema came from the real Alembic chain (single head stamped,
-  exactly the six contract tables, no sequences);
+  exactly the ten contract tables, no sequences);
 * nothing here downgrades, and the guard that makes that impossible is proven.
 """
 
@@ -19,6 +19,7 @@ import uuid
 import pytest
 from pg_migrations import AlembicGuardError
 from pg_testing import (
+    DOMAIN_TABLES,
     HEAD_TABLES,
     KERNEL_TABLES,
     TEST_DATABASE_URL_ENV,
@@ -116,10 +117,10 @@ async def test_business_database_is_stamped_with_the_single_head(
     assert await catalog.version() == head_revision
 
 
-async def test_exactly_the_six_contract_tables_exist(catalog: Catalog) -> None:
-    """The business schema is the six domain tables + ``alembic_version``, nothing else."""
+async def test_exactly_the_contract_tables_exist(catalog: Catalog) -> None:
+    """The business schema is the ten domain tables + ``alembic_version``."""
     assert await catalog.tables() == list(HEAD_TABLES)
-    assert await catalog.table_set() == {*KERNEL_TABLES, VERSION_TABLE}
+    assert await catalog.table_set() == {*DOMAIN_TABLES, VERSION_TABLE}
 
 
 async def test_no_sequences_so_counters_are_application_allocated(catalog: Catalog) -> None:
@@ -129,10 +130,20 @@ async def test_no_sequences_so_counters_are_application_allocated(catalog: Catal
 
 
 async def test_every_kernel_table_has_a_primary_key(catalog: Catalog) -> None:
-    """Each of the six tables is protected by a real primary key."""
+    """Each of the six kernel tables is protected by a real primary key."""
     for table in KERNEL_TABLES:
         primary = [c.name for c in await catalog.constraints(table) if c.kind == "primary key"]
         assert primary, f"{table} has no primary key"
+
+
+async def test_every_auth_table_has_a_primary_key(catalog: Catalog) -> None:
+    """Phase 3 tables are keyed too; membership is a composite key."""
+    for table in DOMAIN_TABLES:
+        primary = [c.name for c in await catalog.constraints(table) if c.kind == "primary key"]
+        assert primary, f"{table} has no primary key"
+
+    members = (await catalog.constraint_map("workspace_members"))["pk_workspace_members"]
+    assert members.definition == "PRIMARY KEY (workspace_id, user_id)"
 
 
 # --------------------------------------------------------------------------- #
@@ -151,9 +162,9 @@ def test_downgrade_is_refused_for_the_business_database(
 async def test_schema_is_still_at_head_after_connectivity(
     catalog: Catalog, head_revision: str
 ) -> None:
-    """Nothing in this module mutated the schema: still head, still six tables."""
+    """Nothing in this module mutated the schema: still head, still ten tables."""
     assert await catalog.version() == head_revision
-    assert await catalog.table_set() == {*KERNEL_TABLES, VERSION_TABLE}
+    assert await catalog.table_set() == {*DOMAIN_TABLES, VERSION_TABLE}
 
 
 def test_environment_variable_names_are_the_contract_ones() -> None:

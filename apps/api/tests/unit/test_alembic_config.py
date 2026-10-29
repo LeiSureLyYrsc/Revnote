@@ -112,13 +112,14 @@ def test_env_py_is_async_and_uses_settings() -> None:
     assert "target_metadata = Base.metadata" in env_source
 
 
-def test_revision_chain_is_baseline_then_kernel_core() -> None:
-    """One head: 0001_baseline (empty) -> 0002_sync_kernel_core (six tables)."""
+def test_revision_chain_is_baseline_kernel_core_then_auth() -> None:
+    """One head: 0001_baseline -> 0002_sync_kernel_core -> 0003 auth schema."""
     versions = sorted((API_DIR / "migrations" / "versions").glob("*.py"))
 
     assert [path.name for path in versions] == [
         "0001_baseline.py",
         "0002_sync_kernel_core.py",
+        "0003_auth_sessions_members.py",
     ]
 
     baseline = versions[0].read_text(encoding="utf-8")
@@ -133,31 +134,47 @@ def test_revision_chain_is_baseline_then_kernel_core() -> None:
     assert kernel.count("def upgrade") == 1
     assert kernel.count("def downgrade") == 1
 
+    # Phase 3 appends exactly one revision on top; a second head would fork the
+    # chain, so the parent link is asserted here as well as by Alembic itself.
+    auth = versions[2].read_text(encoding="utf-8")
+    assert 'revision: str = "0003_auth_sessions_members"' in auth
+    assert 'down_revision: str | None = "0002_sync_kernel_core"' in auth
+    assert auth.count("def upgrade") == 1
+    assert auth.count("def downgrade") == 1
 
-def test_models_package_exists_and_declares_only_the_kernel_tables() -> None:
-    """Phase 2 flips the old "no models" guardrail: models exist, kernel/adapter don't."""
+
+def test_models_package_exists_and_declares_the_domain_tables() -> None:
+    """Phase 3 adds the auth models to the same package (no second layer)."""
     models_dir = API_DIR / "src" / "revnote_api" / "models"
 
     assert (models_dir / "__init__.py").is_file()
     assert sorted(path.name for path in models_dir.glob("*.py")) == [
         "__init__.py",
+        "auth_access_token.py",
+        "auth_refresh_token.py",
+        "auth_session.py",
         "change_event.py",
         "folder.py",
         "note.py",
         "op_ledger.py",
         "user.py",
         "workspace.py",
+        "workspace_member.py",
     ]
 
     imported = _imported_modules(models_dir / "__init__.py")
     assert imported == {
         "revnote_api.db.base",
+        "revnote_api.models.auth_access_token",
+        "revnote_api.models.auth_refresh_token",
+        "revnote_api.models.auth_session",
         "revnote_api.models.change_event",
         "revnote_api.models.folder",
         "revnote_api.models.note",
         "revnote_api.models.op_ledger",
         "revnote_api.models.user",
         "revnote_api.models.workspace",
+        "revnote_api.models.workspace_member",
     }
 
 

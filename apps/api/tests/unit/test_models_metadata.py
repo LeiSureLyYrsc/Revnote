@@ -1,10 +1,11 @@
-"""Focused metadata tests for the Phase 2 sync kernel schema.
+"""Focused metadata tests for the Revnote schema (Phase 2 kernel + Phase 3 auth).
 
 These are **pure unit tests**: no server, no connection, no ``create_all()``. They
-assert the contract that ``docs/plan-phase2.md`` §4 fixes for the six tables —
-column presence/NULLability/defaults, primary keys, composite foreign keys with
-their ``ON DELETE`` behaviour, deferrability, named checks and indexes — and that
-the same DDL is what the Alembic revision emits.
+assert the contract that ``docs/plan-phase2.md`` §4 fixes for the six kernel
+tables and ``docs/plan-phase3.md`` §9 for the auth/membership tables — column
+presence/NULLability/defaults, primary keys, composite foreign keys with their
+``ON DELETE`` behaviour, deferrability, named checks and indexes — and that the
+same DDL is what the Alembic revisions emit.
 
 Why assertions on metadata instead of a live database: the DDL text is produced
 from exactly this metadata (``alembic upgrade --sql``), so a metadata regression
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import re
+import uuid
 from pathlib import Path
 
 import pytest
@@ -24,16 +26,30 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from revnote_api.db.base import NAMING_CONVENTION, Base
-from revnote_api.models import MODEL_TABLES, ChangeEvent, Folder, Note, OpLedger, User, Workspace
+from revnote_api.models import (
+    MEMBER_ROLES,
+    MODEL_TABLES,
+    AuthAccessToken,
+    AuthRefreshToken,
+    AuthSession,
+    ChangeEvent,
+    Folder,
+    Note,
+    OpLedger,
+    User,
+    Workspace,
+    WorkspaceMember,
+)
 
 API_DIR = Path(__file__).resolve().parents[2]
 MIGRATION_0002 = API_DIR / "migrations" / "versions" / "0002_sync_kernel_core.py"
+MIGRATION_0003 = API_DIR / "migrations" / "versions" / "0003_auth_sessions_members.py"
 MIGRATION_0001 = API_DIR / "migrations" / "versions" / "0001_baseline.py"
 
 PG = postgresql.dialect()
 
-#: The exact table set of this phase (plan §4): six domain tables, nothing else.
-EXPECTED_TABLES = (
+#: Phase 2 sync-kernel tables (unchanged by Phase 3).
+KERNEL_TABLES = (
     "users",
     "workspaces",
     "folders",
@@ -41,6 +57,17 @@ EXPECTED_TABLES = (
     "change_events",
     "op_ledger",
 )
+
+#: Phase 3 auth tables + the per-request authorisation row.
+AUTH_TABLES = (
+    "auth_sessions",
+    "auth_access_tokens",
+    "auth_refresh_tokens",
+    "workspace_members",
+)
+
+#: The exact table set of the project: ten domain tables, nothing else.
+EXPECTED_TABLES = (*KERNEL_TABLES, *AUTH_TABLES)
 
 
 def _called_names(source: str) -> set[str]:
@@ -82,6 +109,19 @@ def _indexes(table: str) -> set[tuple[str, tuple[str, ...]]]:
     return {
         (ix.name, tuple(c.name for c in ix.columns)) for ix in Base.metadata.tables[table].indexes
     }
+
+
+def index_sql(table: str, name: str) -> str:
+    """Rendered ``CREATE INDEX`` for one declared index (expression indexes included)."""
+    for index in Base.metadata.tables[table].indexes:
+        if index.name == name:
+            return str(CreateIndex(index).compile(dialect=PG)).strip()
+    raise AssertionError(f"{table} has no index {name!r}")
+
+
+def btrim_index_ddl() -> str:
+    """The Phase 3 normalised-e-mail uniqueness index, as PostgreSQL receives it."""
+    return index_sql("users", "uq_users_email_normalized")
 
 
 # --------------------------------------------------------------------------- #
@@ -136,13 +176,13 @@ def test_unnamed_check_constraint_is_rejected_by_convention() -> None:
 # --------------------------------------------------------------------------- #
 # table set / registration
 # --------------------------------------------------------------------------- #
-def test_metadata_declares_exactly_the_six_kernel_tables() -> None:
+def test_metadata_declares_exactly_the_contract_tables() -> None:
     assert tuple(sorted(Base.metadata.tables)) == tuple(sorted(EXPECTED_TABLES))
     assert tuple(MODEL_TABLES) == EXPECTED_TABLES
 
 
 def test_out_of_scope_tables_are_absent() -> None:
-    """Phase 2 forbids extra business tables (plan §1): none may be declared."""
+    """Tables the plan excludes must not be declared (plan §1 and §9)."""
     forbidden = {
         "attachments",
         "change_seq",
@@ -152,7 +192,9 @@ def test_out_of_scope_tables_are_absent() -> None:
         "sync_sessions",
         "tombstones",
         "user_workspaces",
-        "workspace_members",
+        "auth_devices",
+        "auth_tokens",
+        "workspace_invites",
     }
 
     assert not set(Base.metadata.tables) & forbidden
@@ -165,7 +207,18 @@ def test_mappers_configure_without_mapper_errors() -> None:
 
 def test_only_one_declarative_base_is_in_use() -> None:
     """Every model sits on the shared Base.metadata — no second metadata."""
-    for model in (User, Workspace, Folder, Note, ChangeEvent, OpLedger):
+    for model in (
+        User,
+        Workspace,
+        Folder,
+        Note,
+        ChangeEvent,
+        OpLedger,
+        AuthSession,
+        AuthAccessToken,
+        AuthRefreshToken,
+        WorkspaceMember,
+    ):
         assert model.__table__.metadata is Base.metadata
 
 
@@ -178,6 +231,10 @@ def test_models_are_registered_by_importing_the_package() -> None:
         (Note, "notes"),
         (ChangeEvent, "change_events"),
         (OpLedger, "op_ledger"),
+        (AuthSession, "auth_sessions"),
+        (AuthAccessToken, "auth_access_tokens"),
+        (AuthRefreshToken, "auth_refresh_tokens"),
+        (WorkspaceMember, "workspace_members"),
     ):
         assert model.__tablename__ == table
         assert model.__table__ is Base.metadata.tables[table]
@@ -192,6 +249,10 @@ def test_no_relationship_or_cascade_is_declared() -> None:
         (Note, "notes"),
         (ChangeEvent, "change_events"),
         (OpLedger, "op_ledger"),
+        (AuthSession, "auth_sessions"),
+        (AuthAccessToken, "auth_access_tokens"),
+        (AuthRefreshToken, "auth_refresh_tokens"),
+        (WorkspaceMember, "workspace_members"),
     ):
         assert list(sa.inspect(model).relationships) == [], table
 
@@ -235,10 +296,12 @@ def test_all_checks_pk_uq_fk_indexes_are_explicitly_named() -> None:
 
 
 def test_exact_check_set_per_table() -> None:
-    """The full named CHECK inventory (plan §4) — no missing, extra or unnamed CHECK.
+    """The full named CHECK inventory — no missing, extra or unnamed CHECK.
 
-    A composite-PK table has no separate PK-constraint CHECK entry, so this table
-    is also the guard that no CHECK is silently added by a naming convention.
+    Kernel tables keep the Phase 2 set (plan §4); the Phase 3 tables add their own
+    (plan §9). A composite-PK table has no separate PK-constraint CHECK entry, so
+    this table is also the guard that no CHECK is silently added by a naming
+    convention.
     """
     expected = {
         "users": {"ck_users_email_not_blank"},
@@ -264,6 +327,10 @@ def test_exact_check_set_per_table() -> None:
             "ck_op_ledger_request_hash_len",
             "ck_op_ledger_result_seq_positive",
         },
+        "auth_sessions": set(),
+        "auth_access_tokens": {"ck_auth_access_tokens_token_hash_len"},
+        "auth_refresh_tokens": {"ck_auth_refresh_tokens_token_hash_len"},
+        "workspace_members": {"ck_workspace_members_role_owner_only"},
     }
 
     assert set(Base.metadata.tables) == set(expected)
@@ -300,6 +367,16 @@ def test_check_sql_text_is_pinned() -> None:
             "ck_op_ledger_request_hash_len": "octet_length(request_hash) = 32",
             "ck_op_ledger_result_seq_positive": "result_seq > 0",
         },
+        "auth_sessions": {},
+        "auth_access_tokens": {
+            "ck_auth_access_tokens_token_hash_len": "octet_length(token_hash) = 32",
+        },
+        "auth_refresh_tokens": {
+            "ck_auth_refresh_tokens_token_hash_len": "octet_length(token_hash) = 32",
+        },
+        "workspace_members": {
+            "ck_workspace_members_role_owner_only": "role = 'owner'",
+        },
     }
 
     for table_name, checks in expected.items():
@@ -309,24 +386,57 @@ def test_check_sql_text_is_pinned() -> None:
 # --------------------------------------------------------------------------- #
 # users / workspaces
 # --------------------------------------------------------------------------- #
-def test_users_columns_pk_and_unique_email() -> None:
+def test_users_columns_pk_and_normalised_email_uniqueness() -> None:
+    """Phase 3: two extra nullable columns, and uniqueness moves to an expression."""
     table = Base.metadata.tables["users"]
 
-    assert [c.name for c in table.columns] == ["id", "email", "created_at"]
+    assert [c.name for c in table.columns] == [
+        "id",
+        "email",
+        "password_hash",
+        "disabled_at",
+        "created_at",
+    ]
     assert _col("users", "id").primary_key
     assert not _col("users", "id").nullable
     assert isinstance(_col("users", "id").type, postgresql.UUID)
     assert not _col("users", "email").nullable
     assert isinstance(_col("users", "email").type, sa.Text)
 
-    assert {c.name for c in table.constraints if isinstance(c, sa.UniqueConstraint)} == {
-        "uq_users_email"
-    }
-    # Exactly one CHECK: the non-blank guard. No auth columns, no normalisation,
-    # no syntax/format validation (the plan requires a non-empty e-mail only).
+    # D8: the old plain constraint is gone; uniqueness is lower(btrim(email)).
+    assert {c.name for c in table.constraints if isinstance(c, sa.UniqueConstraint)} == set()
+    assert btrim_index_ddl() == (
+        "CREATE UNIQUE INDEX uq_users_email_normalized ON users (lower(btrim(email)))"
+    )
+
+    # Both added columns are nullable: a legacy row keeps no credential (D8) and
+    # no account is disabled by default.
+    password_hash = _col("users", "password_hash")
+    disabled_at = _col("users", "disabled_at")
+    assert password_hash.nullable and isinstance(password_hash.type, sa.Text)
+    assert password_hash.server_default is None
+    assert disabled_at.nullable
+    assert isinstance(disabled_at.type, postgresql.TIMESTAMP)
+    assert disabled_at.type.timezone is True
+    assert disabled_at.server_default is None
+
+    # Exactly one CHECK: the non-blank guard. No normalisation in the stored
+    # value, no syntax/format validation (the plan requires a non-empty e-mail).
     assert _checks("users") == {"ck_users_email_not_blank": "btrim(email) <> ''"}
     assert not _fks("users")
-    assert not table.indexes
+
+
+def test_users_email_is_unique_without_citext_or_triggers() -> None:
+    """Case/space folding lives in the index expression, never in the column."""
+    email = _col("users", "email")
+
+    assert email.server_default is None
+    assert not getattr(email.type, "collation", None)
+    # No citext extension and no normalising trigger: nothing to keep in sync.
+    assert not any(
+        isinstance(constraint, sa.CheckConstraint) and "lower(" in str(constraint.sqltext)
+        for constraint in Base.metadata.tables["users"].constraints
+    )
 
 
 def test_users_email_check_rejects_blank_without_mutating_the_value() -> None:
@@ -679,6 +789,213 @@ def test_op_ledger_has_no_pending_state_and_unique_result_seq() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 3: auth_sessions / auth_access_tokens / auth_refresh_tokens
+# --------------------------------------------------------------------------- #
+def test_auth_sessions_columns_and_absolute_expiry() -> None:
+    """A session is a device login *and* a refresh family (D4); expiry is absolute."""
+    table = Base.metadata.tables["auth_sessions"]
+
+    assert [c.name for c in table.columns] == [
+        "id",
+        "user_id",
+        "device_name",
+        "created_at",
+        "expires_at",
+        "revoked_at",
+        "revoke_reason",
+    ]
+    assert str(table.primary_key.name) == "pk_auth_sessions"
+    assert [c.name for c in table.primary_key.columns] == ["id"]
+    assert isinstance(_col("auth_sessions", "id").type, postgresql.UUID)
+
+    # expires_at is NOT NULL and has no default: the service computes it from the
+    # session TTL so the value is testable and never a clock read inside SQL.
+    expires_at = _col("auth_sessions", "expires_at")
+    assert not expires_at.nullable
+    assert expires_at.server_default is None
+    assert isinstance(expires_at.type, postgresql.TIMESTAMP)
+    assert expires_at.type.timezone is True
+
+    # Optional metadata: no CHECK on device_name, no default, and revocation is a
+    # timestamp pair — never a boolean, so "when" survives.
+    assert _col("auth_sessions", "device_name").nullable
+    assert _col("auth_sessions", "device_name").server_default is None
+    for name in ("revoked_at", "revoke_reason"):
+        assert _col("auth_sessions", name).nullable, name
+        assert _col("auth_sessions", name).server_default is None, name
+
+    assert not _checks("auth_sessions")
+
+
+def test_auth_sessions_user_fk_restricts_and_is_indexed() -> None:
+    """``RESTRICT`` keeps token history attached; the FK column carries the index."""
+    fk = _fks("auth_sessions")["fk_auth_sessions_user_id_users"]
+
+    assert fk.ondelete == "RESTRICT"
+    assert fk.deferrable is None
+    assert [c.name for c in fk.columns] == ["user_id"]
+    assert [e.target_fullname for e in fk.elements] == ["users.id"]
+    assert _indexes("auth_sessions") == {("ix_auth_sessions_user_id", ("user_id",))}
+
+
+@pytest.mark.parametrize(
+    "table_name, fk_name",
+    [
+        ("auth_access_tokens", "fk_auth_access_tokens_session_id_auth_sessions"),
+        ("auth_refresh_tokens", "fk_auth_refresh_tokens_session_id_auth_sessions"),
+    ],
+)
+def test_token_tables_bind_to_a_session_and_index_it(table_name: str, fk_name: str) -> None:
+    fk = _fks(table_name)[fk_name]
+
+    assert fk.ondelete == "RESTRICT"
+    assert fk.deferrable is None
+    assert [c.name for c in fk.columns] == ["session_id"]
+    assert [e.target_fullname for e in fk.elements] == ["auth_sessions.id"]
+    assert (f"ix_{table_name}_session_id", ("session_id",)) in _indexes(table_name)
+
+
+@pytest.mark.parametrize("table_name", ["auth_access_tokens", "auth_refresh_tokens"])
+def test_token_hashes_are_unique_32_byte_digests(table_name: str) -> None:
+    """Only ``sha256(raw)`` is stored: 32-byte BYTEA, UNIQUE, CHECK-enforced."""
+    table = Base.metadata.tables[table_name]
+
+    token_hash = _col(table_name, "token_hash")
+    assert isinstance(token_hash.type, postgresql.BYTEA)
+    assert not token_hash.nullable
+    assert token_hash.server_default is None
+    assert _checks(table_name)[f"ck_{table_name}_token_hash_len"] == (
+        "octet_length(token_hash) = 32"
+    )
+    assert {
+        (c.name, tuple(column.name for column in c.columns))
+        for c in table.constraints
+        if isinstance(c, sa.UniqueConstraint)
+    } == {(f"uq_{table_name}_token_hash", ("token_hash",))}
+
+    # No raw-token column may ever exist: the secret is returned once, never stored.
+    assert {c.name for c in table.columns} & {"token", "raw_token", "secret"} == set()
+
+
+def test_auth_access_token_columns() -> None:
+    assert [c.name for c in Base.metadata.tables["auth_access_tokens"].columns] == [
+        "id",
+        "session_id",
+        "token_hash",
+        "created_at",
+        "expires_at",
+    ]
+    assert isinstance(_col("auth_access_tokens", "session_id").type, postgresql.UUID)
+    expires_at = _col("auth_access_tokens", "expires_at")
+    assert not expires_at.nullable
+    assert expires_at.server_default is None
+    # No revocation column: a revoked session invalidates its access tokens, and
+    # the 600s TTL is the only other bound (D1).
+    assert "revoked_at" not in Base.metadata.tables["auth_access_tokens"].c
+
+
+def test_auth_refresh_token_rotation_chain() -> None:
+    """``parent_id`` is the rotation chain; the used row is kept for R1."""
+    table = Base.metadata.tables["auth_refresh_tokens"]
+
+    assert [c.name for c in table.columns] == [
+        "id",
+        "session_id",
+        "token_hash",
+        "parent_id",
+        "created_at",
+        "expires_at",
+        "used_at",
+    ]
+    parent = _col("auth_refresh_tokens", "parent_id")
+    assert parent.nullable  # the login-issued token has no parent
+    assert isinstance(parent.type, postgresql.UUID)
+
+    fk = _fks("auth_refresh_tokens")["fk_auth_refresh_tokens_parent_id_auth_refresh_tokens"]
+    assert fk.ondelete == "RESTRICT"
+    assert [e.target_fullname for e in fk.elements] == ["auth_refresh_tokens.id"]
+
+    # used_at NULL = still redeemable; a timestamp = already exchanged (reuse => R1).
+    used_at = _col("auth_refresh_tokens", "used_at")
+    assert used_at.nullable
+    assert used_at.server_default is None
+    assert isinstance(used_at.type, postgresql.TIMESTAMP)
+    assert used_at.type.timezone is True
+    # No boolean/status column may shadow the timestamp.
+    assert {"used", "revoked", "status"} & {c.name for c in table.columns} == set()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3: workspace_members
+# --------------------------------------------------------------------------- #
+def test_workspace_members_composite_pk_and_columns() -> None:
+    """PK ``(workspace_id, user_id)`` is the per-request authorisation probe (D5)."""
+    table = Base.metadata.tables["workspace_members"]
+
+    assert [c.name for c in table.columns] == [
+        "workspace_id",
+        "user_id",
+        "role",
+        "created_at",
+    ]
+    assert str(table.primary_key.name) == "pk_workspace_members"
+    assert [c.name for c in table.primary_key.columns] == ["workspace_id", "user_id"]
+    assert not table.primary_key.deferrable
+    assert isinstance(_col("workspace_members", "workspace_id").type, postgresql.UUID)
+    assert isinstance(_col("workspace_members", "user_id").type, postgresql.UUID)
+    assert not _col("workspace_members", "role").nullable
+
+
+def test_workspace_members_fks_are_restrict_and_user_side_indexed() -> None:
+    fks = _fks("workspace_members")
+
+    assert set(fks) == {
+        "fk_workspace_members_workspace_id_workspaces",
+        "fk_workspace_members_user_id_users",
+    }
+    for name, target in (
+        ("fk_workspace_members_workspace_id_workspaces", "workspaces.id"),
+        ("fk_workspace_members_user_id_users", "users.id"),
+    ):
+        assert fks[name].ondelete == "RESTRICT", name
+        assert fks[name].deferrable is None, name
+        assert [e.target_fullname for e in fks[name].elements] == [target], name
+
+    # The PK covers (workspace_id, user_id); only the reverse direction needs an index.
+    assert _indexes("workspace_members") == {("ix_workspace_members_user_id", ("user_id",))}
+
+
+def test_workspace_members_role_is_owner_only_for_v1() -> None:
+    """D5: v1 has no member management, so the database accepts ``'owner'`` only."""
+    assert MEMBER_ROLES == ("owner",)
+    assert _checks("workspace_members") == {
+        "ck_workspace_members_role_owner_only": "role = 'owner'"
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3: sensitive values never reach a repr
+# --------------------------------------------------------------------------- #
+def test_secret_columns_are_absent_from_every_repr() -> None:
+    """repr is logged: a password hash or token digest must not be reachable from it."""
+    password_hash = "argon2id$sentinel-password-hash"
+    token_digest = b"sentinel-token-digest-32-bytes.."
+    assert len(token_digest) == 32
+
+    user = User(id=uuid.uuid4(), email="repr-sentinel@revnote.test", password_hash=password_hash)
+    assert password_hash not in repr(user)
+    assert user.email not in repr(user)
+
+    for model, kwargs in (
+        (AuthAccessToken, {"token_hash": token_digest}),
+        (AuthRefreshToken, {"token_hash": token_digest}),
+    ):
+        row = model(id=uuid.uuid4(), session_id=uuid.uuid4(), **kwargs)
+        assert repr(token_digest) not in repr(row)
+        assert token_digest.hex() not in repr(row)
+
+
+# --------------------------------------------------------------------------- #
 # PostgreSQL-only / no-sequence discipline
 # --------------------------------------------------------------------------- #
 def test_no_serial_identity_or_nextval_anywhere() -> None:
@@ -731,31 +1048,50 @@ def test_index_ddl_is_rendered_for_every_declared_index() -> None:
         "CREATE INDEX ix_folders_workspace_id_parent_id ON folders (workspace_id, parent_id)",
         "CREATE INDEX ix_notes_workspace_id_updated_seq ON notes (workspace_id, updated_seq)",
         "CREATE INDEX ix_notes_workspace_id_folder_id ON notes (workspace_id, folder_id)",
+        "CREATE UNIQUE INDEX uq_users_email_normalized ON users (lower(btrim(email)))",
+        "CREATE INDEX ix_auth_sessions_user_id ON auth_sessions (user_id)",
+        "CREATE INDEX ix_auth_access_tokens_session_id ON auth_access_tokens (session_id)",
+        "CREATE INDEX ix_auth_refresh_tokens_session_id ON auth_refresh_tokens (session_id)",
+        "CREATE INDEX ix_workspace_members_user_id ON workspace_members (user_id)",
     }
 
 
 # --------------------------------------------------------------------------- #
-# migration source (metadata must agree with what the revision emits)
+# migration source (metadata must agree with what the revisions emit)
 # --------------------------------------------------------------------------- #
-def test_migration_0002_declares_every_table_and_constraint_name() -> None:
+def test_migration_0002_declares_every_kernel_table_and_constraint_name() -> None:
+    """0002 creates exactly the kernel tables and the names metadata implies.
+
+    Phase 3 adds a second revision, so this check is scoped to what ``0002``
+    owns: six ``create_table`` calls and every kernel constraint/index name —
+    and it still forbids bulk metadata DDL.
+    """
     source = MIGRATION_0002.read_text(encoding="utf-8")
 
     assert 'revision: str = "0002_sync_kernel_core"' in source
     assert 'down_revision: str | None = "0001_baseline"' in source
     assert not _called_names(source) & {"create_all", "drop_all"}, "bulk metadata DDL is forbidden"
 
-    for table in EXPECTED_TABLES:
+    for table in KERNEL_TABLES:
         assert f'op.create_table(\n        "{table}"' in source, table
 
-    # Every name the ORM metadata resolves to must appear verbatim in the
-    # revision (wrapped in op.f(), i.e. already final) — and the revision must
-    # not invent constraint names the metadata does not know about.
+    # Every name the ORM metadata resolves to for these six tables must appear
+    # verbatim in the revision (wrapped in op.f(), i.e. already final) — and the
+    # revision must not invent names the metadata does not know about.
+    # ``users`` is the one table 0003 later rewrites, so the name asserted here is
+    # the *0002-era* one (plain ``uq_users_email``), not today's functional index.
     metadata_names = {
         str(constraint.name)
-        for table in Base.metadata.tables.values()
-        for constraint in table.constraints
+        for table_name in KERNEL_TABLES
+        for constraint in Base.metadata.tables[table_name].constraints
         if constraint.name is not None
-    } | {str(index.name) for table in Base.metadata.tables.values() for index in table.indexes}
+    } | {
+        str(index.name)
+        for table_name in KERNEL_TABLES
+        for index in Base.metadata.tables[table_name].indexes
+    }
+    metadata_names.discard("uq_users_email_normalized")
+    metadata_names.add("uq_users_email")
     revision_names = set(re.findall(r'op\.f\("([^"]+)"\)', source))
 
     assert metadata_names == revision_names
@@ -765,7 +1101,8 @@ def test_migration_0002_constraint_sql_matches_metadata() -> None:
     """Rendered DDL of revision and metadata agree, CHECK text included."""
     source = MIGRATION_0002.read_text(encoding="utf-8")
 
-    for table in Base.metadata.tables.values():
+    for table_name in KERNEL_TABLES:
+        table = Base.metadata.tables[table_name]
         assert f'"{table.name}"' in source
         for constraint in table.constraints:
             if isinstance(constraint, sa.CheckConstraint):
@@ -824,7 +1161,7 @@ def test_baseline_revision_is_untouched_by_this_phase() -> None:
 
 
 def test_env_py_imports_models_before_using_metadata() -> None:
-    """``alembic check`` must see the six tables, by explicit import (plan §3)."""
+    """``alembic check`` must see the model package, by explicit import (plan §3)."""
     source = (API_DIR / "migrations" / "env.py").read_text(encoding="utf-8")
 
     assert "import revnote_api.models" in source
@@ -833,3 +1170,161 @@ def test_env_py_imports_models_before_using_metadata() -> None:
         "target_metadata = Base.metadata"
     )
     assert not _called_names(source) & {"create_all", "drop_all"}
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 revision 0003 (source-level contract)
+# --------------------------------------------------------------------------- #
+def test_migration_0003_follows_0002_and_creates_the_auth_tables() -> None:
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+
+    assert 'revision: str = "0003_auth_sessions_members"' in source
+    assert 'down_revision: str | None = "0002_sync_kernel_core"' in source
+    assert not _called_names(source) & {"create_all", "drop_all"}, "bulk metadata DDL is forbidden"
+
+    for table in AUTH_TABLES:
+        assert f'op.create_table(\n        "{table}"' in source, table
+    # The kernel tables are not recreated by this revision.
+    for table in KERNEL_TABLES:
+        assert f'op.create_table(\n        "{table}"' not in source, table
+
+
+def test_migration_0003_names_match_metadata() -> None:
+    """Every name the ORM resolves to for the Phase 3 tables appears in 0003."""
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+    metadata_names = {
+        str(constraint.name)
+        for table_name in AUTH_TABLES
+        for constraint in Base.metadata.tables[table_name].constraints
+        if constraint.name is not None
+    } | {
+        str(index.name)
+        for table_name in AUTH_TABLES
+        for index in Base.metadata.tables[table_name].indexes
+    }
+    revision_names = set(re.findall(r'op\.f\("([^"]+)"\)', source))
+
+    # The revision also touches users: the dropped legacy constraint and the
+    # functional index that replaces it.
+    assert metadata_names | {"uq_users_email"} == revision_names
+
+
+def test_migration_0003_check_sql_matches_metadata() -> None:
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+
+    for table_name in AUTH_TABLES:
+        for constraint in Base.metadata.tables[table_name].constraints:
+            if isinstance(constraint, sa.CheckConstraint):
+                assert str(constraint.sqltext) in source, f"{table_name}: {constraint.sqltext}"
+
+
+def test_migration_0003_extends_users_without_backfilling_credentials() -> None:
+    """The two columns are added nullable; legacy rows must keep ``NULL`` (D8)."""
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+
+    assert 'op.add_column("users", sa.Column("password_hash", sa.Text(), nullable=True))' in (
+        source
+    )
+    assert '"password_hash"' in source and "nullable=True" in source
+    assert '"disabled_at"' in source
+    # No UPDATE of users anywhere: a migration must never invent or rewrite a hash.
+    assert "UPDATE users" not in source.upper().replace('"', "")
+
+
+def test_migration_0003_swaps_the_email_constraint_for_the_functional_index() -> None:
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+    upgrade = source.split("def upgrade()", 1)[1].split("def downgrade()", 1)[0]
+
+    drop = upgrade.index('op.drop_constraint(op.f("uq_users_email")')
+    # The *usage* of the constant inside upgrade(), not its module-level definition.
+    create = upgrade.index("op.create_index(\n        NORMALIZED_EMAIL_INDEX")
+    assert drop < create, "the legacy constraint is dropped before the index is created"
+    assert 'sa.text("lower(btrim(email))")' in upgrade
+    assert "unique=True" in upgrade
+
+
+def _migration_sql(source: str) -> str:
+    """Every SQL string literal the revision executes (docstrings/comments excluded)."""
+    blocks: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name != "text" or not node.args:
+            continue
+        argument = node.args[0]
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            blocks.append(argument.value)
+    return "\n".join(blocks)
+
+
+def test_migration_0003_refuses_to_merge_legacy_email_collisions() -> None:
+    """A normalisation collision aborts the migration; accounts are never merged."""
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+
+    assert "RAISE EXCEPTION" in source
+    assert "HAVING count(*) > 1" in source
+    # Checked before any DDL in upgrade: nothing has changed if it fires.
+    upgrade = source.split("def upgrade()", 1)[1]
+    assert upgrade.index("_refuse_collisions") < upgrade.index("op.add_column")
+    # And before the old constraint is restored on the way down.
+    downgrade = source.split("def downgrade()", 1)[1]
+    assert downgrade.index("_refuse_collisions") < downgrade.index("op.create_unique_constraint")
+
+    # The guard is a read-only probe: no account is deleted, updated or merged.
+    sql = _migration_sql(source).upper()
+    assert "DELETE FROM USERS" not in sql
+    assert "UPDATE USERS" not in sql
+    assert "DROP TABLE USERS" not in sql
+    assert "GROUP BY EMAIL" in sql or "GROUP BY LOWER(BTRIM(EMAIL))" in sql
+
+
+def test_migration_0003_collision_message_carries_no_account_data() -> None:
+    """A migration error is logged: it must not print an address, id or count."""
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+    sql = _migration_sql(source)
+
+    assert "RAISE EXCEPTION" in sql
+    # No placeholder arguments: the message is a fixed string.
+    raise_clauses = [line.strip() for line in sql.splitlines() if "RAISE EXCEPTION" in line.upper()]
+    assert raise_clauses
+    for clause in raise_clauses:
+        assert "%" not in clause, clause
+    # ``USING`` attaches dynamic detail to a RAISE; no such clause may exist.
+    assert " USING " not in sql.upper(), "no dynamic detail may be attached to the error"
+
+
+def test_migration_0003_backfills_owner_membership() -> None:
+    """Every existing workspace gets one owner membership, derived from owner_id."""
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+
+    assert "INSERT INTO workspace_members" in source
+    assert "SELECT id, owner_id, 'owner'" in source
+    assert "FROM workspaces" in source
+
+
+def test_migration_0003_downgrade_is_the_exact_reverse() -> None:
+    source = MIGRATION_0003.read_text(encoding="utf-8")
+    downgrade = source.split("def downgrade()", 1)[1]
+
+    # The refusal guard runs before any DDL, so a refusal leaves the schema whole.
+    assert downgrade.index("_refuse_collisions") < downgrade.index("op.drop_table")
+
+    # Children before parents: tokens/members reference sessions/users.
+    assert list(re.findall(r'op\.drop_table\("(\w+)"\)', downgrade)) == [
+        "workspace_members",
+        "auth_refresh_tokens",
+        "auth_access_tokens",
+        "auth_sessions",
+    ]
+    assert downgrade.index("op.drop_index") < downgrade.index("op.create_unique_constraint")
+    assert list(re.findall(r'op\.drop_column\("users", "(\w+)"\)', downgrade)) == [
+        "disabled_at",
+        "password_hash",
+    ]
+    # Symmetry guard: the same two columns are added in upgrade.
+    assert list(re.findall(r'op\.add_column\(\s*"users",\s*sa\.Column\("(\w+)"', source)) == [
+        "password_hash",
+        "disabled_at",
+    ]

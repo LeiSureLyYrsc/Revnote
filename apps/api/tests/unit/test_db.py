@@ -37,20 +37,25 @@ def _clean_db_state():
     _reset()
 
 
-def test_base_metadata_declares_the_six_kernel_tables() -> None:
-    """Phase 2: the six domain tables are declared, and nothing else.
+def test_base_metadata_declares_the_phase3_tables() -> None:
+    """Every declared table is in ``MODEL_TABLES``, and nothing else is declared.
 
-    Schema is still owned by Alembic (``create_all`` is never called), so this
-    asserts *declared metadata*, not a live database.
+    Phase 2 declared six tables; Phase 3 adds the auth schema and membership
+    (plan §9). Schema is still owned by Alembic (``create_all`` is never
+    called), so this asserts *declared metadata*, not a live database.
     """
     assert tuple(sorted(Base.metadata.tables)) == tuple(sorted(MODEL_TABLES))
     # Pinned literally too: MODEL_TABLES must not silently drift.
     assert tuple(sorted(MODEL_TABLES)) == (
+        "auth_access_tokens",
+        "auth_refresh_tokens",
+        "auth_sessions",
         "change_events",
         "folders",
         "notes",
         "op_ledger",
         "users",
+        "workspace_members",
         "workspaces",
     )
 

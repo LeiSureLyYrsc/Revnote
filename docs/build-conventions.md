@@ -8,7 +8,10 @@
 
 ## 相对 Plan 的调整
 - Plan「不做 API/Web 容器化」改为：**要写 Dockerfile + Actions→GHCR**，但本地不构建；验收以 Actions 绿为准。
-- 其余仍按 Plan：空 Alembic **不建业务表**；无 CRUD/同步/Joplin/E2EE/CRDT/登录。
+- 上述空 Alembic、无领域写逻辑限制仅适用于脚手架阶段。
+- Phase 2 以 `plan-phase2.md` 的已确认范围为准：六张领域表、独立迁移、内核单对象事务写与真实 PostgreSQL 测试。保留原空基线，不新增 HTTP 路由/认证/附件/Joplin/E2EE/CRDT/前端改动。
+- 本地验收使用两个独立可丢弃 PostgreSQL 测试库；迁移降级只允许在专用迁移测试库执行。无 Docker 时可使用仓库外临时 PostgreSQL 实例，用完停止；不能用 SQLite 或 skip 代替验收。
+- 未完成四个本地阶段验收前不推送；推送后监听 Actions，不强推，不改写已发布历史，不改 Clash 配置。
 
 ## 前端 / 后端锁定
 Vite+React19+TS+TanStack Router/Query+Tailwind v4+TipTap；Python3.12+FastAPI+uv+SQLAlchemy async+PG only+MinIO。

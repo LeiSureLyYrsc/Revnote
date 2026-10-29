@@ -119,10 +119,14 @@ jobs:
         # MinIO are absent — the scaffold's core promise.
         run: uv run pytest apps/api/tests/unit -v
 
-      - name: Integration tests against the real PostgreSQL service
-        # `--strict-markers` is already in the repo config, so `-m integration`
-        # selects exactly the opt-in database tests.
-        run: uv run pytest apps/api/tests/integration -v -m integration --junitxml=api-integration.xml
+      - name: PostgreSQL sequential behavior tests
+        run: uv run pytest apps/api/tests/integration -v -m "integration and not concurrency and not migrations" --junitxml=api-integration.xml
+
+      - name: PostgreSQL concurrent and atomicity proofs
+        run: uv run pytest apps/api/tests/integration/kernel -v -m concurrency --junitxml=api-concurrency.xml
+
+      - name: Migration roundtrips on the separate disposable database
+        run: uv run pytest apps/api/tests/integration/test_migrations.py -v --junitxml=api-migrations.xml
 
       - name: Guard - integration tests must not have been skipped
         # A skip is NOT a database acceptance check. Parsing the JUnit XML (not
@@ -134,23 +138,34 @@ jobs:
           import xml.etree.ElementTree as ET
 
           try:
-              suites = ET.parse("api-integration.xml").getroot()
-          except (OSError, ET.ParseError) as exc:
-              print(f"::error::cannot read api-integration.xml: {exc}")
-              sys.exit(1)
-
-          total = skipped = 0
-          for case in suites.iter("testcase"):
-              total += 1
-              if case.find("skipped") is not None:
-                  skipped += 1
-
-          print(f"integration testcases={total} skipped={skipped}")
-          if total == 0:
-              print("::error::No integration tests ran.")
-              sys.exit(1)
-          if skipped:
-              print("::error::Integration tests were skipped: TEST_DATABASE_URL was not honoured.")
+              required = {
+                  "api-integration.xml": {
+                      "test_create_folder_writes_rev1_and_one_event",
+                      "test_note_can_share_a_uuid_with_the_folder_it_lives_in",
+                  },
+                  "api-concurrency.xml": {
+                      "test_eight_producers_allocate_a_dense_sequence",
+                      "test_same_op_from_many_connections_writes_once",
+                      "test_cas_race_has_exactly_one_winner",
+                      "test_ledger_backstop_returning_false_replays_the_recorded_result",
+                      "test_three_connection_visibility_then_commit",
+                      "test_three_connection_visibility_then_rollback_reuses_the_seq",
+                      "test_lost_commit_ack_is_durable_and_retry_replays",
+                  },
+                  "api-migrations.xml": {
+                      "test_full_round_trip_and_reapply",
+                      "test_alembic_check_reports_no_diff",
+                  },
+              }
+              for path, names in required.items():
+                  cases = list(ET.parse(path).getroot().iter("testcase"))
+                  rejected = [c for c in cases if any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
+                  missing = names - {c.attrib.get("name") for c in cases}
+                  print(f"{path}: tests={len(cases)} rejected={len(rejected)} missing={sorted(missing)}")
+                  if not cases or rejected or missing:
+                      raise ValueError(f"PostgreSQL acceptance incomplete: {path}")
+          except (OSError, ET.ParseError, ValueError) as exc:
+              print(f"::error::{exc}")
               sys.exit(1)
           PY
 
@@ -165,6 +180,11 @@ jobs:
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: uv run alembic -c apps/api/alembic.ini current
+
+      - name: Check model and migration agreement
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: uv run alembic -c apps/api/alembic.ini check
 
       - name: Verify exactly the Phase 2 domain tables exist
         # Inspect the real catalog; no attachment/revision/outbox tables belong
@@ -225,7 +245,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: api-integration-report
-          path: api-integration.xml
+          path: |
+            api-integration.xml
+            api-concurrency.xml
+            api-migrations.xml
           if-no-files-found: warn
           retention-days: 7
 

@@ -2,7 +2,7 @@
 
 Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 API；Joplin Server 协议仅是后续兼容适配器，非 Data API、非产品主路径。
 
-**当前仅为开发脚手架，不是可用的同步产品。** 编辑器仅使用内存，刷新即丢失；没有笔记保存、同步、认证或附件业务。API 可达不代表正文已保存。
+**当前不是完整同步产品。** Phase 2 增加六表与 Python 内核事务写入口；没有业务 HTTP、认证或附件业务，Web 未接入内核。编辑器仍仅使用内存，刷新即丢失。API 可达不代表正文已保存。
 
 当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/MinIO 的镜像拉取与运行也尚未完成验收，详见下文限制。
 
@@ -13,9 +13,10 @@ Python 3.12+、FastAPI、uv、SQLAlchemy 2.x async、asyncpg、Alembic；仅 Pos
 Web：Vite、React 19、TypeScript、TanStack Router/Query、Tailwind CSS v4、TipTap。
 
 ```text
-apps/api/                 FastAPI、异步DB骨架、空Alembic基线、测试、Dockerfile
+apps/api/                 FastAPI、六表/迁移、Kernel/service、PG测试、Dockerfile
 apps/web/                 暗色三栏、空TipTap、API状态与开发代理
 docs/plan-scaffold.md      已确认计划、领域表草图及P0不变量
+docs/plan-phase2.md        Phase 2 已确认领域模型与事务写路径契约
 docs/build-conventions.md Build补充约定
 .github/workflows/        检查与Actions→GHCR
 docker-compose.yml        官方PostgreSQL、MinIO、一次性私有建桶
@@ -23,7 +24,7 @@ pyproject.toml / uv.lock   根Python workspace与唯一锁文件
 pnpm-workspace.yaml       Web workspace，根pnpm锁文件
 ```
 
-完整范围见 [脚手架计划](docs/plan-scaffold.md)。领域表只在文档里：**数据库不会创建业务表**，空基线只建立 Alembic 版本记录。没有 `create_all()`。
+Phase 2 范围见 [内核计划](docs/plan-phase2.md)。`0001_baseline` 保持原空基线，`0002_sync_kernel_core` 创建且只创建 `users/workspaces/folders/notes/change_events/op_ledger`。不使用 `create_all()`。
 
 ## 前置条件
 
@@ -62,14 +63,14 @@ docker compose logs minio-wait minio-init minio-private
 
 默认本机端口：PG `5432`、MinIO API `9000`、MinIO Console `9001`。bucket 私有，不开放匿名访问。宿主机 API 默认使用 `127.0.0.1`；未来若容器化运行，内部地址与浏览器公开地址必须分开配置。
 
-### 执行空基线迁移
+### 执行迁移
 
 ```powershell
 uv run --package revnote-api --env-file .env alembic -c apps/api/alembic.ini upgrade head
 uv run --package revnote-api --env-file .env alembic -c apps/api/alembic.ini current
 ```
 
-不要重复执行 `alembic init` 或生成新的 scaffold revision。基线 `upgrade/downgrade` 无业务 DDL；后续正式建模另行生成迁移。
+不要重复执行 `alembic init`。升级 head 会建立 Phase 2 六表；降到 `0001_baseline` 会删除六表及其数据，不得在日常开发库或生产库自动降级。
 
 ### 启动 API 与 Web
 
@@ -106,12 +107,16 @@ pnpm --filter @revnote/web check:markdown
 真实数据库测试使用 **独立可丢弃 PostgreSQL 测试库**：
 
 ```powershell
-$env:TEST_DATABASE_URL = 'postgresql+asyncpg://revnote:你的开发密码@127.0.0.1:5432/独立测试库'
+$env:TEST_DATABASE_URL = 'postgresql+asyncpg://revnote:你的开发密码@127.0.0.1:5432/revnote_test'
+$env:TEST_MIGRATION_DATABASE_URL = 'postgresql+asyncpg://revnote:你的开发密码@127.0.0.1:5432/revnote_migrations_test'
+$env:REQUIRE_POSTGRES_TESTS = '1'
 uv run pytest apps/api/tests
 Remove-Item Env:TEST_DATABASE_URL
+Remove-Item Env:TEST_MIGRATION_DATABASE_URL
+Remove-Item Env:REQUIRE_POSTGRES_TESTS
 ```
 
-该库须事先存在。未配置 `TEST_DATABASE_URL` 时，集成测试明确跳过；配置后连不上必须失败。**skip 不是数据库验收通过。** 不使用 SQLite 替代 PG。
+两库须事先存在且相互独立，均必须可丢弃：普通库运行写入与并发，迁移库独占升降级。CI 或 `REQUIRE_POSTGRES_TESTS=1` 缺少任一 URL 直接失败；已配置的连接错误不能跳过。无参数的本地跳过只方便运行单元测试，**不是数据库验收通过**。不使用 SQLite 替代 PG，也不将外层测试回滚当作多连接隔离。
 
 浏览器冒烟：
 
@@ -124,15 +129,19 @@ Remove-Item Env:TEST_DATABASE_URL
 ### 当前验收与限制
 
 - 已用仓库外临时 Playwright 环境实测：真实 API→Vite 代理、桌面三栏、Markdown 输出、刷新清空、API 停止/恢复、无效 JSON 拒绝、390px 栏位切换与内存内容保留，无浏览器运行时错误。没有给仓库加入 E2E 平台依赖。
-- 已完成根锁定安装、Ruff、API 全套测试（56 passed，包含临时真实 PostgreSQL 上的 4 项集成测试）、Alembic upgrade/current、Web lint/typecheck/build 和 7 项基础 Markdown 往返检查。空基线实际检查仅有 `alembic_version`，无业务表。
+- 脚手架阶段已完成 API 56 项测试、Web lint/typecheck/build、7 项 Markdown 检查，并由 [Actions #40777468266](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/40777468266) 验证 API/Web/GHCR 全绿；这是历史版本证据，不替代 Phase 2 验收。
+- Phase 2 schema 提交 `fa99b83` 前，对精确暂存快照完成锁定安装、Ruff、105 项单元测试及 29 项真实 PostgreSQL 迁移测试（无 skip），`alembic check` 无差异，原基线仅版本表、新 head 恰好六张领域表。
+- 事务写提交 `8948fd9` 前，Ruff、281 项单元测试及 109 项真实 PostgreSQL 非并发内核测试通过。
+- 并发提交 `0473b17` 前，45 项真实 PostgreSQL 并发/原子性测试通过；完整 `pytest apps/api/tests -v` 为 **476 passed、0 skipped**（205.58s）。覆盖 8×20 连续 seq、同 op 并发重放、CAS 单赢家、事务故障回滚、末尾 ledger 真实冲突兜底、三连接提交/回滚可见性及提交确认丢失恢复。单独并发组耗时 51.56s，这些测试耗时不是生产吞吐指标。
+- 最终 CI 的三组 no-skip/必需用例守卫已用该次真实 JUnit 报告验证：普通 PG 121 项、并发/原子性 45 项、迁移 29 项，均无 skip/failure/error；Actions 结果以推送后的实际运行记录为准。
 - Web 构建通过，但编辑器入口约 859 kB（gzip 约 271 kB），仍有 chunk 大小警告；暂不为脚手架引入拆包优化工程。
-- 本机未检测到 Docker CLI/运行时。上述 PostgreSQL 来自仓库外临时实例，验收后已停止；这**不证明 Compose 或 MinIO 可运行**。
+- 本机未检测到 Docker CLI/运行时。本地 PostgreSQL 验证使用仓库外临时实例和两个独立可丢弃库，不使用 SQLite；这**不证明 Compose 或 MinIO 可运行**。本次验收的临时实例已停止。
 - Compose 官方镜像在当前环境未完成拉取与运行验证；若官方 MinIO 分发源不可用，应停止并确认来源，不切换第三方镜像或其他 S3 产品。
 - GitHub 仓库为 [LeiSureLyYrsc/Revnote](https://github.com/LeiSureLyYrsc/Revnote)。Actions、API 镜像构建和 GHCR 发布状态以实际运行记录为准，文件已生成不代表已验收。
 
 ## Actions 与 GHCR
 
-工作流先检查 API、真实 PG/空迁移和 Web，再构建 API 镜像。发布目标为 `ghcr.io/<owner>/revnote-api`。PR 不推镜像；发布使用 GitHub Actions 的 `GITHUB_TOKEN`，不在仓库保存 PAT。
+工作流先检查 API、双库真实 PG/并发/迁移与 Web，再构建 API 镜像。发布目标为 `ghcr.io/<owner>/revnote-api`。PR 不推镜像；发布使用 GitHub Actions 的 `GITHUB_TOKEN`，不在仓库保存 PAT。
 
 仓库需允许 Actions 写 Packages。工作流会在 `main` 推送或手动触发后检查并发布；没有成功运行记录时不应视为 CI 或 GHCR 已验收。
 
@@ -161,8 +170,12 @@ gh run view <run-id> --log-failed
 - MinIO 初始化失败：检查 `minio-wait`、`minio-init`、`minio-private` 日志、凭据、bucket 名称及固定官方镜像版本是否可获取；凭据放入 `MC_HOST_` URL 时，特殊字符需要 URL 编码。
 - 生产构建后的静态文件没有 Vite 代理；生产同源反向代理另行规划。
 
-## 后续内核边界
+## 内核边界
 
-工作区锁分配 seq；对象/事件同事务；DB 唯一 op_id 幂等；客户端队列、服务端 Outbox 与幂等账本分开；rev/CAS、tombstone、三方合并与冲突副本；MinIO 事务外不可变上传与宽限 GC。
+Phase 2 只做工作区锁分配 seq、对象/事件/成功账本同事务、DB 唯一 op_id 幂等、rev/CAS、软删除和树移动。Python 命令由调用方提供 entity_id/op_id；修改 base_rev 或业务内容需新 op_id。重放返回首次事件的结果，不能取当前对象冒充旧版本。
 
-这些是设计约束，**本轮未实现**。预签名 PUT 不天然禁止覆盖，HEAD/ETag 不能普遍替代 SHA-256；正式附件业务前必须验证。v1 面向明文可搜，E2EE 后置且与服务端明文能力互斥。Web Cookie/OIDC/Passkey、Joplin PAT/app password 后续单独设计。
+新 op 修改/移动/再删已删对象返回 `EntityDeleted`，原删除 op 重放仍返回原结果。非空文件夹拒绝删除；子树移动只更新根并发一条 move 事件，不批量修改后代。合法无值变化更新也递增 rev/seq。跨工作区约束不等于用户授权；仍没有认证。
+
+Kernel 内 seq/rev 保持整数，未来对外 JSON 使用十进制字符串。`min_retained_seq` 本阶段固定占位、不推进、不清理；延迟 event FK 和 ledger 会限制未来事件清理，清理策略必须协调引用与幂等窗口。提交确认丢失返回 `CommitOutcomeUnknown`，不能当作已回滚，应使用原 op_id 重试确认。
+
+仍未实现：同步读取/推拉协议、客户端队列、独立服务端 Outbox、三方合并、冲突副本、MinIO 附件、搜索、E2EE、认证及 Joplin 桥。预签名 PUT 不天然防覆盖，HEAD/ETag 不等于 SHA-256；这些后续另行设计，不扩入本阶段。

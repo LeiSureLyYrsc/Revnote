@@ -35,9 +35,20 @@ describe('acceptance evidence guard', () => {
 
   it('keeps locating metadata inside test-owned files and normalizes Windows separators', () => {
     const unit = path.join(webRoot, 'tests', 'unit', 'sync', 'engine.test.ts')
+    // The native form and the forward-slash form name the same absolute file on
+    // every platform, so both must normalize to one portable report entry.
     expect(safeSource(unit, 42)).toEqual({ source: 'tests/unit/sync/engine.test.ts', line: 42 })
     expect(safeSource(unit.replaceAll('\\', '/'), 42)).toEqual({ source: 'tests/unit/sync/engine.test.ts', line: 42 })
-    expect(safeSource(unit.replaceAll('/', '\\'), 42)).toEqual({ source: 'tests/unit/sync/engine.test.ts', line: 42 })
+    // Backslash paths are absolute only on win32. On a POSIX host the same
+    // string is a *relative* path, which the guard must refuse rather than
+    // reinterpret: resolving it would silently read an unrelated file.
+    const backslash = unit.replaceAll('/', '\\')
+    if (process.platform === 'win32') {
+      expect(safeSource(backslash, 42)).toEqual({ source: 'tests/unit/sync/engine.test.ts', line: 42 })
+    } else {
+      expect(path.isAbsolute(backslash)).toBe(false)
+      expect(safeSource(backslash, 42)).toEqual({})
+    }
     const component = path.join(webRoot, 'tests', 'components', 'identity.test.tsx')
     expect(safeSource(component, 3)).toEqual({ source: 'tests/components/identity.test.tsx', line: 3 })
     // Everything below is rejected: scripts, sources, configs, escapes and non-spec files.

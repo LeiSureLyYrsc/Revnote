@@ -44,6 +44,22 @@ class LifecycleError(RuntimeError):
     """A safe, fixed-message lifecycle failure (never include child output)."""
 
 
+if sys.platform == "win32":
+
+    def load_kernel32() -> ctypes.CDLL:
+        """Only a Windows interpreter can load the kernel job API."""
+        return ctypes.WinDLL("kernel32", use_last_error=True)
+
+else:
+
+    def load_kernel32() -> ctypes.CDLL:
+        # Callers already construct a job only when ``os.name == "nt"``; stating
+        # the precondition here keeps the win32-only ctypes members out of a
+        # non-Windows type stub (and out of a Linux import path), while a future
+        # caller that forgets the guard still fails with a fixed message.
+        raise LifecycleError("The owned Windows process job requires Windows.")
+
+
 class WindowsJob:
     """Kill every owned descendant on close, even after its leader has exited.
 
@@ -80,7 +96,7 @@ class WindowsJob:
                 ("peak_job_memory", ctypes.c_size_t),
             ]
 
-        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel = load_kernel32()
         self.kernel.CreateJobObjectW.restype = wintypes.HANDLE
         self.kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
         self.kernel.SetInformationJobObject.argtypes = [
@@ -424,6 +440,10 @@ async def database_probe(raw: str, payload: dict[str, object]) -> dict[str, obje
 class TestControl:
     """Runner-local authenticated IPC; never mounted in the production API/Vite."""
 
+    # Only these names may appear in diagnostics. Anything else is recorded as
+    # "unknown" so a malformed payload cannot inject text into the CI log.
+    ACTIONS = frozenset({"stop", "start", "stats", "floor"})
+
     def __init__(
         self,
         command: list[str],
@@ -436,6 +456,12 @@ class TestControl:
         self.command, self.env, self.port = command, env, port
         self.owned, self.job, self.api = owned, job, api
         self.secret_key = uuid.uuid4().hex
+        # Fixed-vocabulary breadcrumb of the last control exchange, so a failed
+        # run can distinguish "the browser never started the API again" from
+        # "the restart was requested and did not become ready". Never the
+        # payload, a credential, a URL or an exception message.
+        self.last_ok_action: str | None = None
+        self.last_failure: tuple[str, str] | None = None
         control = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -444,37 +470,66 @@ class TestControl:
 
             def do_POST(self) -> None:
                 if self.headers.get("X-Revnote-Control") != control.secret_key:
+                    control.last_failure = ("unknown", "unauthorized")
                     self.send_error(403)
                     return
+                action = "unknown"
+                code = "internal"
                 try:
+                    code = "invalid_length"
                     length = int(self.headers.get("Content-Length", "0"))
                     if length < 1 or length > 2048:
                         raise LifecycleError("Invalid control payload length.")
+                    code = "invalid_payload"
                     payload = json.loads(self.rfile.read(length))
-                    action = payload.get("action")
+                    action = control.action_name(payload.get("action"))
+                    # Past this point the action name is meaningful, so a failure
+                    # is attributed to it rather than to payload parsing.
+                    code = "action_failed"
                     if action == "stop":
                         if control.api.poll() is not None:
+                            code = "already_stopped"
                             raise LifecycleError("The owned API is already stopped.")
                         stop_owned(control.api)
                         result: dict[str, object] = {"ok": True}
                     elif action == "start":
                         if control.api.poll() is None:
+                            code = "already_running"
                             raise LifecycleError("The owned API is already running.")
                         child_env = dict(control.env)
                         if payload.get("snapshotLimit") == 1:
                             child_env["SYNC_SNAPSHOT_MAX_OBJECTS"] = "1"
-                        reservation = reserve_port(control.port)
+                        try:
+                            reservation = reserve_port(control.port)
+                        except LifecycleError:
+                            code = "port_unavailable"
+                            raise
                         reservation.close()
-                        control.api = spawn(control.command, child_env, REPO_ROOT, control.job)
+                        try:
+                            control.api = spawn(control.command, child_env, REPO_ROOT, control.job)
+                        except LifecycleError:
+                            code = "spawn_failed"
+                            raise
                         control.owned.append(control.api)
-                        wait_http(
-                            control.api,
-                            f"http://127.0.0.1:{control.port}/health",
-                            control.env["WEB_E2E_RUN_ID"],
-                        )
+                        try:
+                            wait_http(
+                                control.api,
+                                f"http://127.0.0.1:{control.port}/health",
+                                control.env["WEB_E2E_RUN_ID"],
+                            )
+                        except LifecycleError:
+                            # The decisive distinction for a cascade: a restart
+                            # that was accepted but never became ready.
+                            code = "not_ready_after_start"
+                            raise
                         result = {"ok": True}
                     else:
+                        code = "unknown_action" if action == "unknown" else "probe_failed"
                         result = asyncio.run(database_probe(control.env["DATABASE_URL"], payload))
+                    # The action itself succeeded; only the response write can
+                    # still fail, and that is recorded as its own fixed code.
+                    control.last_ok_action = action
+                    code = "response_write_failed"
                     body = json.dumps(result).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -482,6 +537,7 @@ class TestControl:
                     self.end_headers()
                     self.wfile.write(body)
                 except Exception:
+                    control.last_failure = (action, code)
                     self.send_error(500, "Owned test control failed; details redacted")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -492,10 +548,81 @@ class TestControl:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
+    @classmethod
+    def action_name(cls, value: object) -> str:
+        """Map a payload value onto the fixed vocabulary; never echo the input."""
+        return value if isinstance(value, str) and value in cls.ACTIONS else "unknown"
+
+    def describe(self) -> str:
+        """One line of fixed-vocabulary control history for a failed run."""
+        last_ok = self.last_ok_action or "none"
+        if self.last_failure is None:
+            last_failure = "none"
+        else:
+            action, code = self.last_failure
+            last_failure = f"{action}/{code}"
+        return f"Control: last_ok={last_ok} last_failure={last_failure}"
+
     def close(self) -> None:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=10)
+
+
+def process_alive(process: subprocess.Popen[bytes]) -> str:
+    """Liveness only: never a command line, environment or exit detail."""
+    try:
+        return "running" if process.poll() is None else "exited"
+    except OSError:
+        return "unknown"
+
+
+def probe_status(url: str) -> str:
+    """Return only a numeric HTTP status, or a fixed failure class."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=5) as response:
+            return str(response.status)
+    except urllib.error.HTTPError as error:
+        # A 5xx/4xx from our own service is the useful signal.
+        return str(error.code)
+    except urllib.error.URLError:
+        return "unreachable"
+    except (OSError, ValueError):
+        return "unreachable"
+
+
+def print_lifecycle_diagnostics(
+    api: subprocess.Popen[bytes] | None,
+    web: subprocess.Popen[bytes] | None,
+    api_url: str,
+    web_url: str,
+    control: TestControl | None,
+) -> None:
+    """Bounded, credential-free state of the owned lifecycle at failure time.
+
+    Distinguishes "the API was restarted and never became ready" from "the
+    browser stopped driving the owned API at all" without exposing a single
+    child byte of output.
+    """
+    # The initial API object is replaced whenever a case stops and restarts the
+    # owned service, so report the current one as well: "initial exited, current
+    # running" is the healthy post-restart state, not a failure.
+    current = control.api if control is not None else None
+    print(
+        "Owned processes: "
+        f"api-initial={process_alive(api) if api is not None else 'absent'} "
+        f"api-current={process_alive(current) if current is not None else 'absent'} "
+        f"vite={process_alive(web) if web is not None else 'absent'}",
+        file=sys.stderr,
+    )
+    print(
+        f"Health probes: api={probe_status(f'{api_url}/health')} "
+        f"web-proxy={probe_status(f'{web_url}/api/health')}",
+        file=sys.stderr,
+    )
+    if control is not None:
+        print(control.describe(), file=sys.stderr)
 
 
 def print_safe_browser_failures(report_path: Path, run_id: str, scope: str) -> None:
@@ -714,6 +841,9 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=3_600 if scope == "full" else 1_800,
             )
         except LifecycleError:
+            # Browser exited nonzero: report what the owned lifecycle looked like
+            # at that moment before the located case metadata.
+            print_lifecycle_diagnostics(api, web, api_url, web_url, control)
             print_safe_browser_failures(report_dir / "playwright.json", run_id, scope)
             raise
         report = json.loads((report_dir / "playwright.json").read_text(encoding="utf-8"))

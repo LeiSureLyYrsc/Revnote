@@ -211,17 +211,45 @@ async def require_empty_database(raw: str) -> None:
         await connection.close()
 
 
+#: Bounded retry that only absorbs the kernel releasing a just-killed listener.
+#: Ten attempts over roughly half a second never turn a real conflict into a wait.
+PORT_RESERVATION_ATTEMPTS = 10
+PORT_RESERVATION_RETRY_SECONDS = 0.05
+
+
 def reserve_port(requested: int) -> socket.socket:
-    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        if os.name == "nt":
-            reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        reservation.bind(("127.0.0.1", requested))
-        reservation.listen(1)
-    except OSError:
-        reservation.close()
-        raise LifecycleError("A requested HTTP port is already occupied; refusing reuse.") from None
-    return reservation
+    """Bind a loopback port we will hand to one owned child process.
+
+    A restarted API rebinds the port its predecessor just lost. On POSIX that
+    predecessor served requests, so its closed connections linger in ``TIME_WAIT``
+    on ``127.0.0.1:<port>``; a plain ``bind`` then fails with ``EADDRINUSE`` even
+    though nothing is listening. ``SO_REUSEADDR`` is the option that lets a bind
+    cross that state. Windows has different bind semantics, so it keeps
+    ``SO_EXCLUSIVEADDRUSE`` rather than mixing both rules on one socket.
+
+    This is still exclusive: ``SO_REUSEADDR`` never permits taking a port another
+    socket is *listening* on (that would be ``SO_REUSEPORT``, which is deliberately
+    not used), so a live owner yields the same fixed error as before. The short
+    retry only covers the gap between killing a process and the kernel releasing
+    its listener; when it is exhausted the original error is raised unchanged.
+    """
+    for attempt in range(PORT_RESERVATION_ATTEMPTS):
+        reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt":
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            reservation.bind(("127.0.0.1", requested))
+            reservation.listen(1)
+        except OSError:
+            reservation.close()
+            if attempt == PORT_RESERVATION_ATTEMPTS - 1:
+                break
+            time.sleep(PORT_RESERVATION_RETRY_SECONDS)
+            continue
+        return reservation
+    raise LifecycleError("A requested HTTP port is already occupied; refusing reuse.")
 
 
 def spawn(

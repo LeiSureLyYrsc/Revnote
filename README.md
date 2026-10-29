@@ -2,7 +2,7 @@
 
 Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 API；Joplin Server 协议仅是后续兼容适配器，非 Data API、非产品主路径。
 
-**当前不是完整同步产品。** Phase 3 在事务内核上提供认证与原生 HTTP push/pull/snapshot、只读 API；Web 尚未接入这些业务接口，编辑器仍仅使用内存，刷新即丢失。API 可达不代表 Web 正文已保存。附件与完整部署不在本阶段范围内。
+**当前为受控预览，不是公网生产部署。** Phase 4 正在把 Web 接入 Phase 3 的认证与原生 HTTP push/pull/snapshot；已实现本机持久化与会话模块，完整浏览器及发布门禁仍以 [Phase 4 实际验收记录](docs/phase4-validation.md) 为准。API 可达不代表 Web 正文已保存。附件与完整部署不在本阶段范围内。
 
 当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/MinIO 的镜像拉取与运行也尚未完成验收，详见下文限制。
 
@@ -14,11 +14,13 @@ Web：Vite、React 19、TypeScript、TanStack Router/Query、Tailwind CSS v4、T
 
 ```text
 apps/api/                 FastAPI、认证/同步内核、迁移、PG/HTTP测试、Dockerfile
-apps/web/                 暗色三栏、空TipTap、API状态与开发代理
+apps/web/                 暗色三栏、Markdown 源码编辑、IndexedDB、原生 API 同步
 docs/plan-scaffold.md      已确认计划、领域表草图及P0不变量
 docs/plan-phase2.md        Phase 2 已确认领域模型与事务写路径契约
 docs/plan-phase3.md        Phase 3 锁定计划、迁移与验收责任
 docs/phase3-sync-api-spec.md 原生 HTTP API v1 协议
+docs/plan-phase4.md        已批准的 Web 持久化、会话、同步与浏览器验收计划
+docs/phase4-validation.md  Phase 4 实际运行与发布证据
 docs/build-conventions.md Build补充约定
 .github/workflows/        检查与Actions→GHCR
 docker-compose.yml        官方PostgreSQL、MinIO、一次性私有建桶
@@ -106,6 +108,8 @@ pnpm --filter @revnote/web lint
 pnpm --filter @revnote/web typecheck
 pnpm --filter @revnote/web build
 pnpm --filter @revnote/web check:markdown
+pnpm test:web
+pnpm check:api-reports
 ```
 
 真实数据库测试使用 **独立可丢弃 PostgreSQL 测试库**：
@@ -122,6 +126,32 @@ Remove-Item Env:REQUIRE_POSTGRES_TESTS
 
 两库须事先存在且相互独立，均必须可丢弃：普通库运行写入与并发，迁移库独占升降级。CI 或 `REQUIRE_POSTGRES_TESTS=1` 缺少任一 URL 直接失败；已配置的连接错误不能跳过。无 DB 时只运行 `apps/api/tests/unit`；**skip 不是验收通过**。不使用 SQLite 替代 PG，也不将外层测试回滚当作多连接隔离。
 
+### Web 持久化与浏览器验收
+
+- access 仅在内存。“记住登录”默认不勾选；只有显式勾选才在 IndexedDB 保存 refresh，密码不保存。未勾选时刷新页面可读取未退出账号的本机缓存，但需要重新登录才能同步。
+- 同 origin 仅一个标签持有 Web Lock，其他标签只读。关闭原写标签后可显式接管；不支持 Web Locks 的环境禁止写入。初始支持桌面 Chromium/Edge 安全上下文，不外推移动 Safari 支持。
+- “正在写入本地”“已写入本地”与工作区的待同步/同步状态独立。只有 IndexedDB 事务完成才报告本地保存；存储失败时保留页面输入，离开前复制或导出。
+- 冻结命令先持久化后发送；未知结果使用原 op ID 和原 payload 确认。冲突需要人工选择，不自动合并或覆盖；远端删除的脏稿只能显式另存新 ID。
+- Markdown 原文为正文真相；打开、切换查看、仅改标题不重新序列化正文。富文本转换需显式确认并先保存原文恢复点，不保证任意 Markdown 富文本无损。
+- 退出会隐藏并锁住该账号本机缓存，不自动删除队列。未确认服务端 logout 成功时只宣称本机退出。本机缓存不是磁盘加密，也不是本地身份认证。
+- 已加载页面可断网编辑；静态资源可达时重新打开可恢复已落盘草稿。**不支持完全离线冷启动、页面关闭后的后台同步或 PWA。** 浏览器清理/驱逐存储仍可能丢失本机数据，应另行备份。
+
+浏览器验收使用第三个**新建、空、独占的一次性 PostgreSQL 库**，不能复用普通测试库、迁移库或开发库。测试库名必须为 `revnote_web_e2e` 或 `revnote_web_e2e_<id>`，连接只允许 loopback：
+
+```powershell
+# 由外部生命周期工具创建并拥有临时 PG 与此一次性库；凭据通过环境注入，不写入仓库。
+$env:WEB_E2E_DATABASE_URL = 'postgresql+asyncpg://测试账号:测试密码@127.0.0.1:5432/revnote_web_e2e_local'
+$env:REQUIRE_POSTGRES_TESTS = '1'
+pnpm --filter @revnote/web exec playwright install chromium
+pnpm test:e2e
+pnpm check:web-reports
+Remove-Item Env:WEB_E2E_DATABASE_URL
+```
+
+runner 显式迁移并拥有 API/Vite/浏览器子进程，在 finally 清理，不接管既有服务、不读取开发 `.env`；PG 的停止责任属于外部控制器。不要在含适用根 `.env` 的工作区运行此 runner；使用独立测试工作区，不删除用户开发配置。详见 [浏览器验收清单](apps/web/e2e/README.md)。默认关闭 trace、HAR、storageState、视频与截图，报告仅保存 hash、固定标签和计数，不提交认证状态、正文或数据库目录。
+
+Web 报告门禁要求各组非零、无 skip/todo/failure/error、无 retries/only 且覆盖承重标签。focused 报告与 full 分目录，局部绿色不代替全量验收。`check:api-reports` 要求当前 CI 七组 JUnit 报告及原有承重名称，不以总数替代覆盖。
+
 ### 认证与原生 API
 
 协议和示例见 [API v1 规格](docs/phase3-sync-api-spec.md)，OpenAPI 在 `/docs` 与 `/openapi.json`。注册默认关闭；开发环境可在 .env 显式设 `AUTH_REGISTRATION_OPEN=true`，重启 API 后使用 `/api/v1/auth/register` 原子创建账号和默认 workspace（不自动登录），再 `/auth/login` 获取 token pair。
@@ -134,13 +164,7 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 
 通用错误信封含code/message/request_id/retryable/details；非成员与不存在workspace统一404。合法X-Request-ID原样回传，非法替换。CORS默认空列表、无cookie凭据；真实限流尚未实现，公网部署必须另行配置防护。
 
-浏览器冒烟：
-
-1. 桌面宽屏显示导航、空列表、编辑区三栏；窄屏可切换栏位且不横向溢出。
-2. 空编辑器可输入、换行及基础格式；刷新后内容重置。
-3. 明确显示内存演示与未实现保存/同步；冲突仅中性占位。
-4. API 关闭时显示请求失败，重启后可重新检查恢复；不伪造保存状态。
-5. Markdown 检查仅覆盖基础节点的语义往返，不承诺原始空白、LaTeX、复杂表格、HTML、自定义块无损。
+浏览器承重场景覆盖登录、八操作、刷新持久化、API 停止/恢复、断网编辑、提交后丢响应、A ACK 不吞 B、CAS 冲突、删除恢复、双标签接管、refresh 不确定性、账号隔离、游标/重建、Markdown 原文与 390px 栏位切换。是否已通过只以实际验收记录为准；测试文件存在不等于运行通过。
 
 ### 当前验收与限制
 
@@ -158,7 +182,7 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 
 ## Actions 与 GHCR
 
-工作流先检查 API、双库真实 PG/并发/迁移与 Web，再构建 API 镜像。发布目标为 `ghcr.io/<owner>/revnote-api`。PR 不推镜像；发布使用 GitHub Actions 的 `GITHUB_TOKEN`，不在仓库保存 PAT。
+工作流先检查 API、双库真实 PG/并发/迁移、Web 单元/组件及独立 `web-e2e` 真实浏览器组，再构建 API 镜像；`image.needs` 同时依赖三组。发布目标为 `ghcr.io/<owner>/revnote-api`。PR 不推镜像；发布使用 GitHub Actions 的 `GITHUB_TOKEN`，不在仓库保存 PAT。
 
 仓库需允许 Actions 写 Packages。工作流会在 `main` 推送或手动触发后检查并发布；没有成功运行记录时不应视为 CI 或 GHCR 已验收。
 
@@ -195,4 +219,4 @@ Phase 2 只做工作区锁分配 seq、对象/事件/成功账本同事务、DB 
 
 Kernel 内 seq/rev 保持整数，对外 JSON 使用十进制字符串。`min_retained_seq` 默认1，不推进、不清理；过期条件since<min_retained_seq-1。延迟event FK和ledger限制未来事件清理，清理策略必须协调引用与幂等窗口。写入顺序及取消/超时语义见 [内核补充](docs/phase2-sync-kernel-spec.md)。不shield业务COMMIT，提交期间取消或确认丢失不能当作回滚，应同op_id+payload重试确认；可疑连接invalidate。
 
-仍未实现：Web业务接入、客户端队列、独立服务端Outbox、三方合并、冲突副本、MinIO附件、搜索、E2EE及Joplin桥。预签名PUT不天然防覆盖，HEAD/ETag不等于SHA-256；这些后续另行设计，不扩入本阶段。
+本阶段不实现：独立服务端 Outbox、自动三方合并、自动上传冲突副本、MinIO 附件、搜索、E2EE、Joplin 桥、snapshot 分页与 PWA。预签名 PUT 不天然防覆盖，HEAD/ETag 不等于 SHA-256；这些后续另行设计，不扩入本阶段。

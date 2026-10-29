@@ -31,6 +31,8 @@ export interface SafeCase {
   labels: string[]
   status: CaseStatus
   attempts: number
+  source?: string
+  line?: number
 }
 export interface SafeReport {
   schemaVersion: 1
@@ -44,6 +46,17 @@ export interface SafeReport {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const allLabels = new Set<string>([...UNIT_LABELS, ...E2E_LABELS])
+// A report may only claim labels from its own runner's frozen inventory, so a
+// browser run cannot borrow a unit group (or the reverse) to look complete.
+const runnerLabels: Record<Runner, ReadonlySet<string>> = {
+  vitest: new Set<string>(UNIT_LABELS),
+  playwright: new Set<string>(E2E_LABELS),
+}
+// Test-owned filenames only: no arbitrary paths, source excerpts, annotations,
+// messages, stacks or request bodies may ever reach a persisted report.
+const safeSourcePattern = /^(?:e2e\/[a-zA-Z0-9_-]+\.spec\.ts|tests\/(?:unit|components)\/[a-zA-Z0-9_./-]+\.(?:test|spec)\.tsx?)$/
+const reportKeys = new Set(['schemaVersion', 'runner', 'scope', 'runId', 'complete', 'errors', 'cases'])
+const caseKeys = new Set(['id', 'labels', 'status', 'attempts', 'source', 'line'])
 
 export function caseId(name: string): string {
   return createHash('sha256').update(name).digest('hex')
@@ -58,6 +71,48 @@ export function reportScope(args: string[], runner: Runner): Scope {
 
 export function labelsIn(title: string): string[] {
   return E2E_LABELS.filter((label) => new RegExp(`(?:^|[\\s@\\[])${label}(?=$|[\\s\\]])`).test(title))
+}
+
+export function safeSource(file: string, line: number, title?: string): { source: string; line: number } | Record<string, never> {
+  // Only reporters feed this, and they always pass an absolute module path.
+  // Requiring an absolute path keeps the result independent of the cwd.
+  if (typeof file !== 'string' || !path.isAbsolute(file)) return {}
+  const relative = path.relative(root, file).replaceAll('\\', '/')
+  // Source metadata is restricted to test-owned filenames, never arbitrary
+  // paths, source excerpts or dynamically supplied annotations/error messages.
+  if (!safeSourcePattern.test(relative) || relative.split('/').includes('..')) return {}
+  // Exact declaration line read from the file wins: a runner-reported index can
+  // drift from the on-disk source. The runner index is only a fallback, and only
+  // when it can name a real line in this file; otherwise metadata is omitted.
+  const text = readTestFile(file)
+  if (text === undefined) return {}
+  const candidate = text.lineOf(title)
+    ?? (Number.isSafeInteger(line) && line >= 1 && line <= text.lineCount ? line : undefined)
+  if (candidate === undefined || candidate < 1 || candidate > 1_000_000) return {}
+  return { source: relative, line: candidate }
+}
+
+/** Reads a test-owned file once per call: these files are small and bounded. */
+function readTestFile(file: string): { lineCount: number; lineOf(title?: string): number | undefined } | undefined {
+  let lines: string[]
+  try {
+    lines = readFileSync(file, 'utf8').split('\n')
+  } catch {
+    return undefined
+  }
+  return {
+    lineCount: lines.length,
+    lineOf(title) {
+      if (!title) return undefined
+      const matches = lines.flatMap((text, index) => {
+        for (const quote of ["'", '"', '`']) {
+          if (text.includes('(' + quote + title + quote)) return [index + 1]
+        }
+        return []
+      })
+      return matches.length === 1 ? matches[0] : undefined
+    },
+  }
 }
 
 export function junit(report: SafeReport): string {
@@ -75,7 +130,7 @@ export function junit(report: SafeReport): string {
 export function writeReport(report: SafeReport): void {
   const dir = path.join(root, 'reports', report.scope)
   mkdirSync(dir, { recursive: true })
-  // Only fixed labels, hashes and counts go to disk. Never failure messages,
+  // Only fixed labels, hashes, counts and bounded test source locations go to disk. Never failure messages,
   // stack traces, request bodies, arbitrary annotations or browser attachments.
   const jsonPath = path.join(dir, `${report.runner}.json`)
   const xmlPath = path.join(dir, `${report.runner}.xml`)
@@ -90,15 +145,26 @@ export function validateReport(value: unknown, runner: Runner, scope: Scope, req
   const report = value as SafeReport
   if (report.schemaVersion !== 1 || report.runner !== runner || report.scope !== scope
     || !report.complete || report.errors !== 0 || !/^[a-zA-Z0-9_-]{8,100}$/.test(report.runId)
-    || !Array.isArray(report.cases) || report.cases.length === 0) {
+    || !Array.isArray(report.cases) || report.cases.length === 0
+    || Object.keys(report).some((key) => !reportKeys.has(key))) {
     throw new Error('Incomplete, empty or unsuccessful report')
   }
   const ids = new Set<string>()
   const labels = new Set<string>()
+  const owned = runnerLabels[runner]
   for (const item of report.cases) {
-    if (!item || !/^[a-f0-9]{64}$/.test(item.id) || ids.has(item.id)
+    if (!item || typeof item !== 'object' || Object.keys(item).some((key) => !caseKeys.has(key))
+      || !/^[a-f0-9]{64}$/.test(item.id) || ids.has(item.id)
       || item.status !== 'passed' || item.attempts !== 1 || !Array.isArray(item.labels)
-      || item.labels.some((label) => !allLabels.has(label))) {
+      // Exactly one acceptance label per case: a case cannot inflate coverage by
+      // claiming several groups, and empty labels prove nothing.
+      || item.labels.length !== 1 || item.labels.some((label) => !owned.has(label))
+      // Optional locating metadata must still be a whitelisted test file.
+      || (item.source !== undefined && (
+        typeof item.source !== 'string' || !safeSourcePattern.test(item.source)
+        || item.source.split('/').includes('..')))
+      || (item.source === undefined) !== (item.line === undefined)
+      || (item.line !== undefined && (!Number.isSafeInteger(item.line) || item.line < 1 || item.line > 1_000_000))) {
       throw new Error('A case failed, was omitted/retried, or has invalid metadata')
     }
     ids.add(item.id)

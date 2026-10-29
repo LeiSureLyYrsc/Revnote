@@ -149,7 +149,9 @@ jobs:
             apps/api/src/revnote_api/services/sync_write.py \
             apps/api/src/revnote_api/kernel/results.py \
             apps/api/src/revnote_api/config.py \
-            apps/api/src/revnote_api/main.py
+            apps/api/src/revnote_api/main.py \
+            apps/api/scripts/run_web_e2e.py \
+            apps/api/scripts/check_test_reports.py
 
       - name: Unit tests (must pass with no external service)
         # Proves create_app() boots and serves / with /health while PostgreSQL and
@@ -271,6 +273,9 @@ jobs:
                   sys.exit(1)
           PY
 
+      - name: Reusable API report guard (same seven-group inventory)
+        run: uv run python apps/api/scripts/check_test_reports.py
+
       - name: Alembic upgrade head (documented repo-root command)
         # Alembic reads DATABASE_URL from Settings, so it is supplied here only —
         # never at job level, where it would break the unit tests' default checks.
@@ -377,7 +382,7 @@ jobs:
   # Web: lint, typecheck, production build, Markdown round-trip check
   # ------------------------------------------------------------------------- #
   web:
-    name: web (lint + typecheck + build + markdown)
+    name: web (lint + typecheck + build + markdown + unit + components)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -423,12 +428,72 @@ jobs:
         # Markdown linter, and needs no browser or API.
         run: pnpm --filter @revnote/web check:markdown
 
+      - name: Unit and component tests
+        run: pnpm test:web
+
+      - name: Guard Web unit and component reports
+        run: pnpm --filter @revnote/web check:reports --unit
+
+  web-e2e:
+    name: web-e2e (Chromium + native API + real PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17.11-alpine3.23
+        env:
+          POSTGRES_USER: revnote
+          POSTGRES_PASSWORD: revnote_ci_only_password
+          POSTGRES_DB: revnote_web_e2e_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username revnote --dbname revnote_web_e2e_ci --timeout=5"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 20s
+    env:
+      WEB_E2E_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_web_e2e_ci
+      REQUIRE_POSTGRES_TESTS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Sync Python workspace
+        run: uv sync --locked
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: package.json
+          run_install: false
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install locked Web dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        run: pnpm --filter @revnote/web exec playwright install --with-deps chromium
+      - name: Browser through API to PostgreSQL
+        run: pnpm test:e2e
+      - name: Guard browser acceptance report
+        run: pnpm --filter @revnote/web check:reports --e2e
+
   # ------------------------------------------------------------------------- #
   # API image -> GHCR, only after every check is green.
   # ------------------------------------------------------------------------- #
   image:
     name: image (build + push to GHCR)
-    needs: [api, web]
+    needs: [api, web, web-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

@@ -14,6 +14,9 @@ export default defineConfig({
     allowOnly: false,
     passWithNoTests: false,
     retry: 0,
+    // The safe reporter persists source:line metadata for a failed case. Without
+    // this Vitest omits test locations, so a failure could not be located at all.
+    includeTaskLocation: true,
     clearMocks: true,
     restoreMocks: true,
     unstubEnvs: true,

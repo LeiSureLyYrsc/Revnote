@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Reporter, TestModule } from 'vitest/node'
-import { caseId, reportScope, UNIT_LABELS, writeReport, type SafeCase, type SafeReport } from '../scripts/check-test-reports'
+import { caseId, reportScope, safeSource, UNIT_LABELS, writeReport, type SafeCase, type SafeReport } from '../scripts/check-test-reports'
 
 export default class SafeVitestReporter implements Reporter {
   private report: SafeReport = {
@@ -33,10 +33,13 @@ export default class SafeVitestReporter implements Reporter {
           : result.state === 'failed' ? 'failed'
             : test.options.mode === 'todo' ? 'todo' : 'skipped'
         cases.push({
+          // Vitest IDs include collection order, unlike fullName which can be
+          // identical for multiple it.each rows. Hash before persisting metadata.
           id: caseId(`${file}:${test.id}`),
           labels: group && UNIT_LABELS.some((label) => label === group) ? [group] : [],
           status,
           attempts: 1 + (test.diagnostic()?.retryCount ?? 0),
+          ...(test.location ? safeSource(file, test.location.line, test.name) : {}),
         })
       }
     }

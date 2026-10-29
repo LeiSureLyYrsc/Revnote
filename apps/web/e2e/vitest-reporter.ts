@@ -33,7 +33,7 @@ export default class SafeVitestReporter implements Reporter {
           : result.state === 'failed' ? 'failed'
             : test.options.mode === 'todo' ? 'todo' : 'skipped'
         cases.push({
-          id: caseId(`${file}:${test.fullName}`),
+          id: caseId(`${file}:${test.id}`),
           labels: group && UNIT_LABELS.some((label) => label === group) ? [group] : [],
           status,
           attempts: 1 + (test.diagnostic()?.retryCount ?? 0),

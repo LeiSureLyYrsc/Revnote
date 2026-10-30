@@ -12,23 +12,25 @@
 #
 # Workspace members:
 #   apps/api -> distribution `revnote-api`, import package `revnote_api`
+#   apps/cli -> distribution `revnote-cli`, import package `revnote_cli`, entry `revnote`
 
 [project]
 name = "revnote-workspace"
 version = "0.1.0"
 description = "Revnote monorepo root (virtual uv workspace project; never published)"
 requires-python = ">=3.12"
-dependencies = ["revnote-api"]
+dependencies = ["revnote-api", "revnote-cli"]
 
 [tool.uv]
 # Virtual project: workspace glue only, nothing to build or install.
 package = false
 
 [tool.uv.workspace]
-members = ["apps/api"]
+members = ["apps/api", "apps/cli"]
 
 [tool.uv.sources]
 revnote-api = { workspace = true }
+revnote-cli = { workspace = true }
 
 [[tool.uv.index]]
 name = "pypi"
@@ -47,7 +49,7 @@ dev = [
 # pytest — `uv run pytest` from the repo root
 # --------------------------------------------------------------------------- #
 [tool.pytest.ini_options]
-testpaths = ["apps/api/tests"]
+testpaths = ["apps/api/tests", "apps/cli/tests"]
 addopts = "-ra --strict-markers --strict-config"
 markers = [
     "integration: needs a real PostgreSQL server (set TEST_DATABASE_URL, else skipped)",
@@ -58,6 +60,7 @@ markers = [
     "transport: real socket / uvicorn transport behaviour (disconnects, cancellation)",
     "attachments: Phase 5 attachment HTTP group (needs real PostgreSQL + real object storage)",
     "joplin: Phase 6 Joplin compatibility bridge (real PostgreSQL; resources also need real object storage)",
+    "cli: Phase 8 reference CLI against a real PostgreSQL-backed API",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -66,7 +69,7 @@ markers = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["apps/api/src", "apps/api/tests", "apps/api/migrations"]
+src = ["apps/api/src", "apps/api/tests", "apps/api/migrations", "apps/cli/src", "apps/cli/tests"]
 
 [tool.ruff.lint]
 select = [
@@ -83,4 +86,4 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["revnote_api"]
+known-first-party = ["revnote_api", "revnote_cli"]

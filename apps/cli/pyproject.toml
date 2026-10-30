@@ -1,0 +1,20 @@
+[project]
+name = "revnote-cli"
+version = "0.1.0"
+description = "Revnote reference command-line client (native /api/v1 consumer)"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.28"]
+
+[project.scripts]
+# `uv run --package revnote-cli revnote --help`
+revnote = "revnote_cli.__main__:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/revnote_cli"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/revnote_cli", "tests", "README.md"]

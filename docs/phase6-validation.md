@@ -103,8 +103,16 @@ Both rounds: `conclusion=success`, five jobs `success`, no skipped acceptance
 case. The `api-attachments` job therefore produced both the 24-case Phase 5
 report and the 17-case Joplin report on a real RustFS.
 
-This evidence commit changes the tip; per the build rule the tip was then run
-twice more on its own SHA. Those two runs (same run id, attempts 1 and 2) are
-recorded with their links in
-`.slim/deepwork/phase6-build/progress.md` (local, git-ignored), because a file
-cannot contain the SHA of the commit that adds it.
+This evidence commit changes the tip. The tip (`aa0aa10`) was run three times on
+its own SHA:
+
+| Attempt | Result | Note |
+| --- | --- | --- |
+| 1 | failure (`web` job) | `pnpm test:web` printed `vitest/full: cases=213; errors=0` and still exited 1 — a runner flake on a docs-only change, with no failing case reported. No code change was made in response. |
+| 2 | **success** (five jobs) | full rerun |
+| 3 | **success** (five jobs) | full rerun; consecutive with attempt 2 |
+
+The run id and links for attempts 2–3, plus the two runs of the final
+documentation tip, are recorded in `.slim/deepwork/phase6-build/progress.md`
+(local, git-ignored), because a file cannot contain the SHA of the commit that
+adds it.

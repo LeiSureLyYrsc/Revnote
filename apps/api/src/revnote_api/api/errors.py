@@ -100,6 +100,9 @@ ERROR_SPECS: Final[dict[str, ErrorSpec]] = {
         # -- request / validation -------------------------------------------- #
         ErrorSpec(400, "invalid_request", "The request does not match the API contract."),
         ErrorSpec(400, "cursor_ahead", "The cursor is ahead of this workspace."),
+        # Phase 7: a paged snapshot cursor that is malformed, unsigned, from
+        # another workspace or otherwise not a token this deployment minted.
+        ErrorSpec(400, "invalid_cursor", "The cursor is not valid for this workspace."),
         ErrorSpec(413, "payload_too_large", "The request body exceeds the allowed size."),
         # -- authentication --------------------------------------------------- #
         ErrorSpec(401, "unauthenticated", "Authentication is required."),
@@ -119,6 +122,14 @@ ERROR_SPECS: Final[dict[str, ErrorSpec]] = {
         ErrorSpec(409, "folder_cycle", "The move would make a folder its own ancestor."),
         ErrorSpec(409, "object_too_large", "The object exceeds the allowed size."),
         ErrorSpec(409, "snapshot_too_large", "The workspace is too large for a full snapshot."),
+        # Phase 7: the *paged* bootstrap cap, distinct from the legacy full-read
+        # refusal so a client can tell "ask for pages" from "this workspace is
+        # beyond this deployment's bootstrap limit".
+        ErrorSpec(
+            409,
+            "snapshot_total_too_large",
+            "The workspace exceeds the snapshot bootstrap limit.",
+        ),
         ErrorSpec(409, "counter_overflow", "A workspace counter reached its limit."),
         # -- attachments (Phase 5, additive) ---------------------------------- #
         # A second upload to an id that is already ``ready``. The object is
@@ -134,6 +145,14 @@ ERROR_SPECS: Final[dict[str, ErrorSpec]] = {
         # tell "your body was too big for this path" from "your attachment is
         # over the attachment limit".
         ErrorSpec(413, "attachment_too_large", "The attachment exceeds the allowed size."),
+        # Phase 7: one snapshot object plus its JSON envelope cannot fit one page.
+        # A client cannot shrink an object; this is a deployment/object-size fact,
+        # not a request to retry.
+        ErrorSpec(
+            413,
+            "snapshot_page_too_large",
+            "One object exceeds the snapshot page budget.",
+        ),
         # Never for ``image/svg+xml``: the allowlist is a security boundary (D9).
         ErrorSpec(400, "attachment_unsupported_type", "This file type is not accepted."),
         # -- cursors ---------------------------------------------------------- #

@@ -153,6 +153,16 @@ def test_get_settings_is_cached_singleton(monkeypatch: pytest.MonkeyPatch) -> No
         get_settings.cache_clear()
 
 
+def test_snapshot_pagination_defaults_are_bounded() -> None:
+    """Phase 7 page/total limits are explicit, positive and ordered sensibly."""
+    settings = Settings(_env_file=None)
+
+    assert settings.sync_snapshot_page_max_objects == 1_000
+    assert settings.sync_snapshot_page_max_bytes == 4_194_304
+    assert settings.sync_snapshot_max_total_objects == 100_000
+    assert settings.sync_snapshot_max_total_objects >= settings.sync_snapshot_page_max_objects
+
+
 def test_masked_url_hides_password(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:sup3rs3cret@db:5432/revnote")
     settings = Settings(_env_file=None)

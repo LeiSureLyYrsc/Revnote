@@ -25,8 +25,14 @@ compared against the budget is that byte length.
   even the first event can be shipped, the page is refused with
   ``413 payload_too_large`` - an empty page marked ``has_more`` would trap the
   client in a loop.
-* **Snapshot** is all-or-nothing (D15): oversize is ``409 snapshot_too_large`` and
-  never a partial list.
+* **Snapshot** without pagination parameters is the Phase 3 all-or-nothing read
+  (D3/D15): oversize is ``409 snapshot_too_large`` and never a partial list. An
+  explicit ``limit`` (plus an optional ``cursor``) selects the additive paged
+  bootstrap: each page is cut to a contiguous prefix, ``has_more``/``next_cursor``
+  describe exactly what remains, and the pinned ``as_of_seq`` is repeated on every
+  page. Page over-budget is ``413 snapshot_page_too_large``; the whole-bootstrap
+  cap is ``409 snapshot_total_too_large``; a bad/foreign cursor is ``400
+  invalid_cursor``.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ from revnote_api.api.schemas.sync_pull import (
     NoteObject,
     PullEvent,
     PullResponse,
+    SnapshotPageResponse,
     SnapshotResponse,
     dump_body,
     dump_size,
@@ -55,8 +62,10 @@ from revnote_api.services.sync_read import (
     ReadEvent,
     ReadFolder,
     ReadObject,
+    SnapshotPage,
     SyncReadError,
     SyncReadService,
+    derive_snapshot_cursor_key,
 )
 
 __all__ = ["ReadServiceDep", "get_read_service", "router"]
@@ -70,11 +79,10 @@ _SINCE_DESCRIPTION: Final[str] = (
     "(default '0', max 9223372036854775807)."
 )
 
-#: Query parameters that would imply a cursor or pagination. A snapshot has neither
-#: (D15), and silently ignoring one would answer "page 2" or "since X" with page 1.
-_PAGINATION_PARAMETERS: Final[frozenset[str]] = frozenset(
-    {"cursor", "limit", "offset", "page", "since"}
-)
+#: Query parameters that would silently change the meaning of a snapshot. ``limit``
+#: and ``cursor`` are now the additive paged mode; the rest remain contract errors
+#: rather than being ignored (a client asking for ``page=2`` must not receive page 1).
+_UNSUPPORTED_SNAPSHOT_PARAMETERS: Final[frozenset[str]] = frozenset({"offset", "page", "since"})
 
 #: Widest canonical decimal that can fit a PostgreSQL ``BIGINT``
 #: (``9223372036854775807`` = 19 digits). Anything longer is out of range *and* must
@@ -111,7 +119,10 @@ def get_read_service(request: Request) -> SyncReadService:
     nothing and no module global can pin the first app's engine.
     """
     settings: Settings = request.app.state.settings
-    return SyncReadService(get_sessionmaker(settings))
+    return SyncReadService(
+        get_sessionmaker(settings),
+        cursor_key=derive_snapshot_cursor_key(settings.database_url),
+    )
 
 
 #: The annotated, injectable form of :func:`get_read_service`.
@@ -281,13 +292,66 @@ async def pull(
     )
 
 
+def _fit_snapshot_page(
+    page: SnapshotPage,
+    service: SyncReadService,
+    workspace_id: uuid.UUID,
+    max_bytes: int,
+) -> SnapshotPageResponse:
+    """Render a paged snapshot, shortening its contiguous object prefix if needed.
+
+    The service already cut by an estimated content budget; escaping can still
+    inflate the exact wire bytes, so this measures the serialized page and finds
+    the longest prefix that fits. Every dropped object means ``has_more`` and a
+    cursor at the last shipped object - never a silent gap. If one object cannot
+    fit, the page is refused with ``snapshot_page_too_large`` rather than shipped
+    empty with ``has_more``.
+    """
+
+    def render(count: int) -> SnapshotPageResponse:
+        objects = page.objects[:count]
+        last = objects[-1] if objects else None
+        has_more = page.has_more or count < len(page.objects)
+        next_cursor = (
+            service.encode_snapshot_cursor(workspace_id, page.as_of_seq, last.key)
+            if has_more and last is not None
+            else None
+        )
+        return SnapshotPageResponse(
+            as_of_seq=render_decimal(page.as_of_seq),
+            min_retained_seq=render_decimal(page.min_retained_seq),
+            objects=[_object_model(obj) for obj in objects],
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    full = render(len(page.objects))
+    if dump_size(full) <= max_bytes or not page.objects:
+        return full
+
+    low, high = 0, len(page.objects) - 1  # ``high`` is known not to fit
+    while low < high:
+        middle = (low + high + 1) // 2
+        if dump_size(render(middle)) <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+
+    if low == 0:
+        raise ApiError("snapshot_page_too_large")
+    return render(low)
+
+
 @router.get(
     "/workspaces/{workspace_id}/sync/snapshot",
-    response_model=SnapshotResponse,
-    summary="Complete bootstrap from one REPEATABLE READ snapshot",
+    response_model=SnapshotResponse | SnapshotPageResponse,
+    summary="Bootstrap snapshot: legacy full read or additive paged read",
     responses={
-        200: {"description": "Every active object at as_of_seq; continue with pull."},
-        409: {"description": "The workspace is too large for a full snapshot."},
+        200: {"description": "Active objects at as_of_seq; continue with pull."},
+        400: {"description": "Unsupported query parameter, or an invalid/foreign cursor."},
+        409: {"description": "Too large for a full snapshot, or over the paged bootstrap cap."},
+        410: {"description": "The cursor's watermark is older than retained history."},
+        413: {"description": "One object cannot fit a paged response."},
     },
 )
 async def snapshot(
@@ -295,18 +359,28 @@ async def snapshot(
     request: Request,
     context: Annotated[AuthContext, Depends(require_workspace_member)],
     service: ReadServiceDep,
+    limit: Annotated[
+        int | None,
+        Query(ge=1, description="Page size; supplying it selects the paged bootstrap."),
+    ] = None,
+    cursor: Annotated[
+        str | None,
+        # Length/alphabet are checked by the cursor decoder so every malformed
+        # value is the documented 400 ``invalid_cursor``, not a 422 from the
+        # query parser. The decoder still bounds the work it will do.
+        Query(description="Opaque continuation cursor from a previous page."),
+    ] = None,
 ) -> Response:
-    """All active objects and both watermarks from one read-only RR transaction.
+    """Legacy full snapshot, or one page of a stable bootstrap at ``as_of_seq``.
 
-    ``cursor``/``limit`` are deliberately **not** declared: pagination of a
-    snapshot is not part of v1 (D15), and an unknown query parameter would
-    otherwise be ignored - a client that asked for page 2 must be told the
-    contract has no pages rather than silently receive page 1 again.
+    No ``limit``/``cursor`` means exactly the Phase 3 contract. Supplying either
+    selects paging; ``offset``/``page``/``since`` remain contract errors rather
+    than being silently ignored.
     """
     del context
 
     settings: Settings = request.app.state.settings
-    supplied = {name for name in request.query_params if name in _PAGINATION_PARAMETERS}
+    supplied = {name for name in request.query_params if name in _UNSUPPORTED_SNAPSHOT_PARAMETERS}
     if supplied:
         raise ApiError(
             "invalid_request",
@@ -318,30 +392,61 @@ async def snapshot(
             },
         )
 
+    if limit is None and cursor is None:
+        try:
+            view = await service.snapshot(
+                workspace_id,
+                max_objects=settings.sync_snapshot_max_objects,
+                max_bytes=settings.sync_snapshot_max_bytes,
+            )
+        except SyncReadError as error:
+            raise _translate(error) from None
+
+        payload = SnapshotResponse(
+            as_of_seq=render_decimal(view.as_of_seq),
+            min_retained_seq=render_decimal(view.min_retained_seq),
+            objects=[_object_model(obj) for obj in view.objects],
+        )
+        # Serialized once, and that one buffer is both measured and sent: the SQL
+        # guard counted *content* bytes, escaping can still inflate them, and the
+        # budget is about bytes on the wire. Same answer either way - the whole
+        # snapshot is refused, never truncated (D15).
+        body = dump_body(payload)
+        if len(body) > settings.sync_snapshot_max_bytes:
+            raise ApiError("snapshot_too_large")
+
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers=_PRIVATE_READ,
+        )
+
+    page_limit = settings.sync_snapshot_page_max_objects if limit is None else limit
+    if page_limit > settings.sync_snapshot_page_max_objects:
+        raise ApiError(
+            "invalid_request",
+            details={"fields": [{"path": ["query", "limit"], "reason": "too_large"}]},
+        )
+
     try:
-        view = await service.snapshot(
+        page = await service.snapshot_page(
             workspace_id,
-            max_objects=settings.sync_snapshot_max_objects,
-            max_bytes=settings.sync_snapshot_max_bytes,
+            limit=page_limit,
+            max_bytes=settings.sync_snapshot_page_max_bytes,
+            max_total_objects=settings.sync_snapshot_max_total_objects,
+            cursor=cursor,
         )
     except SyncReadError as error:
         raise _translate(error) from None
 
-    payload = SnapshotResponse(
-        as_of_seq=render_decimal(view.as_of_seq),
-        min_retained_seq=render_decimal(view.min_retained_seq),
-        objects=[_object_model(obj) for obj in view.objects],
+    payload = _fit_snapshot_page(
+        page,
+        service,
+        workspace_id,
+        settings.sync_snapshot_page_max_bytes,
     )
-    # Serialized once, and that one buffer is both measured and sent: the SQL guard
-    # counted *content* bytes, escaping can still inflate them, and the budget is
-    # about bytes on the wire. Same answer either way - the whole snapshot is
-    # refused, never truncated (D15).
-    body = dump_body(payload)
-    if len(body) > settings.sync_snapshot_max_bytes:
-        raise ApiError("snapshot_too_large")
-
     return Response(
-        content=body,
+        content=dump_body(payload),
         media_type="application/json",
         headers=_PRIVATE_READ,
     )

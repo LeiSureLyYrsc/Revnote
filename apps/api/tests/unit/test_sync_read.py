@@ -61,10 +61,14 @@ from revnote_api.services.sync_read import (
     ReadEvent,
     ReadFolder,
     ReadNote,
+    SnapshotPage,
     SnapshotView,
     SyncReadError,
     SyncReadService,
     TreeView,
+    decode_snapshot_cursor,
+    derive_snapshot_cursor_key,
+    encode_snapshot_cursor,
 )
 
 pytestmark = pytest.mark.anyio
@@ -105,6 +109,7 @@ class FakeSession:
         error_fragment: str | None = None,
     ) -> None:
         self.statements: list[str] = []
+        self.parameters: list[Any] = []
         self._answers = list(answers)
         self._error = error
         self._error_fragment = error_fragment
@@ -113,9 +118,9 @@ class FakeSession:
         self.closed = False
 
     async def execute(self, statement: Any, params: Any = None) -> FakeResult:
-        del params
         sql = str(statement)
         self.statements.append(sql)
+        self.parameters.append(params)
         if self._error is not None and (
             self._error_fragment is None or self._error_fragment in sql
         ):
@@ -152,6 +157,13 @@ def factory_for(*sessions: FakeSession) -> Any:
 
 def service_for(*sessions: FakeSession) -> SyncReadService:
     return SyncReadService(factory_for(*sessions))
+
+
+PAGED_CURSOR_KEY = derive_snapshot_cursor_key("postgresql+asyncpg://u:p@test/revnote")
+
+
+def paged_service_for(*sessions: FakeSession) -> SyncReadService:
+    return SyncReadService(factory_for(*sessions), cursor_key=PAGED_CURSOR_KEY)
 
 
 def jsonb(value: Any) -> str:
@@ -378,6 +390,16 @@ def test_every_statement_declares_only_its_intended_bind_parameters() -> None:
         "snapshot_count": {"workspace_id"},
         "snapshot_bytes": {"workspace_id"},
         "snapshot": {"workspace_id"},
+        "snapshot_anchor": {"workspace_id"},
+        "snapshot_page": {
+            "workspace_id",
+            "as_of_seq",
+            "after_kind",
+            "after_id",
+            "fetch_limit",
+            "max_bytes",
+            "object_overhead",
+        },
         "tree": {"workspace_id"},
         "note": {"workspace_id", "note_id"},
     }
@@ -386,6 +408,8 @@ def test_every_statement_declares_only_its_intended_bind_parameters() -> None:
         "snapshot_count": module.snapshot_count_statement(),
         "snapshot_bytes": module.snapshot_bytes_statement(),
         "snapshot": module.snapshot_statement(),
+        "snapshot_anchor": module.snapshot_anchor_statement(),
+        "snapshot_page": module.snapshot_page_statement(),
         "tree": module.tree_statement(),
         "note": module.note_statement(),
     }
@@ -407,6 +431,8 @@ def test_no_statement_interpolates_a_caller_value() -> None:
         module.snapshot_count_statement(),
         module.snapshot_bytes_statement(),
         module.snapshot_statement(),
+        module.snapshot_anchor_statement(),
+        module.snapshot_page_statement(),
         module.tree_statement(),
         module.note_statement(),
     ):
@@ -1167,6 +1193,260 @@ async def test_snapshot_rejects_a_nonsensical_limit_before_connecting() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# snapshot pagination (Phase 7)
+# --------------------------------------------------------------------------- #
+
+
+def snapshot_page_row(
+    *,
+    last_seq: int = 4,
+    floor: int = 1,
+    fetched: int = 2,
+    cutoff: int = 2,
+    folders: Sequence[Mapping[str, Any]] = (),
+    notes: Sequence[Mapping[str, Any]] = (),
+) -> tuple[Any, ...]:
+    return (last_seq, floor, fetched, cutoff, jsonb(list(folders)), jsonb(list(notes)))
+
+
+def test_snapshot_page_sql_is_watermark_filtered_and_stably_ordered() -> None:
+    sql = module.snapshot_page_statement()
+
+    # Membership is the current row *as of* the pinned watermark: a write after
+    # page 1 cannot enter a later page, and the following pull carries it.
+    assert sql.count("f.updated_seq <= CAST(:as_of_seq AS BIGINT)") == 1
+    assert sql.count("n.updated_seq <= CAST(:as_of_seq AS BIGINT)") == 1
+    assert sql.count("AND f.deleted_at IS NULL") == 1
+    assert sql.count("AND n.deleted_at IS NULL") == 1
+    # Stable total order: folders then notes, each by id.
+    assert "ORDER BY kind, entity_id" in sql
+    # The cursor is a strict "after this key" bound, not an offset.
+    assert "f.id > CAST(:after_id AS UUID)" in sql
+    assert "n.id > CAST(:after_id AS UUID)" in sql
+    assert "OFFSET" not in sql.upper()
+    # The byte cut is a contiguous prefix over the ordered page.
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" in sql
+    assert "cumulative_bytes <= CAST(:max_bytes AS BIGINT)" in sql
+    assert "AS fetched_objects" in sql and "AS cutoff_rn" in sql
+
+
+async def test_snapshot_page_first_page_pins_the_watermark_and_ships_one_page() -> None:
+    workspace_id = uuid.uuid4()
+    folder_id, note_id = uuid.uuid4(), uuid.uuid4()
+    session = FakeSession(
+        [
+            ("REPEATABLE READ", FakeResult()),
+            ("AS object_count", FakeResult(row=(4, 1, 2))),
+            (
+                "AS fetched_objects",
+                FakeResult(
+                    row=snapshot_page_row(
+                        folders=[folder_json(folder_id, workspace_id)],
+                        notes=[note_json(note_id, workspace_id)],
+                    )
+                ),
+            ),
+        ]
+    )
+
+    page = await paged_service_for(session).snapshot_page(
+        workspace_id,
+        limit=10,
+        max_bytes=1_048_576,
+        max_total_objects=100,
+    )
+
+    assert page.as_of_seq == 4
+    assert page.min_retained_seq == 1
+    assert {obj.id for obj in page.objects} == {folder_id, note_id}
+    assert page.has_more is False
+    assert page.last_key == ("note", note_id)
+    assert session.statements[0] == SET_SNAPSHOT_TRANSACTION
+    assert session.rollbacks == 1 and session.commits == 0
+    params = session.parameters[2]
+    assert params["as_of_seq"] == 4
+    assert params["after_kind"] is None and params["after_id"] is None
+    assert params["fetch_limit"] == 11, "limit + 1 is the has_more probe"
+
+
+async def test_snapshot_page_honours_the_total_cap_before_reading_objects() -> None:
+    session = FakeSession(
+        [
+            ("REPEATABLE READ", FakeResult()),
+            ("AS object_count", FakeResult(row=(4, 1, 101))),
+        ]
+    )
+
+    with pytest.raises(SyncReadError) as caught:
+        await paged_service_for(session).snapshot_page(
+            uuid.uuid4(), limit=10, max_bytes=1_024, max_total_objects=100
+        )
+
+    assert caught.value.code == "snapshot_total_too_large"
+    assert caught.value.details == {"max_total_objects": "100"}
+    assert len(session.statements) == 2, "no page statement may follow a refused bootstrap"
+    assert session.rollbacks == 1
+
+
+async def test_snapshot_page_cutoff_shrinks_and_marks_more() -> None:
+    workspace_id = uuid.uuid4()
+    ids = [uuid.uuid4() for _ in range(3)]
+    session = FakeSession(
+        [
+            ("REPEATABLE READ", FakeResult()),
+            ("AS object_count", FakeResult(row=(4, 1, 3))),
+            (
+                "AS fetched_objects",
+                FakeResult(
+                    row=snapshot_page_row(
+                        fetched=3,
+                        cutoff=2,
+                        notes=[note_json(entity_id, workspace_id) for entity_id in ids[:2]],
+                    )
+                ),
+            ),
+        ]
+    )
+
+    page = await paged_service_for(session).snapshot_page(
+        workspace_id, limit=10, max_bytes=1_024, max_total_objects=100
+    )
+
+    assert len(page.objects) == 2
+    assert page.has_more is True, "a cut prefix means the client must come back"
+    assert page.last_key == ("note", ids[1])
+
+
+async def test_snapshot_page_one_object_too_large_is_a_413_not_an_empty_page() -> None:
+    session = FakeSession(
+        [
+            ("REPEATABLE READ", FakeResult()),
+            ("AS object_count", FakeResult(row=(1, 1, 1))),
+            (
+                "AS fetched_objects",
+                FakeResult(row=snapshot_page_row(last_seq=1, fetched=1, cutoff=0)),
+            ),
+        ]
+    )
+
+    with pytest.raises(SyncReadError) as caught:
+        await paged_service_for(session).snapshot_page(
+            uuid.uuid4(), limit=10, max_bytes=1_024, max_total_objects=100
+        )
+
+    assert caught.value.code == "snapshot_page_too_large"
+
+
+async def test_snapshot_page_continuation_reuses_the_pinned_watermark_and_after_key() -> None:
+    workspace_id = uuid.uuid4()
+    after_id, next_id = uuid.uuid4(), uuid.uuid4()
+    cursor = encode_snapshot_cursor(PAGED_CURSOR_KEY, workspace_id, 4, ("note", after_id))
+    session = FakeSession(
+        [
+            ("REPEATABLE READ", FakeResult()),
+            (
+                "AS fetched_objects",
+                FakeResult(
+                    row=snapshot_page_row(
+                        last_seq=6,
+                        fetched=1,
+                        cutoff=1,
+                        notes=[note_json(next_id, workspace_id)],
+                    )
+                ),
+            ),
+            ("SELECT w.last_seq AS last_seq", FakeResult(row=(6, 1))),
+        ]
+    )
+
+    page = await paged_service_for(session).snapshot_page(
+        workspace_id,
+        limit=10,
+        max_bytes=1_048_576,
+        max_total_objects=100,
+        cursor=cursor,
+    )
+
+    assert page.as_of_seq == 4, "the pinned watermark is carried, not re-pinned"
+    assert [obj.id for obj in page.objects] == [next_id]
+    assert page.has_more is False
+    params = session.parameters[2]  # SET, anchor, then the data statement
+    assert params["as_of_seq"] == 4
+    assert params["after_kind"] == 1
+    assert params["after_id"] == after_id
+
+
+async def test_snapshot_page_cursor_paths_are_closed() -> None:
+    workspace_id = uuid.uuid4()
+    key = PAGED_CURSOR_KEY
+    token = encode_snapshot_cursor(key, workspace_id, 7, ("folder", uuid.uuid4()))
+
+    assert decode_snapshot_cursor(key, workspace_id, token)[0] == 7
+
+    # A different workspace, a changed signature and a changed payload all fail
+    # with the same fixed code and never echo the token.
+    wrong_workspace = encode_snapshot_cursor(key, uuid.uuid4(), 7, ("folder", uuid.uuid4()))
+    for bad in ("", "abc", token + "x", wrong_workspace, "A" * 2_049):
+        with pytest.raises(SyncReadError) as caught:
+            decode_snapshot_cursor(key, workspace_id, bad)
+        assert caught.value.code == "invalid_cursor"
+        assert "cursor" in caught.value.code
+
+
+async def test_snapshot_page_rejects_a_cursor_before_opening_a_session() -> None:
+    def factory() -> Any:  # pragma: no cover - must never be called
+        raise AssertionError("no session may be opened for an invalid cursor")
+
+    service = SyncReadService(factory, cursor_key=PAGED_CURSOR_KEY)
+    with pytest.raises(SyncReadError) as caught:
+        await service.snapshot_page(
+            uuid.uuid4(),
+            limit=10,
+            max_bytes=1_024,
+            max_total_objects=100,
+            cursor="not-a-cursor",
+        )
+    assert caught.value.code == "invalid_cursor"
+
+
+async def test_snapshot_paging_requires_a_cursor_key() -> None:
+    def factory() -> Any:  # pragma: no cover - must never be called
+        raise AssertionError("no session may be opened without a cursor key")
+
+    with pytest.raises(SyncReadError) as caught:
+        await SyncReadService(factory).snapshot_page(
+            uuid.uuid4(), limit=10, max_bytes=1_024, max_total_objects=100
+        )
+    assert caught.value.code == "internal"
+
+
+async def test_snapshot_page_validates_arguments_before_any_io() -> None:
+    def factory() -> Any:  # pragma: no cover - must never be called
+        raise AssertionError("no session may be opened for an invalid call")
+
+    service = SyncReadService(factory, cursor_key=PAGED_CURSOR_KEY)
+    for kwargs in (
+        {"limit": 0, "max_bytes": 1_024, "max_total_objects": 100},
+        {"limit": 10, "max_bytes": 0, "max_total_objects": 100},
+        {"limit": 10, "max_bytes": 1_024, "max_total_objects": 0},
+        {"limit": True, "max_bytes": 1_024, "max_total_objects": 100},
+    ):
+        with pytest.raises(SyncReadError) as caught:
+            await service.snapshot_page(uuid.uuid4(), **kwargs)  # type: ignore[arg-type]
+        assert caught.value.code == "invalid_request"
+
+
+def test_snapshot_cursor_key_is_stable_and_dsn_bound() -> None:
+    first = derive_snapshot_cursor_key("postgresql+asyncpg://u:p@db/revnote")
+    same = derive_snapshot_cursor_key("postgresql+asyncpg://u:p@db/revnote")
+    other = derive_snapshot_cursor_key("postgresql+asyncpg://u:p@db/other")
+
+    assert first == same
+    assert first != other
+    assert len(first) == 32
+
+
+# --------------------------------------------------------------------------- #
 # tree and note
 # --------------------------------------------------------------------------- #
 
@@ -1464,12 +1744,14 @@ class FakeService:
         *,
         page: PullPage | None = None,
         view: SnapshotView | None = None,
+        snapshot_page: SnapshotPage | None = None,
         tree: TreeView | None = None,
         note: ReadNote | None = None,
         error: SyncReadError | None = None,
     ) -> None:
         self.page = page
         self.view = view
+        self.snapshot_page_view = snapshot_page
         self.tree_view = tree
         self.note_view = note
         self.error = error
@@ -1488,6 +1770,21 @@ class FakeService:
             raise self.error
         assert self.view is not None
         return self.view
+
+    async def snapshot_page(self, workspace_id: uuid.UUID, **kwargs: Any) -> SnapshotPage:
+        self.calls.append(("snapshot_page", {"workspace_id": workspace_id, **kwargs}))
+        if self.error is not None:
+            raise self.error
+        assert self.snapshot_page_view is not None
+        return self.snapshot_page_view
+
+    def encode_snapshot_cursor(
+        self,
+        workspace_id: uuid.UUID,
+        as_of_seq: int,
+        last_key: tuple[str, uuid.UUID],
+    ) -> str:
+        return f"{workspace_id}_{as_of_seq}_{last_key[0]}_{last_key[1]}"
 
     async def tree(self, workspace_id: uuid.UUID) -> TreeView:
         self.calls.append(("tree", {"workspace_id": workspace_id}))
@@ -1658,17 +1955,136 @@ async def test_pull_route_shortens_a_page_that_exceeds_the_budget(
     assert response.status_code == 413, "one event cannot be shipped, so nothing is"
 
 
-async def test_snapshot_route_rejects_pagination(client_for: Any, workspace_id: uuid.UUID) -> None:
+async def test_snapshot_route_rejects_ambiguous_pagination_spellings(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
     service = FakeService(view=SnapshotView(as_of_seq=0, min_retained_seq=1, objects=()))
     client = await client_for(service)
 
-    response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?cursor=abc&limit=10")
+    for params in ("offset=0", "page=2", "since=1"):
+        response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?{params}")
+
+        assert response.status_code == 400, params
+        assert response.json()["error"]["code"] == "invalid_request"
+        fields = response.json()["error"]["details"]["fields"]
+        assert [field["path"][1] for field in fields] == [params.split("=", 1)[0]]
+    assert service.calls == []
+
+
+def a_snapshot_page(
+    *objects: ReadNote,
+    as_of: int = 11,
+    floor: int = 1,
+    has_more: bool = False,
+) -> SnapshotPage:
+    return SnapshotPage(
+        as_of_seq=as_of,
+        min_retained_seq=floor,
+        objects=tuple(objects),
+        has_more=has_more,
+        last_key=objects[-1].key if objects else None,
+    )
+
+
+async def test_snapshot_route_renders_a_page_with_a_cursor_while_more_remains(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
+    note_id = uuid.uuid4()
+    page = a_snapshot_page(a_note(note_id, workspace_id, "body"), has_more=True)
+    service = FakeService(snapshot_page=page)
+    client = await client_for(service)
+
+    response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["as_of_seq"] == "11"
+    assert body["min_retained_seq"] == "1"
+    assert body["has_more"] is True
+    assert body["next_cursor"] == f"{workspace_id}_11_note_{note_id}"
+    assert [obj["id"] for obj in body["objects"]] == [str(note_id)]
+    call = service.calls[0][1]
+    assert call["limit"] == 10
+    assert call["max_total_objects"] == 100_000
+    assert call["cursor"] is None
+
+
+async def test_snapshot_route_terminal_page_has_no_cursor(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
+    note_id = uuid.uuid4()
+    service = FakeService(snapshot_page=a_snapshot_page(a_note(note_id, workspace_id, "body")))
+    client = await client_for(service)
+
+    response = await client.get(
+        f"/workspaces/{workspace_id}/sync/snapshot?limit=10&cursor=opaque-token"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
+    assert service.calls[0][1]["cursor"] == "opaque-token"
+
+
+async def test_snapshot_route_shortens_a_page_to_the_serialized_budget(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
+    settings = Settings(_env_file=None, sync_snapshot_page_max_bytes=1_400)
+    ids = [uuid.uuid4() for _ in range(3)]
+    page = a_snapshot_page(
+        *(a_note(entity_id, workspace_id, "q" * 700) for entity_id in ids),
+        has_more=False,
+    )
+    service = FakeService(snapshot_page=page)
+    client = await client_for(service, settings=settings)
+
+    response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["objects"]) < 3
+    assert body["has_more"] is True
+    assert body["next_cursor"]
+
+
+async def test_snapshot_route_refuses_a_single_object_larger_than_a_page(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
+    settings = Settings(_env_file=None, sync_snapshot_page_max_bytes=1_024)
+    page = a_snapshot_page(a_note(uuid.uuid4(), workspace_id, "z" * 20_000))
+    client = await client_for(FakeService(snapshot_page=page), settings=settings)
+
+    response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?limit=10")
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "snapshot_page_too_large"
+
+
+async def test_snapshot_route_rejects_a_page_limit_above_the_maximum(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
+    settings = Settings(_env_file=None)
+    service = FakeService(snapshot_page=a_snapshot_page())
+    client = await client_for(service, settings=settings)
+
+    too_large_limit = settings.sync_snapshot_page_max_objects + 1
+    response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?limit={too_large_limit}")
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
     assert service.calls == []
-    fields = response.json()["error"]["details"]["fields"]
-    assert {field["path"][1] for field in fields} == {"cursor", "limit"}
+
+
+async def test_snapshot_route_maps_bad_cursor_to_400(
+    client_for: Any, workspace_id: uuid.UUID
+) -> None:
+    client = await client_for(FakeService(error=SyncReadError("invalid_cursor")))
+
+    response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?cursor=bad")
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_cursor"
 
 
 async def test_snapshot_route_renders_one_complete_view(
@@ -1864,20 +2280,6 @@ async def test_pull_route_rejects_a_zero_limit(client_for: Any, workspace_id: uu
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
-    assert service.calls == []
-
-
-async def test_snapshot_route_rejects_every_pagination_spelling(
-    client_for: Any, workspace_id: uuid.UUID
-) -> None:
-    service = FakeService(view=SnapshotView(as_of_seq=0, min_retained_seq=1, objects=()))
-    client = await client_for(service)
-
-    for name in ("cursor", "limit", "offset", "page", "since"):
-        response = await client.get(f"/workspaces/{workspace_id}/sync/snapshot?{name}=1")
-        assert response.status_code == 400, name
-        assert response.json()["error"]["code"] == "invalid_request"
-
     assert service.calls == []
 
 

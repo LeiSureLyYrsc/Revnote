@@ -37,6 +37,8 @@ __all__ = [
     "OpName",
     "PullEvent",
     "PullResponse",
+    "SnapshotCursor",
+    "SnapshotPageResponse",
     "SnapshotResponse",
     "dump_body",
     "dump_size",
@@ -44,6 +46,19 @@ __all__ = [
 
 EntityType = Literal["folder", "note"]
 OpName = Literal["create", "update", "delete", "move"]
+
+#: An opaque snapshot page boundary. Unlike a decimal cursor it is signed
+#: base64url text, so it has its own bounded character set - never a JSON number
+#: and never a value a client should parse.
+SnapshotCursor = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=2_048,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+        description="Opaque signed page boundary; treat as a black box.",
+    ),
+]
 
 
 class _WireModel(BaseModel):
@@ -129,16 +144,37 @@ class PullResponse(_WireModel):
 
 
 class SnapshotResponse(_WireModel):
-    """A complete bootstrap: every active object at one ``REPEATABLE READ`` view.
+    """A complete legacy bootstrap: every active object at one ``REPEATABLE READ`` view.
 
     There is no cursor and no page: the client pulls ``since=as_of_seq`` next.
     Oversize is refused as a whole (409 ``snapshot_too_large``), so a response
-    that exists is always complete for its ``as_of_seq``.
+    that exists is always complete for its ``as_of_seq``. Phase 7 keeps this shape
+    byte-compatible; a client that sends no ``limit``/``cursor`` never sees the
+    paged fields.
     """
 
     as_of_seq: DecimalString
     min_retained_seq: DecimalString
     objects: ObjectList
+
+
+class SnapshotPageResponse(_WireModel):
+    """One page of the additive Phase 7 bootstrap.
+
+    ``as_of_seq`` is pinned by the first page and repeats byte-identically on
+    every page. ``min_retained_seq`` is the *current* retention floor, so it may
+    advance during a bootstrap; a page whose pinned watermark falls behind it is
+    refused with ``410 cursor_expired``. ``next_cursor`` is an opaque, signed
+    token for the page boundary; it is ``null`` exactly when ``has_more`` is
+    false. An empty page is legal only as the terminal page, never with
+    ``has_more``.
+    """
+
+    as_of_seq: DecimalString
+    min_retained_seq: DecimalString
+    objects: ObjectList
+    next_cursor: SnapshotCursor | None = None
+    has_more: bool
 
 
 #: The separators ``JSONResponse`` uses: no whitespace at all.

@@ -213,6 +213,32 @@ class CapabilityJoplinBridge(_WireModel):
     ] = "/api"
 
 
+class CapabilitySnapshotPagination(_WireModel):
+    """The ``snapshot_pagination`` object of the capabilities response (Phase 7).
+
+    Additive to the Phase 5/6 shape. A client that ignores it keeps using the
+    legacy full snapshot; a new client uses ``page_max_objects`` as its page size
+    and can explain the whole-bootstrap cap before starting.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(description="Whether the paged snapshot bootstrap is available."),
+    ]
+    page_max_objects: Annotated[
+        int,
+        Field(ge=1, description="Largest accepted snapshot page, in objects."),
+    ]
+    page_max_bytes: Annotated[
+        int,
+        Field(ge=1, description="Largest accepted serialized snapshot page, in bytes."),
+    ]
+    max_total_objects: Annotated[
+        int,
+        Field(ge=1, description="Whole-bootstrap object cap across all pages."),
+    ]
+
+
 class CapabilitiesResponse(_WireModel):
     """``GET /capabilities`` - always ``200``, even when attachments are disabled.
 
@@ -225,3 +251,5 @@ class CapabilitiesResponse(_WireModel):
     #: Phase 6, additive. An old client ignores an unknown object; a new one can
     #: tell "bridge off" from "bridge missing" without a second request.
     joplin_bridge: CapabilityJoplinBridge
+    #: Phase 7, additive. Paged snapshot bootstrap limits.
+    snapshot_pagination: CapabilitySnapshotPagination

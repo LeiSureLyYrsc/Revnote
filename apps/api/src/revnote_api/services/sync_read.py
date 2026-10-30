@@ -84,9 +84,13 @@ because PostgreSQL messages quote row values, note bodies included.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import datetime
+import hashlib
+import hmac
 import json
+import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -102,6 +106,7 @@ __all__ = [
     "ENVELOPE_RESERVE_BYTES",
     "EVENT_OVERHEAD_BYTES",
     "SET_SNAPSHOT_TRANSACTION",
+    "SNAPSHOT_OBJECT_OVERHEAD_BYTES",
     "EntityType",
     "FolderMeta",
     "NoteMeta",
@@ -111,10 +116,14 @@ __all__ = [
     "ReadFolder",
     "ReadNote",
     "ReadObject",
+    "SnapshotPage",
     "SnapshotView",
     "SyncReadError",
     "SyncReadService",
     "TreeView",
+    "decode_snapshot_cursor",
+    "derive_snapshot_cursor_key",
+    "encode_snapshot_cursor",
 ]
 
 #: The two entity kinds the sync protocol knows (matches the schema's CHECK).
@@ -135,6 +144,23 @@ EVENT_OVERHEAD_BYTES: Final[int] = 200
 #: (``{"events":...,"objects":...,"next_cursor":...}``). Small and constant.
 ENVELOPE_RESERVE_BYTES: Final[int] = 512
 
+#: Approximate wire cost of one snapshot object besides its content: JSON keys,
+#: ids, timestamps and the ``deleted`` flag. An estimate only; the route measures
+#: the exact serialized page and may shorten it further.
+SNAPSHOT_OBJECT_OVERHEAD_BYTES: Final[int] = 256
+
+#: Domain separator for the cursor-signing key. Deriving the key from the DSN means
+#: a cursor is stable across workers of one deployment and stale after a DSN change
+#: (which is correct: the old page is no longer reachable), without introducing a
+#: new secret to configure or accidentally print.
+_SNAPSHOT_CURSOR_KEY_PREFIX: Final[bytes] = b"revnote.sync.snapshot.cursor.v1\x00"
+
+#: Cursor payload version and the only accepted token alphabet. The token is
+#: ``base64url(payload).base64url(hmac)``; no padding, no whitespace.
+_SNAPSHOT_CURSOR_VERSION: Final[int] = 1
+_SNAPSHOT_CURSOR_MAX_CHARS: Final[int] = 2_048
+_SNAPSHOT_CURSOR_PART_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]+$")
+
 #: The isolation + read-only pin of a snapshot, issued as the first statement of
 #: the transaction so PostgreSQL takes the snapshot under the right rules. A
 #: ``REPEATABLE READ`` snapshot is acquired on the first *query* and held to the
@@ -148,10 +174,13 @@ _SAFE_CODES: Final[frozenset[str]] = frozenset(
         "cursor_ahead",
         "cursor_expired",
         "internal",
+        "invalid_cursor",
         "invalid_request",
         "not_found",
         "payload_too_large",
+        "snapshot_page_too_large",
         "snapshot_too_large",
+        "snapshot_total_too_large",
     }
 )
 
@@ -212,10 +241,10 @@ class ReadFolder:
     created_at: datetime.datetime
     updated_at: datetime.datetime
 
-    entity_type: ClassVar[str] = "folder"
+    entity_type: ClassVar[EntityType] = "folder"
 
     @property
-    def key(self) -> tuple[str, uuid.UUID]:
+    def key(self) -> tuple[EntityType, uuid.UUID]:
         return (self.entity_type, self.id)
 
 
@@ -238,10 +267,10 @@ class ReadNote:
     created_at: datetime.datetime
     updated_at: datetime.datetime
 
-    entity_type: ClassVar[str] = "note"
+    entity_type: ClassVar[EntityType] = "note"
 
     @property
-    def key(self) -> tuple[str, uuid.UUID]:
+    def key(self) -> tuple[EntityType, uuid.UUID]:
         return (self.entity_type, self.id)
 
 
@@ -307,11 +336,135 @@ class SnapshotView:
 
 
 @dataclass(frozen=True, slots=True)
+class SnapshotPage:
+    """One page of a paged bootstrap at a pinned ``as_of_seq``.
+
+    ``last_key`` is the ordered key of the last object actually shipped. The route
+    uses it to mint ``next_cursor`` only when ``has_more`` is true, so a terminal
+    page never pretends to have a successor.
+    """
+
+    as_of_seq: int
+    min_retained_seq: int
+    objects: tuple[ReadObject, ...]
+    has_more: bool
+    last_key: tuple[EntityType, uuid.UUID] | None
+
+
+@dataclass(frozen=True, slots=True)
 class TreeView:
     """Active folders and notes, metadata only."""
 
     folders: tuple[FolderMeta, ...]
     notes: tuple[NoteMeta, ...]
+
+
+# --------------------------------------------------------------------------- #
+# snapshot cursor
+# --------------------------------------------------------------------------- #
+
+
+def derive_snapshot_cursor_key(database_url: str) -> bytes:
+    """Derive the HMAC key for snapshot cursors from the deployment DSN.
+
+    A cursor is not an authorization token: every request still authenticates and
+    every statement is scoped by ``workspace_id``. The signature exists so a
+    client cannot silently re-target a page boundary (which would skip or repeat
+    objects); it must be stable across processes, hence a deterministic
+    derivation rather than a per-process random key. The DSN never appears in the
+    key or in diagnostics, and rotating the DSN invalidates old cursors, which a
+    client handles as a normal resync.
+    """
+    return hashlib.sha256(_SNAPSHOT_CURSOR_KEY_PREFIX + database_url.encode("utf-8")).digest()
+
+
+def _b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def encode_snapshot_cursor(
+    key: bytes,
+    workspace_id: uuid.UUID,
+    as_of_seq: int,
+    last_key: tuple[EntityType, uuid.UUID],
+) -> str:
+    """Mint an opaque, signed cursor for the next page.
+
+    The payload is canonical JSON with only fixed keys, so the same page boundary
+    always produces the same token. ``as_of_seq`` is embedded because the server
+    keeps no per-client session state (D13): every later page re-reads *its* view
+    through the same watermark filter.
+    """
+    entity_type, entity_id = last_key
+    payload = json.dumps(
+        {
+            "v": _SNAPSHOT_CURSOR_VERSION,
+            "w": str(workspace_id),
+            "a": str(as_of_seq),
+            "t": entity_type,
+            "i": str(entity_id),
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    signature = hmac.new(key, payload, hashlib.sha256).digest()
+    return f"{_b64encode(payload)}.{_b64encode(signature)}"
+
+
+def decode_snapshot_cursor(
+    key: bytes,
+    workspace_id: uuid.UUID,
+    token: str,
+) -> tuple[int, tuple[EntityType, uuid.UUID]]:
+    """Verify and decode a cursor, or raise ``invalid_cursor``.
+
+    Every failure mode (bad length/alphabet, bad split, bad signature, wrong
+    workspace, wrong version, non-canonical number, unknown entity type) maps to
+    the same fixed code. The caller never sees the driver's or JSON parser's text.
+    """
+    if not isinstance(token, str) or not token or len(token) > _SNAPSHOT_CURSOR_MAX_CHARS:
+        raise SyncReadError("invalid_cursor")
+    parts = token.split(".")
+    if len(parts) != 2 or not all(_SNAPSHOT_CURSOR_PART_RE.fullmatch(part) for part in parts):
+        raise SyncReadError("invalid_cursor")
+    payload_b64, signature_b64 = parts
+    try:
+        payload = _b64decode(payload_b64)
+        signature = _b64decode(signature_b64)
+    except (ValueError, TypeError) as exc:
+        raise SyncReadError("invalid_cursor") from exc
+    expected = hmac.new(key, payload, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, expected):
+        raise SyncReadError("invalid_cursor")
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise SyncReadError("invalid_cursor") from exc
+    if not isinstance(decoded, dict) or set(decoded) != {"v", "w", "a", "t", "i"}:
+        raise SyncReadError("invalid_cursor")
+    if decoded.get("v") != _SNAPSHOT_CURSOR_VERSION or decoded.get("w") != str(workspace_id):
+        raise SyncReadError("invalid_cursor")
+    entity_type = decoded.get("t")
+    if entity_type not in ENTITY_TYPES:
+        raise SyncReadError("invalid_cursor")
+    as_of_raw = decoded.get("a")
+    if not isinstance(as_of_raw, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)", as_of_raw):
+        raise SyncReadError("invalid_cursor")
+    try:
+        as_of_seq = int(as_of_raw)
+        entity_id = uuid.UUID(str(decoded.get("i")))
+    except (TypeError, ValueError) as exc:
+        raise SyncReadError("invalid_cursor") from exc
+    if as_of_seq > MAX_BIGINT:
+        raise SyncReadError("invalid_cursor")
+    return as_of_seq, (entity_type, entity_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -621,6 +774,128 @@ FROM anchor AS a
 """.strip()
 
 
+def snapshot_anchor_statement() -> str:
+    """Watermarks for a continuation page, without counting the whole workspace.
+
+    The first page already proved the hard cap; every later page re-reads these
+    two values only so it can validate the cursor and ship the same watermarks.
+    """
+    return """
+SELECT w.last_seq AS last_seq,
+       w.min_retained_seq AS min_retained_seq
+FROM workspaces AS w
+WHERE w.id = :workspace_id
+""".strip()
+
+
+def snapshot_page_statement() -> str:
+    """One ordered page of the pinned snapshot, cut to a contiguous byte prefix.
+
+    Membership is read from the *current* rows but filtered by the pinned
+    watermark (``updated_seq <= as_of_seq``) and by ``deleted_at IS NULL``. An
+    object created or changed after the first page therefore does not enter a
+    later page: its event is delivered by the ``pull since=as_of_seq`` that
+    follows bootstrap. Objects already shipped in an earlier page are past the
+    cursor and cannot repeat. The stable key is ``(kind, id)`` with folders before
+    notes, so page boundaries are meaningful even while rows are being written.
+
+    The byte cut is a *contiguous prefix* of that order (``running``/``cutoff``),
+    exactly like pull: the route measures the serialized page and may shorten it
+    further, but it can never skip one object and keep a later one.
+    """
+    return f"""
+WITH anchor AS (
+    SELECT w.id AS workspace_id,
+           w.last_seq AS last_seq,
+           w.min_retained_seq AS min_retained_seq
+    FROM workspaces AS w
+    WHERE w.id = :workspace_id
+),
+eligible AS (
+    SELECT 0 AS kind,
+           f.id AS entity_id,
+           octet_length(f.name) AS object_bytes
+    FROM folders AS f
+    CROSS JOIN anchor AS a
+    WHERE f.workspace_id = a.workspace_id
+      AND f.deleted_at IS NULL
+      AND f.updated_seq <= CAST(:as_of_seq AS BIGINT)
+      AND (
+          CAST(:after_kind AS INTEGER) IS NULL
+          OR 0 > CAST(:after_kind AS INTEGER)
+          OR (0 = CAST(:after_kind AS INTEGER) AND f.id > CAST(:after_id AS UUID))
+      )
+    UNION ALL
+    SELECT 1 AS kind,
+           n.id AS entity_id,
+           octet_length(n.title) + octet_length(n.body_md) AS object_bytes
+    FROM notes AS n
+    CROSS JOIN anchor AS a
+    WHERE n.workspace_id = a.workspace_id
+      AND n.deleted_at IS NULL
+      AND n.updated_seq <= CAST(:as_of_seq AS BIGINT)
+      AND (
+          CAST(:after_kind AS INTEGER) IS NULL
+          OR 1 > CAST(:after_kind AS INTEGER)
+          OR (1 = CAST(:after_kind AS INTEGER) AND n.id > CAST(:after_id AS UUID))
+      )
+),
+limited AS (
+    SELECT kind, entity_id, object_bytes
+    FROM eligible
+    ORDER BY kind, entity_id
+    LIMIT CAST(:fetch_limit AS BIGINT)
+),
+page AS (
+    SELECT kind,
+           entity_id,
+           object_bytes,
+           row_number() OVER (ORDER BY kind, entity_id) AS rn
+    FROM limited
+),
+running AS (
+    SELECT p.rn AS rn,
+           sum(
+               p.object_bytes + CAST(:object_overhead AS BIGINT)
+           ) OVER (
+               ORDER BY p.rn
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           ) AS cumulative_bytes
+    FROM page AS p
+),
+cutoff AS (
+    SELECT coalesce(max(rn), 0) AS last_rn
+    FROM running
+    WHERE cumulative_bytes <= CAST(:max_bytes AS BIGINT)
+)
+SELECT a.last_seq AS last_seq,
+       a.min_retained_seq AS min_retained_seq,
+       (SELECT count(*) FROM page) AS fetched_objects,
+       (SELECT last_rn FROM cutoff) AS cutoff_rn,
+       coalesce(
+           (SELECT jsonb_agg({_folder_json("f")} ORDER BY f.id)
+              FROM page AS p
+              JOIN folders AS f
+                ON p.kind = 0
+               AND f.workspace_id = a.workspace_id
+               AND f.id = p.entity_id
+             WHERE p.rn <= (SELECT last_rn FROM cutoff)),
+           '[]'::jsonb
+       ) AS folder_objects,
+       coalesce(
+           (SELECT jsonb_agg({_note_json("n", tree=False)} ORDER BY n.id)
+              FROM page AS p
+              JOIN notes AS n
+                ON p.kind = 1
+               AND n.workspace_id = a.workspace_id
+               AND n.id = p.entity_id
+             WHERE p.rn <= (SELECT last_rn FROM cutoff)),
+           '[]'::jsonb
+       ) AS note_objects
+FROM anchor AS a
+""".strip()
+
+
 def tree_statement() -> str:
     """Active folders/notes metadata, no bodies (plan §12.2)."""
     return f"""
@@ -844,8 +1119,17 @@ class SyncReadService:
     session's implicit transaction is closed without a commit - nothing here writes.
     """
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        cursor_key: bytes | None = None,
+    ) -> None:
         self._factory = session_factory
+        # Only paged snapshot reads need this. Legacy callers/tests keep working
+        # without it; a paged call without a key is refused rather than signing
+        # with a predictable default.
+        self._cursor_key = cursor_key
 
     # -- pull --------------------------------------------------------------- #
 
@@ -991,6 +1275,160 @@ class SyncReadService:
         except SQLAlchemyError as exc:
             raise SyncReadError("internal") from exc
 
+    async def snapshot_page(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        limit: int,
+        max_bytes: int,
+        max_total_objects: int,
+        cursor: str | None = None,
+    ) -> SnapshotPage:
+        """Read one page of a bootstrap pinned at ``as_of_seq``.
+
+        The first page (``cursor is None``) takes a ``REPEATABLE READ, READ ONLY``
+        snapshot, proves the whole-workspace hard cap, and pins ``as_of_seq`` to
+        that view's ``last_seq``. A continuation page opens its own read-only RR
+        transaction, decodes the cursor, and serves only rows whose current state
+        took effect at or before the pinned watermark. The stable order is
+        ``(folder, note)`` then ``id``; the byte cut is a contiguous prefix, so a
+        page can be shortened but never skip an object.
+
+        What this does **not** claim: content is not time-travelled. A row updated
+        after the first page is omitted from later pages (its ``updated_seq`` is
+        now past the watermark) and is delivered by the following pull. The
+        response is still a complete bootstrap because ``pull since=as_of_seq``
+        carries every such change.
+        """
+        if (
+            not isinstance(workspace_id, uuid.UUID)
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 1
+            or isinstance(max_total_objects, bool)
+            or not isinstance(max_total_objects, int)
+            or max_total_objects < 1
+            or (cursor is not None and not isinstance(cursor, str))
+        ):
+            raise SyncReadError("invalid_request")
+        key = self._cursor_key
+        if key is None:
+            raise SyncReadError("internal")
+
+        # An explicit empty cursor is a malformed cursor, not "start over": the
+        # route only enters paged mode because a boundary was supplied.
+        decoded = decode_snapshot_cursor(key, workspace_id, cursor) if cursor is not None else None
+        after_key = decoded[1] if decoded is not None else None
+        as_of_hint = decoded[0] if decoded is not None else None
+
+        try:
+            async with self._factory() as session:
+                try:
+                    await SyncReadService._begin_snapshot(session)
+
+                    if as_of_hint is None:
+                        (
+                            last_seq,
+                            min_retained_seq,
+                            object_count,
+                        ) = await SyncReadService._snapshot_counts(session, workspace_id)
+                        if object_count > max_total_objects:
+                            raise SyncReadError(
+                                "snapshot_total_too_large",
+                                details={"max_total_objects": str(max_total_objects)},
+                            )
+                        as_of_seq = last_seq
+                    else:
+                        (
+                            last_seq,
+                            min_retained_seq,
+                        ) = await SyncReadService._snapshot_anchor(session, workspace_id)
+                        as_of_seq = as_of_hint
+
+                    # Cursor verdicts come before any content is decoded, and use
+                    # this page's own view of the watermarks. A cursor is usable
+                    # only while the pull that follows it can still start there.
+                    if as_of_seq > last_seq:
+                        raise SyncReadError("cursor_ahead", details={"last_seq": str(last_seq)})
+                    if as_of_seq < min_retained_seq - 1:
+                        raise SyncReadError(
+                            "cursor_expired",
+                            details={
+                                "min_retained_seq": str(min_retained_seq),
+                                "action": "resync",
+                            },
+                        )
+
+                    params: dict[str, Any] = {
+                        "workspace_id": workspace_id,
+                        "as_of_seq": as_of_seq,
+                        # SQL's stable order is numeric (folder=0, note=1); the
+                        # cursor payload keeps the readable entity name.
+                        "after_kind": (
+                            None if after_key is None else (0 if after_key[0] == "folder" else 1)
+                        ),
+                        "after_id": after_key[1] if after_key is not None else None,
+                        "fetch_limit": limit + 1,
+                        "max_bytes": self._sql_budget(max_bytes),
+                        "object_overhead": SNAPSHOT_OBJECT_OVERHEAD_BYTES,
+                    }
+                    row = await SyncReadService._read_snapshot_page_row(session, params)
+                finally:
+                    with contextlib.suppress(SQLAlchemyError):
+                        await session.rollback()
+        except SyncReadError:
+            raise
+        except SQLAlchemyError as exc:
+            raise SyncReadError("internal") from exc
+
+        if row is None:
+            raise SyncReadError("not_found")
+
+        # The row's own watermarks are the authoritative ones for this page: the
+        # cursor checks above used the same transaction, so they cannot disagree.
+        last_seq = _counter(row[0])
+        min_retained_seq = _counter(row[1])
+        fetched_objects = _counter(row[2])
+        cutoff_rn = _counter(row[3])
+
+        if fetched_objects and cutoff_rn == 0:
+            # Not even the first object fits one page. Refusing is honest; an
+            # empty page with ``has_more`` would trap the client forever.
+            raise SyncReadError("snapshot_page_too_large")
+
+        shipped = min(limit, cutoff_rn) if fetched_objects else 0
+        decoded = tuple(
+            _object_from_json(item) for item in (*_json_items(row[4]), *_json_items(row[5]))
+        )
+        if len(decoded) < shipped:  # pragma: no cover - the SQL keeps them in lockstep
+            raise SyncReadError("internal")
+        # ``cutoff`` may include the limit+1 probe row when the byte budget is not
+        # the binding constraint; the combined folder-then-note order means the
+        # first ``shipped`` objects are exactly the page.
+        objects = decoded[:shipped]
+
+        return SnapshotPage(
+            as_of_seq=as_of_hint if as_of_hint is not None else last_seq,
+            min_retained_seq=min_retained_seq,
+            objects=objects,
+            has_more=fetched_objects > shipped,
+            last_key=objects[-1].key if objects else None,
+        )
+
+    def encode_snapshot_cursor(
+        self,
+        workspace_id: uuid.UUID,
+        as_of_seq: int,
+        last_key: tuple[EntityType, uuid.UUID],
+    ) -> str:
+        """Mint the continuation cursor for the last object a page actually shipped."""
+        if self._cursor_key is None:
+            raise SyncReadError("internal")
+        return encode_snapshot_cursor(self._cursor_key, workspace_id, as_of_seq, last_key)
+
     # -- snapshot: one method per step (stable test seams) ------------------- #
 
     @staticmethod
@@ -1024,6 +1462,19 @@ class SyncReadService:
         return _counter(row[0]), _counter(row[1]), _counter(row[2])
 
     @staticmethod
+    async def _snapshot_anchor(session: AsyncSession, workspace_id: uuid.UUID) -> tuple[int, int]:
+        """Watermarks only, for a continuation page (no whole-workspace count)."""
+        row = (
+            await session.execute(
+                sa.text(snapshot_anchor_statement()),
+                {"workspace_id": workspace_id},
+            )
+        ).first()
+        if row is None:
+            raise SyncReadError("not_found")
+        return _counter(row[0]), _counter(row[1])
+
+    @staticmethod
     async def _snapshot_bytes(session: AsyncSession, workspace_id: uuid.UUID) -> int:
         """Step 3: logical content bytes of the active objects (``octet_length``)."""
         row = (
@@ -1052,6 +1503,11 @@ class SyncReadService:
         return tuple(
             _object_from_json(item) for item in (*_json_items(row[2]), *_json_items(row[3]))
         )
+
+    @staticmethod
+    async def _read_snapshot_page_row(session: AsyncSession, params: Mapping[str, Any]) -> Any:
+        """The only statement a paged snapshot executes for object rows."""
+        return (await session.execute(sa.text(snapshot_page_statement()), params)).first()
 
     # -- pull: one method per statement (stable test seams) ------------------ #
 

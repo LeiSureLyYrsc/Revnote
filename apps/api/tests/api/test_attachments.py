@@ -287,8 +287,14 @@ async def test_capabilities_reports_the_effective_policy(app: AttachmentsHarness
 
     assert response.status_code == 200, response.text
     body = response.json()
-    # Phase 6 adds one sibling object; the Phase 5 object itself is unchanged.
-    assert set(body) == {"attachments", "joplin_bridge"}
+    # Phases 6/7 add sibling objects; the Phase 5 object itself is unchanged.
+    assert set(body) == {"attachments", "joplin_bridge", "snapshot_pagination"}
+    assert body["snapshot_pagination"] == {
+        "enabled": True,
+        "page_max_objects": app.api.settings.sync_snapshot_page_max_objects,
+        "page_max_bytes": app.api.settings.sync_snapshot_page_max_bytes,
+        "max_total_objects": app.api.settings.sync_snapshot_max_total_objects,
+    }
     assert body["joplin_bridge"]["enabled"] is False
     assert body["joplin_bridge"]["protocol_baseline"] == "3.7"
     attachment_support = body["attachments"]

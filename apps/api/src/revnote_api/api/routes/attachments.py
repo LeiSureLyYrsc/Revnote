@@ -52,6 +52,7 @@ from revnote_api.api.schemas.attachments import (
     CapabilitiesResponse,
     CapabilityAttachment,
     CapabilityJoplinBridge,
+    CapabilitySnapshotPagination,
     CreateAttachmentRequest,
     CreateAttachmentResponse,
     UploadContentResponse,
@@ -180,6 +181,12 @@ async def capabilities(request: Request) -> Response:
         joplin_bridge=CapabilityJoplinBridge(
             enabled=bool(getattr(settings, "joplin_bridge_enabled", False)),
             protocol_baseline=str(getattr(settings, "joplin_protocol_baseline", "3.7")),
+        ),
+        snapshot_pagination=CapabilitySnapshotPagination(
+            enabled=True,
+            page_max_objects=settings.sync_snapshot_page_max_objects,
+            page_max_bytes=settings.sync_snapshot_page_max_bytes,
+            max_total_objects=settings.sync_snapshot_max_total_objects,
         ),
     )
     return Response(

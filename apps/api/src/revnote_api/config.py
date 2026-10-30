@@ -145,9 +145,17 @@ class Settings(BaseSettings):
     sync_pull_max_limit: int = Field(default=500, ge=1)
     #: Approximate pull response budget (D14: ~4 MiB).
     sync_pull_max_bytes: int = Field(default=4_194_304, ge=1_024)
-    #: Full-bootstrap limits: one ``REPEATABLE READ`` view, no pagination (D15).
+    #: Legacy full-bootstrap limits: one ``REPEATABLE READ`` view, no pagination
+    #: (D15). Phase 7 keeps this path byte-compatible; paged reads use the three
+    #: limits below instead.
     sync_snapshot_max_objects: int = Field(default=10_000, ge=1)
     sync_snapshot_max_bytes: int = Field(default=16_777_216, ge=1_024)
+    #: Paged bootstrap (Phase 7). One page may hold at most this many objects and
+    #: this many serialized bytes; the whole bootstrap is refused when the pinned
+    #: watermark holds more than ``sync_snapshot_max_total_objects`` objects.
+    sync_snapshot_page_max_objects: int = Field(default=1_000, ge=1)
+    sync_snapshot_page_max_bytes: int = Field(default=4_194_304, ge=1_024)
+    sync_snapshot_max_total_objects: int = Field(default=100_000, ge=1)
 
     # -- attachments (Phase 5) ---------------------------------------------- #
     #: Master switch (D12). Closed by default: a deployment with no object
@@ -245,6 +253,9 @@ class Settings(BaseSettings):
             )
         if self.sync_pull_default_limit > self.sync_pull_max_limit:
             raise ValueError("SYNC_PULL_DEFAULT_LIMIT must not exceed SYNC_PULL_MAX_LIMIT")
+        # Page limits are deliberately independent of the legacy full-snapshot
+        # limits: a deployment may lower the legacy cap (fault injection included)
+        # while keeping paged bootstrap usable.
         if self.joplin_delta_default_limit > self.joplin_delta_max_limit:
             raise ValueError("JOPLIN_DELTA_DEFAULT_LIMIT must not exceed JOPLIN_DELTA_MAX_LIMIT")
         if self.db_lock_timeout_ms > self.db_statement_timeout_ms:

@@ -301,12 +301,228 @@ async def test_snapshot_bootstraps_from_one_watermark() -> None:
         assert [_seq(event) for event in page["events"]] == [state.last_seq + 1]
         assert page["objects"][0]["body_md"] == "bye"
 
-        # Pagination parameters are not part of a snapshot: asking for page 2 is a
-        # contract error, not page 1 again.
-        for params in ({"limit": 10}, {"cursor": "1"}, {"offset": 0}):
+        # The legacy shape is unchanged: no paged fields leak into a no-parameter
+        # response. Ambiguous spellings remain contract errors; ``limit``/``cursor``
+        # are the additive paged mode covered below.
+        assert set(body) == {"as_of_seq", "min_retained_seq", "objects"}
+        for params in ({"offset": 0}, {"page": 2}, {"since": "1"}):
             rejected = await api.snapshot(params=params)
             assert rejected.status_code == 400, (params, rejected.text)
             assert rejected.json()["error"]["code"] == "invalid_request"
+
+
+# --------------------------------------------------------------------------- #
+# snapshot pagination (Phase 7)
+# --------------------------------------------------------------------------- #
+async def test_snapshot_pagination_bootstraps_a_workspace_larger_than_one_page() -> None:
+    """Pages stitch into exactly the watermark's active set, with no gaps/repeats."""
+    page_size = 3
+    async with open_api(
+        overrides={
+            "sync_snapshot_page_max_objects": page_size,
+            "sync_snapshot_page_max_bytes": 1_048_576,
+            "sync_snapshot_max_total_objects": 100,
+        }
+    ) as api:
+        folder_id = uuid.uuid4()
+        assert (await api.push([folder_create(folder_id, name="Docs")])).status_code == 200
+        note_ids = [uuid.uuid4() for _ in range(7)]
+        for index, note_id in enumerate(note_ids):
+            created = await api.push(
+                [
+                    note_create(
+                        note_id,
+                        title=f"n{index}",
+                        body_md=f"body {index}",
+                        folder_id=folder_id,
+                    )
+                ]
+            )
+            assert created.status_code == 200, created.text
+
+        state = await api.state()
+        as_of = state.last_seq
+
+        collected: list[str] = []
+        cursor: str | None = None
+        pages = 0
+        while True:
+            params: dict[str, Any] = {"limit": page_size}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await api.snapshot(params=params)
+            assert response.status_code == 200, response.text
+            body = response.json()
+
+            assert set(body) == {
+                "as_of_seq",
+                "min_retained_seq",
+                "objects",
+                "next_cursor",
+                "has_more",
+            }
+            assert body["as_of_seq"] == str(as_of), "the watermark is pinned once"
+            assert body["min_retained_seq"] == "1"
+            page_ids = [str(obj["id"]) for obj in body["objects"]]
+            assert page_ids, "a page with has_more must never be empty"
+            collected.extend(page_ids)
+            pages += 1
+
+            if not body["has_more"]:
+                assert body["next_cursor"] is None
+                break
+            assert body["next_cursor"]
+            cursor = body["next_cursor"]
+
+        assert pages >= 3, "eight objects at three per page cannot fit in fewer pages"
+        assert len(collected) == len(set(collected)), "no object may repeat across pages"
+        assert set(collected) == {str(folder_id), *(str(note_id) for note_id in note_ids)}
+
+        # The bootstrap is complete: continuing at the pinned watermark has no
+        # events and no objects left to discover.
+        tail = _pull_body(await api.pull(since=as_of))
+        assert tail["events"] == [] and tail["objects"] == []
+
+
+async def test_snapshot_pages_exclude_writes_after_the_first_page() -> None:
+    """A new object is invisible to the pinned bootstrap and visible to pull."""
+    async with open_api(
+        overrides={
+            "sync_snapshot_page_max_objects": 2,
+            "sync_snapshot_page_max_bytes": 1_048_576,
+            "sync_snapshot_max_total_objects": 100,
+        }
+    ) as api:
+        existing = [uuid.uuid4() for _ in range(5)]
+        for note_id in existing:
+            assert (await api.push([note_create(note_id)])).status_code == 200
+
+        as_of = (await api.state()).last_seq
+        first = _snapshot_page(await api.snapshot(params={"limit": 2}))
+        assert first["as_of_seq"] == str(as_of)
+        assert first["has_more"] is True
+        collected = [str(obj["id"]) for obj in first["objects"]]
+
+        late_id = uuid.uuid4()
+        assert (await api.push([note_create(late_id, title="late")])).status_code == 200
+
+        cursor = first["next_cursor"]
+        while cursor is not None:
+            body = _snapshot_page(await api.snapshot(params={"limit": 2, "cursor": cursor}))
+            assert body["as_of_seq"] == str(as_of)
+            page_ids = [str(obj["id"]) for obj in body["objects"]]
+            assert str(late_id) not in page_ids, "a write after the watermark is not in a page"
+            collected.extend(page_ids)
+            cursor = body["next_cursor"] if body["has_more"] else None
+
+        assert set(collected) == {str(note_id) for note_id in existing}
+
+        # The late note is not lost: the pull at the pinned watermark carries it.
+        tail = _pull_body(await api.pull(since=as_of))
+        assert [event["op"] for event in tail["events"]] == ["create"]
+        assert [str(obj["id"]) for obj in tail["objects"]] == [str(late_id)]
+
+
+async def test_snapshot_pagination_cursor_verdicts_and_page_limits() -> None:
+    async with open_api(
+        overrides={
+            "sync_snapshot_page_max_objects": 2,
+            "sync_snapshot_page_max_bytes": 1_048_576,
+            "sync_snapshot_max_total_objects": 100,
+        }
+    ) as api:
+        for _ in range(5):
+            assert (await api.push([note_create()])).status_code == 200
+
+        too_large = await api.snapshot(params={"limit": 3})
+        assert too_large.status_code == 400, too_large.text
+        assert too_large.json()["error"]["code"] == "invalid_request"
+
+        first = _snapshot_page(await api.snapshot(params={"limit": 2}))
+        assert first["has_more"] is True
+
+        for bad in ("", "not-a-cursor", "abc.def", first["next_cursor"] + "x", "x" * 2_049):
+            broken = await api.snapshot(params={"limit": 2, "cursor": bad})
+            assert broken.status_code == 400, (bad, broken.text)
+            assert broken.json()["error"]["code"] == "invalid_cursor"
+
+        # A valid page boundary from another workspace must not be accepted: the
+        # cursor is bound to its workspace, not merely to a shape.
+        other = await api.app.seed_second_account()
+        other_token = await api.login(other)
+        for _ in range(3):
+            assert (
+                await api.push(
+                    [note_create()],
+                    workspace_id=other.workspace_id,
+                    token=other_token,
+                )
+            ).status_code == 200
+        other_workspace_first = await api.snapshot(
+            params={"limit": 2}, workspace_id=other.workspace_id, token=other_token
+        )
+        assert other_workspace_first.status_code == 200, other_workspace_first.text
+        foreign_cursor = other_workspace_first.json()["next_cursor"]
+        assert foreign_cursor
+        foreign = await api.snapshot(params={"limit": 2, "cursor": foreign_cursor})
+        assert foreign.status_code == 400, foreign.text
+        assert foreign.json()["error"]["code"] == "invalid_cursor"
+
+        # Advance the retention floor past the pinned watermark: the client's
+        # follow-up pull could no longer start there, so the page is a 410 resync.
+        as_of = int(first["as_of_seq"])
+        assert (await api.push([note_create()])).status_code == 200
+        connection = await api.db.conn()
+        await connection.execute(
+            "UPDATE workspaces SET min_retained_seq = $2 WHERE id = $1",
+            api.workspace_id,
+            as_of + 2,
+        )
+        try:
+            expired = await api.snapshot(params={"limit": 2, "cursor": first["next_cursor"]})
+            assert expired.status_code == 410, expired.text
+            error = expired.json()["error"]
+            assert error["code"] == "cursor_expired"
+            assert error["details"]["action"] == "resync"
+        finally:
+            await connection.execute(
+                "UPDATE workspaces SET min_retained_seq = 1 WHERE id = $1", api.workspace_id
+            )
+
+
+async def test_snapshot_pagination_refuses_the_total_cap_and_a_single_oversize_page() -> None:
+    async with open_api(
+        overrides={
+            "sync_snapshot_page_max_objects": 2,
+            "sync_snapshot_max_total_objects": 3,
+        }
+    ) as api:
+        for _ in range(4):
+            assert (await api.push([note_create()])).status_code == 200
+
+        refused = await api.snapshot(params={"limit": 2})
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["code"] == "snapshot_total_too_large"
+        assert '"objects"' not in refused.text
+
+    async with open_api(
+        overrides={
+            "sync_snapshot_page_max_objects": 10,
+            "sync_snapshot_page_max_bytes": 1_024,
+            "sync_snapshot_max_total_objects": 100,
+        }
+    ) as api:
+        assert (await api.push([note_create(title="big", body_md="x" * 5_000)])).status_code == 200
+
+        too_large = await api.snapshot(params={"limit": 10})
+        assert too_large.status_code == 413, too_large.text
+        assert too_large.json()["error"]["code"] == "snapshot_page_too_large"
+        assert '"objects"' not in too_large.text
+
+
+def _snapshot_page(response: Any) -> dict[str, Any]:
+    assert response.status_code == 200, response.text
+    return dict(response.json())
 
 
 # --------------------------------------------------------------------------- #

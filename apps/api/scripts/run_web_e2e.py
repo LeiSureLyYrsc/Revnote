@@ -706,6 +706,8 @@ STAGES = frozenset(
         "retry_clicked",
         "follower_enter",
         "follower_ready",
+        "takeover_enter",
+        "takeover_ready",
         "crash_enter",
         "crash_sent",
         "crash_confirmed",

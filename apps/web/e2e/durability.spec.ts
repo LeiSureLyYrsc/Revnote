@@ -1,8 +1,8 @@
 import type { WireOperation } from '../src/api/contracts'
 import {
   test, expect, account, control, crashPage, createNote, edit, ensureOwnedApi, enterLogin,
-  expectWorkspaceReady, expectWriterLockFree, followerReady, idle, localState, login, openNote,
-  retry, same, serverBody, signal, stats,
+  expectTakeoverComplete, expectWorkspaceReady, expectWriterLockFree, followerReady, idle, localState,
+  login, openNote, retry, same, serverBody, signal, stats,
 } from './fixtures'
 
 test('api_restart_recovery actual API process stops while Vite serves reload and durable draft', async ({ page, request }) => {
@@ -163,6 +163,10 @@ test('single_writer_takeover crashed writer retains uncertain command and follow
   // only writer transition, so a click here must succeed on a live page.
   await follower.getByRole('button', { name: '接管写入', exact: true }).click()
   await expect(follower.getByText('另一个标签页持有写入权限，此页只读。关闭原标签页后可接管。')).toHaveCount(0)
+  // The banner leaving only proves the lock was taken. The workspace is still
+  // rendered by the outgoing runtime until the new one is committed, so opening
+  // a note before that commit would click into a subtree the remount discards.
+  await expectTakeoverComplete(follower)
   await openNote(follower, 'takeover-note')
   await expect(follower.getByTestId('note-source')).not.toHaveAttribute('readonly', '')
   await retry(follower)

@@ -376,6 +376,46 @@ export async function followerReady(page: Page): Promise<void> {
 }
 
 /**
+ * Wait until the takeover has actually *completed*, not merely started.
+ *
+ * `接管写入` is not a single state change, and the two halves are separated by
+ * the network:
+ *   1. `activateRuntime` acquires the origin-wide writer lock, so
+ *      `coordinator.isWriter` flips and App stops rendering the read-only banner
+ *      at once. At this instant the *old* runtime is still installed, and its
+ *      session was just suspended by the click handler.
+ *   2. Only after `session.restore()` has re-read the profile and rotated the
+ *      access token does `setRuntime(next)` commit. `WorkspaceProvider` is keyed
+ *      by `partitionKey:ownershipGeneration`, so that commit remounts the whole
+ *      workspace subtree and `AppLayout` starts again with `noteId === null`.
+ *
+ * So "the banner is gone" proves step 1 and says nothing about step 2. The note
+ * buttons are rendered by *both* trees (they come from cached drafts), and a
+ * click dispatched into the outgoing tree lands on a handler whose selection the
+ * remount then discards: the note editor appears for a moment and is replaced by
+ * `选择一篇笔记`, so a subsequent `note-source` visibility check never passes.
+ * Waiting for the button to be *visible* therefore cannot fix this either; the
+ * wait has to be for evidence that only the committed tree can produce.
+ *
+ * Both signals below are that evidence, and both are product semantics rather
+ * than a delay. The outgoing tree is driven by the suspended session and the
+ * pre-takeover port, so it shows neither:
+ *   - `交出写入权限` renders only when `!session.readonly`, and the suspend that
+ *     starts the takeover makes the outgoing session read-only immediately;
+ *   - `新建笔记` enabled needs a port that reports itself writable *and* a
+ *     workspace state read through it with `bootstrapped` set (see
+ *     `expectWorkspaceReady`), which is exactly the list this case then clicks.
+ * A takeover that never takes the lock leaves the tab read-only and fails here
+ * with `stage=takeover_enter`: the honest outcome, not a slow pass.
+ */
+export async function expectTakeoverComplete(page: Page): Promise<void> {
+  stage('takeover_enter')
+  await expect(page.getByRole('button', { name: '交出写入权限', exact: true })).toBeVisible()
+  await expectWorkspaceReady(page)
+  stage('takeover_ready')
+}
+
+/**
  * Kill the writer renderer for real, and wait for evidence that it is gone
  * rather than for one particular notification.
  *

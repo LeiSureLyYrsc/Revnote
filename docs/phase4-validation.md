@@ -199,9 +199,11 @@ Owned API/Vite/browser groups stopped; external PostgreSQL remains caller-owned.
 
 拓扑为真实 Chromium → Vite 同源代理 → 真实 uvicorn → Alembic 迁移的真实临时 PostgreSQL（第三个一次性库，与 pytest 业务库、迁移库相互独立）。响应丢失用例先在真实服务端完成提交并确认 event/ledger 各 1 条，再丢弃响应。
 
-## 远端 CI 最终结果
+## 远端 CI 结果（阶段未完成，进行中）
 
-`origin/main = b92f70cb7ac742cbc837fb1558c2fdfff4c4cd65`，对应 run **40974724185**（`push` 事件，headSha 精确匹配）：
+### 平台差异修复已被真实 CI 验证
+
+`b92f70c` 对应 run **40974724185**（`push`，headSha 精确匹配）四个作业全部 success，并对同一 SHA 重跑一次（`attempt 2`）仍全部 success：
 
 | 作业 | 结果 |
 |---|---|
@@ -210,9 +212,29 @@ Owned API/Vite/browser groups stopped; external PostgreSQL remains caller-owned.
 | web-e2e（Chromium + native API + real PostgreSQL） | **success** |
 | image（build + push to GHCR） | **success** |
 
-为排除不稳定用例造成的假绿，对同一 SHA 重跑一次（`attempt 2`），同样四个作业全部 success。因此**连续两轮 CI 全绿**，且镜像发布被全部检查门禁阻挡后才允许。
+这证明下列平台缺陷的修复在真实 CI 上有效。
 
-## 本轮 CI 失败的真实原因与修复（全部为平台差异，逐条有证据）
+### 但随后仅改文档的提交再次失败 —— 该结论不足
+
+提交 `3509b7c` 只修改 `README.md` 与本文档，其 run **40975758621** 仍失败：api 与 web success、**web-e2e failure**、image skipped（镜像被门禁正确阻挡）。
+
+```text
+Health probes: api=200 web-proxy=200   Control: last_ok=stats last_failure=none
+Browser failure: e2e/durability.spec.ts:122 assertion=e2e/fixtures.ts:186
+                 labels=single_writer_takeover
+```
+
+失败点是 `openNote()` 内的 `expect(page.getByTestId('note-source')).toBeVisible()`（`fixtures.ts:186`），调用处在点击「接管写入」并确认只读提示消失之后。此前失败点为 `fixtures.ts:388`（崩溃事件等待），因此崩溃修复本身没有回退，这是**另一个**失败点。
+
+纯文档改动不可能改变测试行为，故这是**用例不稳定（flaky）**，而不是产品回归。据此：
+
+- 先前「连续两轮 CI 全绿即稳定」的判据**不充分**，已撤回；有已知 flaky 用例时，两轮通过可能只是运气。
+- 新的稳定性判据：重复全量运行 + 对可疑用例反复聚焦运行，证明竞态消失；再以最终 SHA 的 CI 稳定全绿确认。
+- 当前 `manual_conflict` 与 `single_writer_takeover` 均按 **open / flaky** 记录，未关闭。
+
+**因此 Phase 4 尚未交付完成，镜像未被发布。**
+
+## 本轮 CI 失败的真实原因与修复（逐条有证据）
 
 初次推送后 CI 连续失败三轮，每次都用 `gh run view --log-failed` 取真实原因后修复，而非猜测：
 
@@ -224,7 +246,7 @@ Owned API/Vite/browser groups stopped; external PostgreSQL remains caller-owned.
 | web-e2e（2 例） | `manual_conflict` 不稳定；`single_writer_takeover` 报 `assertion=unknown` | 先把断言位置与阶段标记纳入受限诊断，再据实定位 |
 | web-e2e（1 例） | 诊断给出 `assertion=e2e/fixtures.ts:388`：`crashPage()` 等待 Playwright `crash` 事件 20s 超时。源码依据：Playwright 由 CDP `Inspector.targetCrashed` 驱动该事件，事件丢失时 `evaluate` 不会快速报错而是挂住 | 注入仍用 CDP `Page.crash`，确认改为三路先到者胜（事件 / `Inspector.targetCrashed` / 连续两次有界无响应），必要时升级 `chrome://crash`。承重保证由跟随页独立观测 `revnote-writer-v1` 持有者为 0 断言，不依赖夹具自述 |
 
-`manual_conflict` 曾在一次运行中失败、后续运行通过且期间无代码变更，因此按 **flaky** 记录；最终稳定性以连续两轮 CI 全绿为准。
+`manual_conflict` 曾在一次运行中失败、后续运行通过且期间无代码变更，因此按 **flaky** 记录，未视为已修复。
 
 ### 提交列表（`77a20c2` 之后，共 11 个）
 

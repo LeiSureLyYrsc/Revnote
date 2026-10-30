@@ -117,6 +117,31 @@ export async function reauthenticate(page: Page, identity: Account): Promise<voi
 }
 
 /**
+ * Wait until the mounted workspace tree has settled for its own ownership
+ * generation.
+ *
+ * `AppLayout` renders `workspace-ready` only after the tree it belongs to has
+ * completed its first durable read, and the element dies with that tree. Every
+ * remount that follows a writer takeover, a reauthentication or an identity
+ * re-check (`WorkspaceScreen` keys the provider by
+ * `partitionKey:ownershipGeneration`) therefore starts without it, so waiting on
+ * it is a wait for *this* tree to be the settled one — not a delay that hopes a
+ * remount has happened.
+ *
+ * While a takeover is being committed, `App` replaces the workspace with an
+ * explicit restoring state, so the superseded tree cannot answer this wait at
+ * all: its note buttons and this marker are unmounted together.
+ *
+ * Web-first on purpose: no fixed sleep, bounded by the configured expect timeout.
+ */
+export async function expectWorkspaceSettled(page: Page): Promise<void> {
+  // `toBeVisible`, not merely attached: the marker sits on the very container
+  // that holds the note columns, so this one assertion proves the columns exist,
+  // belong to a settled tree, and are on screen.
+  await expect(page.getByTestId('workspace-ready')).toBeVisible()
+}
+
+/**
  * The workspace is usable for real editing. Separate from `enterLogin` on
  * purpose: `笔记列表` disables creation until the snapshot bootstrap finishes,
  * so callers that create or edit must wait for this instead of for login.
@@ -126,6 +151,9 @@ export async function reauthenticate(page: Page, identity: Account): Promise<voi
  * follower page of a takeover case.
  */
 export async function expectWorkspaceReady(page: Page): Promise<void> {
+  // Settled first: `新建笔记` belongs to a workspace tree, and a tree that has
+  // not finished its own read yet is about to be replaced by the one that will.
+  await expectWorkspaceSettled(page)
   await expect(page.getByRole('button', { name: '新建笔记', exact: true })).toBeEnabled()
 }
 
@@ -182,6 +210,13 @@ export async function edit(page: Page, body: string): Promise<void> {
 
 export async function openNote(page: Page, title: string): Promise<void> {
   stage('note_open')
+  // Opening is only legal once the mounted tree is settled for its own ownership
+  // generation. Without this the click could land in a tree that a takeover,
+  // reauthentication or identity re-check is about to replace, and the selection
+  // it sets would be discarded with it (the editor appears for an instant and is
+  // replaced by `选择一篇笔记`). Waiting on readiness is a wait for product state,
+  // not a sleep: the marker only exists while a settled tree is mounted.
+  await expectWorkspaceSettled(page)
   await page.getByRole('button', { name: `打开笔记 ${title}`, exact: true }).click()
   await expect(page.getByTestId('note-source')).toBeVisible()
 }
@@ -370,6 +405,7 @@ export async function blockSync(context: BrowserContext): Promise<() => Promise<
 /** Wait until the page reports itself as a read-only follower, not merely rendering. */
 export async function followerReady(page: Page): Promise<void> {
   stage('follower_enter')
+  await expectWorkspaceSettled(page)
   await expect(page.getByText('另一个标签页持有写入权限，此页只读。关闭原标签页后可接管。')).toBeVisible()
   await expect(page.getByRole('button', { name: '接管写入', exact: true })).toBeEnabled()
   stage('follower_ready')
@@ -389,24 +425,23 @@ export async function followerReady(page: Page): Promise<void> {
  *      by `partitionKey:ownershipGeneration`, so that commit remounts the whole
  *      workspace subtree and `AppLayout` starts again with `noteId === null`.
  *
- * So "the banner is gone" proves step 1 and says nothing about step 2. The note
- * buttons are rendered by *both* trees (they come from cached drafts), and a
- * click dispatched into the outgoing tree lands on a handler whose selection the
- * remount then discards: the note editor appears for a moment and is replaced by
- * `选择一篇笔记`, so a subsequent `note-source` visibility check never passes.
- * Waiting for the button to be *visible* therefore cannot fix this either; the
- * wait has to be for evidence that only the committed tree can produce.
+ * Between the two, `App` now renders an explicit restoring state
+ * (`workspace-restoring`) instead of the doomed tree, so the outgoing tree is not
+ * merely stale but unmounted: it cannot answer a wait at all.
  *
- * Both signals below are that evidence, and both are product semantics rather
- * than a delay. The outgoing tree is driven by the suspended session and the
- * pre-takeover port, so it shows neither:
+ * "The banner is gone" still proves only step 1, so the wait below is for
+ * evidence that only the committed tree can produce:
  *   - `交出写入权限` renders only when `!session.readonly`, and the suspend that
  *     starts the takeover makes the outgoing session read-only immediately;
+ *   - `workspace-ready` is published by the mounted tree only after *its own*
+ *     first durable read settled, and it is keyed to that tree's
+ *     `ownershipGeneration`, so a tree from before the commit never has it;
  *   - `新建笔记` enabled needs a port that reports itself writable *and* a
  *     workspace state read through it with `bootstrapped` set (see
  *     `expectWorkspaceReady`), which is exactly the list this case then clicks.
- * A takeover that never takes the lock leaves the tab read-only and fails here
- * with `stage=takeover_enter`: the honest outcome, not a slow pass.
+ * None of these is a delay. A takeover that never takes the lock leaves the tab
+ * read-only and fails here with `stage=takeover_enter`: the honest outcome, not a
+ * slow pass.
  */
 export async function expectTakeoverComplete(page: Page): Promise<void> {
   stage('takeover_enter')

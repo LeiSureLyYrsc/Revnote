@@ -163,9 +163,10 @@ test('single_writer_takeover crashed writer retains uncertain command and follow
   // only writer transition, so a click here must succeed on a live page.
   await follower.getByRole('button', { name: '接管写入', exact: true }).click()
   await expect(follower.getByText('另一个标签页持有写入权限，此页只读。关闭原标签页后可接管。')).toHaveCount(0)
-  // The banner leaving only proves the lock was taken. The workspace is still
-  // rendered by the outgoing runtime until the new one is committed, so opening
-  // a note before that commit would click into a subtree the remount discards.
+  // The banner leaving only proves the lock was taken; until the successor
+  // runtime is committed App renders an explicit restoring state instead of the
+  // superseded tree, so the workspace columns (and their note buttons) are simply
+  // not mounted in that window. Both waits below are readiness, not delays.
   await expectTakeoverComplete(follower)
   await openNote(follower, 'takeover-note')
   await expect(follower.getByTestId('note-source')).not.toHaveAttribute('readonly', '')

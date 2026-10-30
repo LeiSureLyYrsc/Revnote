@@ -57,6 +57,7 @@ markers = [
     "api_concurrency: HTTP API behaviour with independent PostgreSQL connections",
     "transport: real socket / uvicorn transport behaviour (disconnects, cancellation)",
     "attachments: Phase 5 attachment HTTP group (needs real PostgreSQL + real object storage)",
+    "joplin: Phase 6 Joplin compatibility bridge (real PostgreSQL; resources also need real object storage)",
 ]
 
 # --------------------------------------------------------------------------- #

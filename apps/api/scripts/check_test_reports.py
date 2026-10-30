@@ -1,10 +1,11 @@
-"""Guard the exact eight API report groups without printing failure bodies.
+"""Guard the exact nine API report groups without printing failure bodies.
 
-Seven are the Phase 3 groups and one, ``api-attachments``, is the Phase 5
-real-PostgreSQL-plus-real-S3 group. By default every one of the eight is
+Seven are the Phase 3 groups, one is the Phase 5 real-PostgreSQL-plus-real-store
+group, and one is the Phase 6 Joplin bridge group (also real PostgreSQL, plus
+real storage for its resource cases). By default every one of the nine is
 required. Repeat --group for focused verification; that does not stand in for
 the default full group gate. --full-report optionally checks an additional
-aggregate report, never instead of the eight group reports.
+aggregate report, never instead of the nine group reports.
 """
 
 from __future__ import annotations
@@ -105,6 +106,35 @@ REQUIRED: dict[str, set[str]] = {
         "test_gc_removes_expired_pending_rows_and_leaves_ready_ones",
         # interface §4: the immutable four-segment storage key.
         "test_the_object_lives_under_the_contract_key",
+    },
+    # Phase 6: the Joplin compatibility bridge, real PostgreSQL (the resource
+    # cases also use the real store in the api-attachments job). One case per
+    # claim of plan §3.2; a group that loses a case must fail here, not shrink.
+    "api-joplin.xml": {
+        # session + the 401 collapse
+        "test_session_login_is_email_password_and_misuse_is_unauthenticated",
+        # bridge -> native, with the mapping and the kernel command
+        "test_a_note_written_through_the_bridge_is_readable_natively",
+        "test_a_folder_and_its_note_keep_the_parent_mapping",
+        "test_deleting_through_the_bridge_is_a_kernel_tombstone",
+        # native -> bridge, deterministic key + serialization
+        "test_a_native_note_appears_in_the_bridge_delta_and_by_name",
+        "test_an_item_can_be_updated_repeatedly_through_the_bridge",
+        # delta compression, cursors and resync
+        "test_delta_chains_without_gaps_and_compresses_a_create_then_updates",
+        "test_an_invalid_or_ahead_cursor_requires_a_resync",
+        "test_a_create_then_delete_pair_is_absent_from_the_delta",
+        # locks
+        "test_sync_locks_coexist_and_an_exclusive_lock_excludes_everyone",
+        # authorisation and batch
+        "test_another_account_cannot_address_this_workspace",
+        "test_batch_put_and_batch_delete_are_per_item",
+        "test_item_metadata_carries_the_times_the_client_compares",
+        # resources on the Phase 5 state machine + real store
+        "test_a_resource_round_trips_into_the_attachment_state_machine",
+        "test_an_unsupported_resource_type_is_permanently_rejected",
+        "test_a_resource_delete_is_accepted_and_the_bytes_remain",
+        "test_a_resource_upload_is_refused_when_the_deployment_has_no_storage",
     },
 }
 GROUPS = {filename.removeprefix("api-").removesuffix(".xml"): filename for filename in REQUIRED}

@@ -330,8 +330,8 @@ jobs:
         run: uv run alembic -c apps/api/alembic.ini check
 
       - name: Verify exactly the Phase 5 domain tables exist
-        # Inspect the real catalog; the eleven domain tables of phases 2-3-5
-        # (kernel six + auth four + attachments one) and nothing else. Detailed
+        # Inspect the real catalog; the fourteen domain tables of phases 2-3-5-6
+        # (kernel six + auth four + attachments one + bridge three) and nothing else. Detailed
         # constraints are verified by PostgreSQL tests.
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
@@ -383,11 +383,15 @@ jobs:
                   "workspace_members",
                   # phase 5 attachments
                   "attachments",
+                  # phase 6 joplin bridge (additive; not kernel entities)
+                  "joplin_id_map",
+                  "joplin_locks",
+                  "joplin_sessions",
               }
               if set(tables) != expected:
                   print(f"::error::schema mismatch: expected {sorted(expected)}, got {tables}")
                   return 1
-              print("OK: Phase 5 schema applied, exactly eleven domain tables")
+              print("OK: Phase 6 schema applied, exactly fourteen domain tables")
               return 0
 
 
@@ -550,6 +554,13 @@ jobs:
         # non-member 404 collapse, and the GC that lists the real bucket.
         run: uv run pytest apps/api/tests/api -m attachments -v --junitxml=api-attachments.xml
 
+      - name: Joplin bridge protocol (real PostgreSQL + real RustFS)
+        # The compatibility surface: session, items in both directions, delta
+        # compression and cursors, locks, and .resource blobs on the Phase 5
+        # attachment state machine. The resource cases need the real store, which
+        # is why this group runs in this job instead of in the api job.
+        run: uv run pytest apps/api/tests/api -m joplin -v --junitxml=api-joplin.xml
+
       - name: Guard - the twelve attachment cases ran, passed, and skipped nothing
         # The same treatment the `api` job gives its seven groups: parse the JUnit
         # XML and count real elements, so an equivalently named case cannot
@@ -606,12 +617,24 @@ jobs:
         # generates. The `api` job's guard covers its own seven.
         run: uv run python apps/api/scripts/check_test_reports.py --group attachments
 
+      - name: Guard the Joplin bridge acceptance report
+        run: uv run python apps/api/scripts/check_test_reports.py --group joplin
+
       - name: Upload the attachments test report
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: api-attachments-reports
           path: api-attachments.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload the Joplin test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: api-joplin-reports
+          path: api-joplin.xml
           if-no-files-found: warn
           retention-days: 7
 

@@ -1,7 +1,7 @@
 """Guard the exact eight API report groups without printing failure bodies.
 
 Seven are the Phase 3 groups and one, ``api-attachments``, is the Phase 5
-real-PostgreSQL-plus-real-MinIO group. By default every one of the eight is
+real-PostgreSQL-plus-real-S3 group. By default every one of the eight is
 required. Repeat --group for focused verification; that does not stand in for
 the default full group gate. --full-report optionally checks an additional
 aggregate report, never instead of the eight group reports.

@@ -2,6 +2,8 @@
 
 以[计划](plan-phase3.md)§2和Build prompt锁定表为准；本规范替代历史草案的JWT、分页快照、upsert、superseded_by_seq方案。
 
+> **Phase 7 修订（加法，不改变本规范既有语义）：** Phase 3 的“无参 snapshot 单次全量、超限整次 409”原样保留；新增显式 `limit`（+可选 `cursor`）的分页 bootstrap，协议、一致性与错误码见 [Phase 7 snapshot 分页](phase7-snapshot-pagination.md)。§5 与 §6 只追加说明，不回写或削弱 Phase 3 已锁定行为。
+
 ## 1. 通用
 
 业务前缀/api/v1；健康/与/health保留。JSON；UUID字符串，seq/rev/cursor/last_seq为十进制字符串，最大9223372036854775807；UTC RFC3339时间。Authorization: Bearer opaque-access；合法X-Request-ID（ASCII [A-Za-z0-9._-]，1–64）原样回传，非法替换。错误固定如下，禁止input/ctx/原始异常/SQL/秘密回显：
@@ -59,7 +61,9 @@ GET /workspaces/{workspace_id}/sync/pull?since=0&limit=100。since排他，默�
 
 ## 5. Snapshot/只读
 
-GET /workspaces/{workspace_id}/sync/snapshot：一个REPEATABLE READ READ ONLY事务，返回as_of_seq/min_retained_seq/objects（全部活跃folders/notes含正文），无分页、拒绝cursor/limit。默认10,000对象/16MiB完整JSON；同事务先count/原文bytes预检避免超大物化，再按JSON真实字节检测，超限整次409 snapshot_too_large，绝不半成功。随后pull since=as_of_seq。
+GET /workspaces/{workspace_id}/sync/snapshot：**无 `limit`/`cursor` 时**一个REPEATABLE READ READ ONLY事务，返回as_of_seq/min_retained_seq/objects（全部活跃folders/notes含正文），无分页。默认10,000对象/16MiB完整JSON；同事务先count/原文bytes预检避免超大物化，再按JSON真实字节检测，超限整次409 snapshot_too_large，绝不半成功。随后pull since=as_of_seq。
+
+**Phase 7 加法：** 显式 `limit`（1..SYNC_SNAPSHOT_PAGE_MAX_OBJECTS）启用分页；`cursor` 为上一页返回的不透明签名串。每页返回在同一 `as_of_seq` 水位下活跃、且当前状态生效于该水位之前的对象，按 `(folder,id)` 后 `(note,id)` 稳定排序，并返回 `next_cursor`/`has_more`。分页响应额外含这两个字段；遗留无参响应形状不变。`offset`/`page`/`since` 仍拒绝。分页错误码：坏游标400 `invalid_cursor`，游标水位超前400 `cursor_ahead`，低于保留下限410 `cursor_expired`，单页放不下413 `snapshot_page_too_large`，跨页超硬顶409 `snapshot_total_too_large`。`/api/v1/capabilities` 追加 `snapshot_pagination` 能力对象。完整说明见 [Phase 7 snapshot 分页](phase7-snapshot-pagination.md)。
 
 GET /workspaces/{workspace_id}/tree：活跃folders/notes元数据，无正文。GET /workspaces/{workspace_id}/notes/{note_id}：指定workspace活跃笔记含正文/rev，缺失/已删404。无REST写包装/成员管理/session列表额外范围。
 
@@ -67,13 +71,13 @@ GET /workspaces/{workspace_id}/tree：活跃folders/notes元数据，无正文�
 
 | code | HTTP或push status | retryable |
 |---|---|---|
-| invalid_request / cursor_ahead | 400 | false |
+| invalid_request / cursor_ahead / invalid_cursor（Phase 7） | 400 | false |
 | unauthenticated / invalid_credentials / token_reused | 401 | false |
 | registration_closed | 403 | false |
 | not_found | 404 | false |
-| conflict / snapshot_too_large | 409（push conflict） | false |
+| conflict / snapshot_too_large / snapshot_total_too_large（Phase 7） | 409（push conflict） | false |
 | cursor_expired | 410 | false |
-| payload_too_large | 413 | false |
+| payload_too_large / snapshot_page_too_large（Phase 7） | 413 | false |
 | rev_conflict / entity_deleted | push conflict | false |
 | invalid_parent / folder_cycle / folder_not_empty / counter_overflow | push rejected | false |
 | write_busy | 503 / push rejected停止 | true |
@@ -85,7 +89,7 @@ GET /workspaces/{workspace_id}/tree：活跃folders/notes元数据，无正文�
 
 ## 7. 配置/验收
 
-AUTH_REGISTRATION_OPEN=false、AUTH_PASSWORD_MIN_CHARS=8、AUTH_PASSWORD_MAX_CHARS=256、AUTH_ACCESS_TTL_S=600、AUTH_SESSION_TTL_S=2592000、ARGON2_MEMORY_COST=65536、ARGON2_TIME_COST=3、ARGON2_PARALLELISM=4、AUTH_HASH_MAX_CONCURRENCY=2；SYNC_PUSH_MAX_OPS=50、SYNC_PUSH_MAX_BYTES=2097152、SYNC_NOTE_MAX_BYTES=262144、SYNC_PUSH_BUDGET_MS=30000、SYNC_PULL_DEFAULT_LIMIT=100、SYNC_PULL_MAX_LIMIT=500、SYNC_PULL_MAX_BYTES=4194304、SYNC_SNAPSHOT_MAX_OBJECTS=10000、SYNC_SNAPSHOT_MAX_BYTES=16777216；DB_LOCK_TIMEOUT_MS=5000、DB_STATEMENT_TIMEOUT_MS=10000；CORS_ALLOW_ORIGINS=[]、RATE_LIMIT_ENABLED=false（仅占位）。配置名称与.env.example保持同步。
+AUTH_REGISTRATION_OPEN=false、AUTH_PASSWORD_MIN_CHARS=8、AUTH_PASSWORD_MAX_CHARS=256、AUTH_ACCESS_TTL_S=600、AUTH_SESSION_TTL_S=2592000、ARGON2_MEMORY_COST=65536、ARGON2_TIME_COST=3、ARGON2_PARALLELISM=4、AUTH_HASH_MAX_CONCURRENCY=2；SYNC_PUSH_MAX_OPS=50、SYNC_PUSH_MAX_BYTES=2097152、SYNC_NOTE_MAX_BYTES=262144、SYNC_PUSH_BUDGET_MS=30000、SYNC_PULL_DEFAULT_LIMIT=100、SYNC_PULL_MAX_LIMIT=500、SYNC_PULL_MAX_BYTES=4194304、SYNC_SNAPSHOT_MAX_OBJECTS=10000、SYNC_SNAPSHOT_MAX_BYTES=16777216、SYNC_SNAPSHOT_PAGE_MAX_OBJECTS=1000、SYNC_SNAPSHOT_PAGE_MAX_BYTES=4194304、SYNC_SNAPSHOT_MAX_TOTAL_OBJECTS=100000；DB_LOCK_TIMEOUT_MS=5000、DB_STATEMENT_TIMEOUT_MS=10000；CORS_ALLOW_ORIGINS=[]、RATE_LIMIT_ENABLED=false（仅占位）。配置名称与.env.example保持同步。
 
 具体schema与认证状态机见计划§9–10，所有权§13，验证§14。真实PG/多连接/uvicorn socket承重测试，0skip，秘密哨兵，保留旧内核责任。六提交、本地全绿、一次push、gh run watch --exit-status等CI绿；不得本机build镜像、触碰Clash或改前端业务。
 

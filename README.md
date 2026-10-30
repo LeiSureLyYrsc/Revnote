@@ -160,7 +160,7 @@ Web 报告门禁要求各组非零、无 skip/todo/failure/error、无 retries/o
 
 业务请求带 `Authorization: Bearer <access>`。写入仅走 `/api/v1/workspaces/{workspace_id}/sync/push`，每批1–50op、JSON≤2MiB、body_md≤256KiB，每op独立事务、按顺序执行。须逐项处理 applied/replayed/conflict/rejected/unknown/not_attempted；收到unknown或丢失响应时保留同一op_id与payload重试。
 
-pull的since为排他十进制字符串（默认0），保留完整事件并独立去重objects；snapshot单RR事务、不分页，默认最多10,000对象/16MiB，超限409 snapshot_too_large（本阶段大workspace无法bootstrap的已知限制）。先snapshot取得as_of_seq，再pull since=as_of_seq。tree不含正文，note端点返回授权笔记正文。所有seq/rev/cursor使用十进制字符串，避免JavaScript精度损失。
+pull的since为排他十进制字符串（默认0），保留完整事件并独立去重objects。snapshot 在**无 `limit`/`cursor`** 时仍是 Phase 3 的单 RR 全量：默认最多 10,000 对象 / 16 MiB，超限整次 409 `snapshot_too_large`。显式 `limit`（+可选 `cursor`）启用 Phase 7 分页 bootstrap：首页钉住 `as_of_seq`，续页按同一水位过滤、稳定序、不透明签名游标；默认单页 1,000 对象 / 4 MiB，跨页硬顶 100,000 对象，超限分别 413 `snapshot_page_too_large` / 409 `snapshot_total_too_large`。分页拼完后仍以 `pull since=as_of_seq` 追上增量。详见 [Phase 7 snapshot 分页](docs/phase7-snapshot-pagination.md)。tree 不含正文，note 端点返回授权笔记正文。所有 seq/rev/cursor 使用十进制字符串，避免 JavaScript 精度损失；分页游标是不透明字符串，客户端不得解析。
 
 通用错误信封含code/message/request_id/retryable/details；非成员与不存在workspace统一404。合法X-Request-ID原样回传，非法替换。CORS默认空列表、无cookie凭据；真实限流尚未实现，公网部署必须另行配置防护。
 
@@ -226,6 +226,17 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 **Phase 6 明确不做**：Joplin Data API 作为产品基础、E2EE 服务端解密、分享、revision、附件删除（`.resource` 删除为已记录的 no-op）、自动三方合并、snapshot 分页、公网加固、参考 CLI、第二对象存储或 MinIO。
 
 验证以 [Phase 6 实际验收记录](docs/phase6-validation.md) 为准；该文件只写实际运行结果，未跑的小节会明确写「未运行」。
+
+**Phase 7（snapshot 分页 bootstrap）已实现**，协议与一致性边界见 [Phase 7 说明](docs/phase7-snapshot-pagination.md)：
+
+- 无参 snapshot 路径与 Phase 3 字节兼容；响应形状不变，仍可返回 `409 snapshot_too_large`。
+- 显式 `limit`/`cursor` 走分页：首页在 `REPEATABLE READ, READ ONLY` 中钉住 `as_of_seq`；续页各自新事务，只返回 `updated_seq <= as_of_seq` 且当前活跃的对象，按 `(folder,id)` 后 `(note,id)` 稳定排序。
+- 游标是 HMAC 签名的不透明串，内嵌 workspace / `as_of_seq` / 最后键；坏游标 400 `invalid_cursor`，水位超前 400 `cursor_ahead`，低于保留 floor 410 `cursor_expired`。
+- `GET /api/v1/capabilities` **加法**声明 `snapshot_pagination {enabled, page_max_objects, page_max_bytes, max_total_objects}`。
+- Web transport 感知能力后循环拉页并原子合并，再进入既有 `activateSnapshot` + pull；旧服务端或关闭能力时回退到遗留单次 snapshot。
+- 本阶段**没有**新迁移、没有服务端快照租约表、没有跨请求长事务；并发写入由 `pull since=as_of_seq` 补齐，不把更新泄漏进已钉页。
+
+**Phase 7 明确不做**：自动三方合并、参考 CLI、公网加固、附件进入事件流、Joplin 功能扩张、MinIO/第二对象存储。验证以 [Phase 7 实际验收记录](docs/phase7-validation.md) 为准。
 
 ## Actions 与 GHCR
 

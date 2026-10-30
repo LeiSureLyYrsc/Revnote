@@ -60,11 +60,11 @@
 
 ### H — 稳定性前置
 
-（待填：focused ×5 + full ×2，各自全新一次性库）
+见下文「H - 稳定性前置验收」：focused `single_writer_takeover` **5/5 PASS**（5 个各自独立的一次性库）、全量 E2E **2/2 PASS**、`check:web-reports` 退出码 0（16 个既有标签全部通过）。
 
 ### B — 附件全栈
 
-（待填）
+见下文「真实 MinIO + 真实 PG 附件组」「宽限期 GC 运维脚本」「迁移 `0004_attachments` 真实 PG 往返」与「最终门禁」各节；B1/B2/B4 三个缺陷的复现与修复也在下文单独记录。
 
 ## 迁移 `0004_attachments` 真实 PG 往返（orchestrator 亲自执行）
 
@@ -115,7 +115,39 @@
 
 ## CI
 
-（待填：本次 SHA 对应的 run 链接与五 job 结论；不以旧 run 的绿色代替本次验收）
+同一 SHA `2c1b66adb23d3982f9cf43e5a36c66b78c834312` 的 run
+[`41004284199`](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41004284199)
+连续**两轮**五个 job 全绿（`gh run watch --exit-status` 均为 0）：
+
+| job | 第一轮 | 第二轮（rerun） |
+|---|---|---|
+| api（lint + types + unit + postgres + http + migrations） | success | success |
+| api-attachments（真实 PostgreSQL + 真实 MinIO） | success | success |
+| web（lint + typecheck + build + markdown + unit + components） | success | success |
+| web-e2e（Chromium + 原生 API + 真实 PostgreSQL） | success | success |
+| image（build + push to GHCR，`needs` 含 api-attachments） | success | success |
+
+**为什么要求两轮**：本阶段之前有已记录的 E2E flake 史，「一次绿」不足以作为发布证据。
+两轮都在**同一 SHA** 上取得，未用任何旧 run 的绿色结果替代。
+
+### 首轮 CI 失败与修复（同轮内追加提交）
+
+首轮 run `41003735131`（SHA `3d0a2e7`）失败，三个原因均经实测确认，非猜测：
+
+1. **api**：`ty` 报 3 条诊断——`AttachmentView.state` 为 `str` 而响应模型要求三值字面量；
+   `_closing_stream` 把协程访问器标注为 `Callable[[], object]` 却 `await` 之；
+   E2E runner 在运行期把 `apps/api/tests` 加入 `sys.path` 后才延迟导入 `pg_support`，
+   检查器不知该路径。修复落在类型标注与 `--extra-search-path`，**未用抑制注释掩盖**。
+2. **web-e2e**：未配置外部端点时回落到 `owned` 模式，而该模式固定的是 **Windows** 二进制，
+   在 Linux runner 上必然不存在。改为指向本地对象存储的 **external** 模式。
+3. **api-attachments**：MinIO 服务容器起步即失败，报 `unauthorized`。实测确认既非标签问题、
+   亦非瞬时故障：`quay.io/minio/minio` 对**所有**标签返回 401（含 2024 年旧标签与 `latest`），
+   Docker Hub 已不再托管 `minio/minio`（仓库 API 404），`dl.min.io` 返回 410 Gone。
+   MinIO 仍在**自己的 GitHub releases** 发布同一 release 的 Linux amd64 二进制及其 SHA-256，
+   故 CI 改为下载该二进制、按仓库内固定摘要校验后运行——同一 release、同一来源、不同官方渠道，
+   **不是**第三方重建，也**不是**换用其他 S3 产品。
+
+以上修复以追加提交 `2c1b66a` 完成，未强推、未改写已发布历史。
 
 ## 本轮暂停：配额（403 upstream）
 

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -195,7 +195,7 @@ def _attachment_model(view: AttachmentView) -> AttachmentResponse:
     return AttachmentResponse(
         id=view.id,
         workspace_id=view.workspace_id,
-        state=view.state,  # type: ignore[arg-type]
+        state=view.state,
         mime=view.mime,
         byte_size=view.byte_size,
         content_hash=view.content_hash,
@@ -442,7 +442,7 @@ async def _closing_stream(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
         async for chunk in chunks:
             yield chunk
     finally:
-        close: Callable[[], object] | None = getattr(chunks, "aclose", None)
+        close: Callable[[], Awaitable[object]] | None = getattr(chunks, "aclose", None)
         if close is not None:
             with contextlib.suppress(Exception):
-                await close()  # type: ignore[misc]
+                await close()

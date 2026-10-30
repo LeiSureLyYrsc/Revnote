@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import datetime
 import uuid
+from typing import Literal
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
@@ -43,7 +44,16 @@ from sqlalchemy.orm import Mapped, mapped_column
 from revnote_api.db.base import Base
 
 #: The three legal states, in lifecycle order. Mirrors the ``state`` CHECK.
+#:
+#: :data:`AttachmentState` is the *narrow* form of the same fact. Consumers that must
+#: not invent a fourth state (the service view, the response schema) annotate with
+#: it, so a widened ``str`` cannot slip past a type check. It lives on the model
+#: rather than in ``services/`` or ``api/`` because both layers may import a model,
+#: while ``services/`` may not import ``api/`` (kernel boundary).
 ATTACHMENT_STATES: tuple[str, ...] = ("pending", "ready", "deleted")
+
+#: One of :data:`ATTACHMENT_STATES`, as a type rather than a runtime tuple.
+AttachmentState = Literal["pending", "ready", "deleted"]
 
 #: SHA-256 digest length stored in ``content_hash`` (``BYTEA``, 32 octets).
 CONTENT_HASH_BYTES = 32

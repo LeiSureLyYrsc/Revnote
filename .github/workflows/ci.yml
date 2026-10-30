@@ -144,7 +144,11 @@ jobs:
         # No global ignore file: a diagnostic is fixed at its source or the build
         # stays red.
         run: |
-          uvx --from "ty==${TY_VERSION}" ty check \
+          # `--extra-search-path` names where `pg_support` really lives. The E2E
+          # runner imports it deliberately late (after adding the path at runtime),
+          # so the checker has to be told the same thing rather than the import
+          # being suppressed.
+          uvx --from "ty==${TY_VERSION}" ty check --extra-search-path apps/api/tests \
             apps/api/src/revnote_api/api \
             apps/api/src/revnote_api/security \
             apps/api/src/revnote_api/models \
@@ -443,23 +447,6 @@ jobs:
           --health-retries 20
           --health-start-period 20s
 
-      minio:
-        # The official image on the tag docker-compose.yml pins, so the container
-        # CI tests against and the one a developer runs are one release.
-        image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-        # The image's entrypoint prepends `minio` when the first argument is not
-        # `minio`, so the effective command is `minio server /data`.
-        command: server /data
-        env:
-          # MinIO's own documented names for its root identity.
-          MINIO_ROOT_USER: revnote_minio_ci_only_user
-          MINIO_ROOT_PASSWORD: revnote_minio_ci_only_password
-        ports:
-          - 9000:9000
-        # Deliberately NO Docker health-check options here: this image's built-in
-        # probe is not verified, and a service whose check never reports healthy
-        # fails the job before a single step runs. Readiness is polled below by
-        # our adapter instead.
 
     env:
       # Both promises are gates, not hints: with these set, a test that cannot
@@ -472,6 +459,9 @@ jobs:
       TEST_MIGRATION_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_attachments_ci_migrations
       REQUIRE_POSTGRES_TESTS: "1"
       REQUIRE_OBJECT_STORAGE_TESTS: "1"
+      # Read only by the MinIO start step, so the credential appears in one place.
+      MINIO_CI_ACCESS_KEY: revnote_minio_ci_only_user
+      MINIO_CI_SECRET_KEY: revnote_minio_ci_only_password
       OBJECT_STORAGE_ENDPOINT: http://127.0.0.1:9000
       OBJECT_STORAGE_BUCKET: revnote-attachments-ci
       OBJECT_STORAGE_ACCESS_KEY: revnote_minio_ci_only_user
@@ -497,6 +487,31 @@ jobs:
       - name: Sync workspace from the lock file
         run: uv sync --locked
 
+      - name: Start the pinned MinIO (official release binary)
+        # The official container images are no longer anonymously pullable: quay.io
+        # answers 401 for every tag and Docker Hub no longer hosts `minio/minio`, so a
+        # `services: minio` block fails the job before a single step runs. `dl.min.io`
+        # is 410 Gone as well. MinIO still publishes this exact release on its own
+        # GitHub releases, so the Linux amd64 binary is fetched from there and verified
+        # against the hash published beside it - same release, same provenance,
+        # different official channel. Not a rebuild, not a different S3 product.
+        env:
+          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+        run: |
+          set -euo pipefail
+          asset="minio.linux-amd64.${MINIO_RELEASE}"
+          curl -fsSL --retry 3 -o /tmp/minio \
+            "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/${asset}"
+          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum -c -
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          # A background process outlives its step on a GitHub runner, which is why the
+          # server is started here and polled in the next step rather than in one block.
+          MINIO_ROOT_USER="${MINIO_CI_ACCESS_KEY}" \
+          MINIO_ROOT_PASSWORD="${MINIO_CI_SECRET_KEY}" \
+            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
+              --console-address 127.0.0.1:0 > /tmp/minio.log 2>&1 &
       - name: Wait for object storage and create the bucket
         # The project's own code, not a poller image and not `mc`: readiness is
         # `probe_store` (list_buckets) which answers "the store is reachable and
@@ -682,6 +697,15 @@ jobs:
     env:
       WEB_E2E_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_web_e2e_ci
       REQUIRE_POSTGRES_TESTS: "1"
+      # External mode: the runner creates its own per-run bucket in this store and
+      # passes the values to its children, instead of trying to own a MinIO process
+      # (owned mode pins the Windows binary, which cannot exist on a Linux runner).
+      WEB_E2E_MINIO_ENDPOINT: http://127.0.0.1:9000
+      WEB_E2E_MINIO_ACCESS_KEY: revnote_minio_ci_only_user
+      WEB_E2E_MINIO_SECRET_KEY: revnote_minio_ci_only_password
+      REQUIRE_OBJECT_STORAGE_TESTS: "1"
+      MINIO_CI_ACCESS_KEY: revnote_minio_ci_only_user
+      MINIO_CI_SECRET_KEY: revnote_minio_ci_only_password
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -693,6 +717,31 @@ jobs:
           enable-cache: true
       - name: Sync Python workspace
         run: uv sync --locked
+      - name: Start the pinned MinIO (official release binary)
+        # The official container images are no longer anonymously pullable: quay.io
+        # answers 401 for every tag and Docker Hub no longer hosts `minio/minio`, so a
+        # `services: minio` block fails the job before a single step runs. `dl.min.io`
+        # is 410 Gone as well. MinIO still publishes this exact release on its own
+        # GitHub releases, so the Linux amd64 binary is fetched from there and verified
+        # against the hash published beside it - same release, same provenance,
+        # different official channel. Not a rebuild, not a different S3 product.
+        env:
+          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+        run: |
+          set -euo pipefail
+          asset="minio.linux-amd64.${MINIO_RELEASE}"
+          curl -fsSL --retry 3 -o /tmp/minio \
+            "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/${asset}"
+          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum -c -
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          # A background process outlives its step on a GitHub runner, which is why the
+          # server is started here and polled in the next step rather than in one block.
+          MINIO_ROOT_USER="${MINIO_CI_ACCESS_KEY}" \
+          MINIO_ROOT_PASSWORD="${MINIO_CI_SECRET_KEY}" \
+            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
+              --console-address 127.0.0.1:0 > /tmp/minio.log 2>&1 &
       - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:

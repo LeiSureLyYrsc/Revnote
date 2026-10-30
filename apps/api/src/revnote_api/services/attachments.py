@@ -89,7 +89,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from revnote_api.kernel.ids import new_id
-from revnote_api.models.attachment import CONTENT_HASH_BYTES, MIME_MAX_BYTES, MIME_MIN_BYTES
+from revnote_api.models.attachment import (
+    CONTENT_HASH_BYTES,
+    MIME_MAX_BYTES,
+    MIME_MIN_BYTES,
+    AttachmentState,
+)
 from revnote_api.storage.ports import BlobDigest, BlobStore, BlobTooLarge, StorageUnavailable
 
 __all__ = [
@@ -375,7 +380,7 @@ class AttachmentView:
 
     id: uuid.UUID
     workspace_id: uuid.UUID
-    state: str
+    state: AttachmentState
     mime: str
     byte_size: int
     created_at: datetime.datetime

@@ -14,32 +14,30 @@
 # Configuration comes from the repository-root `.env` (copy `.env.example`).
 #
 # --------------------------------------------------------------------------- #
-# OPEN BLOCKER — MinIO image availability (read before changing, and before
-# claiming this stack works).
+# OPEN BLOCKER - MinIO image availability (measured, not assumed).
 #
-# Registry probes in the implementation environment did not establish a
-# pullable official source. HTTP/authentication errors in that environment
-# do not establish that upstream images are universally unavailable.
+# The official MinIO container image is NOT anonymously pullable any more. Measured
+# from the CI runner on 2026-10-30:
 #
-# The references below are the OFFICIAL quay.io repositories with explicit
-# release tags. They are a statement of intent, NOT a verified pull: no digest
-# is pinned because none could be retrieved, and no digest may be invented.
+#   * `docker pull quay.io/minio/minio:<tag>` -> 401 unauthorized for EVERY tag
+#     (the tag below, an older 2024 release and `latest` all answer the same), so
+#     this is a gated repository, not a missing tag;
+#   * Docker Hub no longer hosts `minio/minio` (the repository API answers 404);
+#   * `dl.min.io` answers 410 Gone.
 #
-# The server tag is RELEASE.2025-09-07T16-13-09Z rather than the earlier
-# RELEASE.2025-09-06T17-38-46Z because 09-06 publishes no Windows asset, and the
-# local real-storage acceptance run uses the OFFICIAL Windows build of 09-07
-# (SHA-256 and provenance in docs/phase5-validation.md). Compose and CI pin the
-# same tag so the container and the binary under local acceptance are one
-# release. That still proves nothing about pullability: nobody has pulled this
-# tag on a Docker host yet.
+# MinIO still publishes this exact release on its OWN GitHub releases, including a
+# Linux amd64 binary and a published SHA-256. That is the channel CI uses (see
+# `.github/workflows/ci.yml`, pinned by digest), and it is the same release as the
+# local Windows binary recorded in docs/phase5-validation.md.
 #
-# CONSEQUENCE: the MinIO portion is NOT accepted as runnable yet. Confirm an
-# official pull and review the selected release's security status before use.
-# Do not substitute a third-party rebuild without explicit approval.
+# CONSEQUENCE: the `minio`, `minio-wait`, `minio-init` and `minio-private` services
+# below CANNOT start on a host with a Docker daemon - the pull fails before anything
+# runs. They are kept as a statement of intent for the day an official pullable
+# image exists again, not as a working local stack.
 #
-# Action required: verify `docker pull quay.io/minio/minio:<tag>` on a host with
-# a Docker daemon, or decide on an officially supported channel, then pin the
-# digest that was actually observed.
+# Do not substitute a third-party rebuild or a different S3 product to make this
+# work: that would change what the acceptance run actually proves. Use the pinned
+# official binary instead, or wait for an official image.
 # --------------------------------------------------------------------------- #
 
 # Official MinIO server and client, with explicit release tags.

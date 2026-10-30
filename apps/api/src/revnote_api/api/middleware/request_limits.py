@@ -17,6 +17,7 @@ class            budget     rationale
 ===============  =========  ===============================================
 ``/api/v1/auth`` 16 KiB     two short strings; nothing legitimate is larger
 ``sync/push``    2 MiB      <=50 ops of <=256 KiB body, in practice far less
+attachment PUT   configured ``ATTACHMENT_MAX_BYTES`` (25 MiB default)
 default          1 MiB      anything else that grows a body later
 ===============  =========  ===============================================
 
@@ -32,6 +33,7 @@ testable without sleeping.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Final
@@ -65,17 +67,39 @@ _LIMIT_BY_PREFIX: Final[tuple[tuple[str, str], ...]] = (
     ("/api/v1/workspaces/", "push"),
 )
 
+#: The one Phase 5 upload path, matched exactly rather than by prefix: every
+#: other ``/api/v1/workspaces/`` request keeps the 2 MiB push budget, and an
+#: attachment upload is the only body allowed to approach the attachment cap.
+_ATTACHMENT_UPLOAD_PATH: Final = re.compile(
+    r"^/api/v1/workspaces/[^/]+/attachments/[^/]+/content/?$"
+)
+
 
 class PayloadTooLarge(Exception):
     """Internal signal: the running body size passed the path's limit."""
 
 
-def limit_for_path(path: str, *, push_limit: int = PUSH_BODY_LIMIT_BYTES) -> int:
+def limit_for_path(
+    path: str,
+    *,
+    push_limit: int = PUSH_BODY_LIMIT_BYTES,
+    attachment_limit: int = DEFAULT_BODY_LIMIT_BYTES,
+) -> int:
     """The body budget for ``path`` (longest matching prefix, else the default).
 
-    ``push_limit`` is the configured ``SYNC_PUSH_MAX_BYTES``; passing it in keeps
-    the module free of a settings import and keeps the defaults testable.
+    ``push_limit`` is the configured ``SYNC_PUSH_MAX_BYTES`` and
+    ``attachment_limit`` the configured ``ATTACHMENT_MAX_BYTES``; passing them in
+    keeps the module free of a settings import and keeps the defaults testable.
+
+    The attachment rule is checked **first** and matched exactly (see
+    :data:`_ATTACHMENT_UPLOAD_PATH`). It sits above the prefix table on purpose:
+    ``/api/v1/workspaces/`` would otherwise claim the upload path with the push
+    budget, so an attachment could never exceed 2 MiB. No other
+    ``/api/v1/workspaces/`` request is affected.
     """
+    if _ATTACHMENT_UPLOAD_PATH.match(path):
+        return attachment_limit
+
     best_length = -1
     best_kind = "default"
     for prefix, kind in _LIMIT_BY_PREFIX:
@@ -109,14 +133,28 @@ def _declared_length(scope: Scope) -> int | None:
 class BodyLimitMiddleware:
     """Enforce per-path request-body budgets on bytes really received."""
 
-    def __init__(self, app: ASGIApp, *, push_limit: int | None = None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        push_limit: int | None = None,
+        attachment_limit: int | None = None,
+    ) -> None:
         self.app = app
         #: ``SYNC_PUSH_MAX_BYTES`` when configured; the constant is the default so
         #: the middleware stays usable on its own (tests, embedded apps).
         self._push_limit = PUSH_BODY_LIMIT_BYTES if push_limit is None else int(push_limit)
+        #: ``ATTACHMENT_MAX_BYTES`` when configured; never larger than the cap the
+        #: storage write itself enforces, so the two cannot disagree about a body
+        #: that is "allowed" here and refused a layer deeper.
+        self._attachment_limit = (
+            DEFAULT_BODY_LIMIT_BYTES if attachment_limit is None else int(attachment_limit)
+        )
 
     def _limit_for(self, path: str) -> int:
-        return limit_for_path(path, push_limit=self._push_limit)
+        return limit_for_path(
+            path, push_limit=self._push_limit, attachment_limit=self._attachment_limit
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope["method"] in {"GET", "HEAD", "DELETE", "OPTIONS"}:

@@ -254,6 +254,13 @@ def test_the_documented_vocabulary_is_present_exactly() -> None:
         "counter_overflow",
         "rate_limited",
         "internal",
+        # -- Phase 5 attachments (additive: new codes only, none changed) ----- #
+        "attachment_storage_unavailable",
+        "attachment_already_ready",
+        "attachment_hash_mismatch",
+        "attachment_expired",
+        "attachment_too_large",
+        "attachment_unsupported_type",
     }
 
 
@@ -285,6 +292,13 @@ def test_the_documented_vocabulary_is_present_exactly() -> None:
         ("auth_temporarily_unavailable", 503),
         ("storage_failure", 500),
         ("internal", 500),
+        # -- Phase 5 attachments (additive) ------------------------------------ #
+        ("attachment_unsupported_type", 400),
+        ("attachment_already_ready", 409),
+        ("attachment_hash_mismatch", 409),
+        ("attachment_expired", 409),
+        ("attachment_too_large", 413),
+        ("attachment_storage_unavailable", 503),
     ],
 )
 def test_status_codes_match_the_protocol_table(code: str, status: int) -> None:
@@ -300,6 +314,9 @@ def test_only_transient_codes_are_retryable() -> None:
         "outcome_unknown",
         "auth_temporarily_unavailable",
         "storage_failure",
+        # Phase 5: the store was unreachable and nothing was committed, so
+        # re-sending the identical upload is safe.
+        "attachment_storage_unavailable",
     }
 
 

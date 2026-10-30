@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from revnote_api.api.routes.attachments import capabilities_router
+from revnote_api.api.routes.attachments import router as attachments_router
 from revnote_api.api.routes.auth import me_router
 from revnote_api.api.routes.auth import router as auth_router
 from revnote_api.api.routes.health import liveness_router
@@ -38,6 +40,8 @@ api_v1.include_router(me_router)
 api_v1.include_router(sync_push_router)
 api_v1.include_router(sync_pull_router)
 api_v1.include_router(read_router)
+api_v1.include_router(attachments_router)
+api_v1.include_router(capabilities_router)
 
 #: What the app mounts. Liveness first (it must answer even if a later route's
 #: import is broken), then the versioned group.

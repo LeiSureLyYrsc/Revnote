@@ -60,6 +60,12 @@ EXPECTED_PATHS = {
     "/api/v1/workspaces/{workspace_id}/sync/snapshot",
     "/api/v1/workspaces/{workspace_id}/tree",
     "/api/v1/workspaces/{workspace_id}/notes/{note_id}",
+    # -- Phase 5 attachments (D4: proxied by the API, never presigned) -------- #
+    "/api/v1/capabilities",
+    "/api/v1/workspaces/{workspace_id}/attachments",
+    "/api/v1/workspaces/{workspace_id}/attachments/{attachment_id}/content",
+    "/api/v1/attachments/{attachment_id}",
+    "/api/v1/attachments/{attachment_id}/content",
 }
 
 

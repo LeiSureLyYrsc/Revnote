@@ -149,6 +149,33 @@ class Settings(BaseSettings):
     sync_snapshot_max_objects: int = Field(default=10_000, ge=1)
     sync_snapshot_max_bytes: int = Field(default=16_777_216, ge=1_024)
 
+    # -- attachments (Phase 5) ---------------------------------------------- #
+    #: Master switch (D12). Closed by default: a deployment with no object
+    #: storage configured must not *look* like it supports attachments.
+    #: ``GET /api/v1/capabilities`` reports the effective value so a client can
+    #: hide the entry point instead of discovering the gap on first upload.
+    attachments_enabled: bool = False
+    #: Hard ceiling on one attachment, enforced twice: as the HTTP body budget
+    #: for the upload path (middleware) and by the storage write itself, which
+    #: aborts the moment the running total passes it (25 MiB).
+    attachment_max_bytes: int = Field(default=26_214_400, ge=1_024)
+    #: How long a ``pending`` row may exist before the GC script may delete it.
+    #: ``ready`` rows are never collected automatically (D8).
+    attachment_pending_grace_s: int = Field(default=86_400, ge=1)
+    #: MIME allowlist (D9). Deliberately narrow, and ``image/svg+xml`` is
+    #: excluded on purpose: an SVG is a document that can carry script, and it
+    #: would be served from our own origin.
+    attachment_accepted_mime: list[str] = Field(
+        default_factory=lambda: [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "application/pdf",
+            "text/plain",
+        ]
+    )
+
     # -- HTTP cross-cutting ------------------------------------------------- #
     #: Explicit origins only; empty means no CORS headers at all. CORS is not
     #: an authorization mechanism - credentials are never allowed.
@@ -198,6 +225,11 @@ class Settings(BaseSettings):
             raise ValueError("SYNC_PULL_DEFAULT_LIMIT must not exceed SYNC_PULL_MAX_LIMIT")
         if self.db_lock_timeout_ms > self.db_statement_timeout_ms:
             raise ValueError("DB_LOCK_TIMEOUT_MS must not exceed DB_STATEMENT_TIMEOUT_MS")
+        # SVG is refused here as well as in the service: the allowlist is a
+        # security boundary, not a preference, and configuring it back in is
+        # exactly the change nobody would notice in review (D9).
+        if "image/svg+xml" in {mime.strip().lower() for mime in self.attachment_accepted_mime}:
+            raise ValueError("ATTACHMENT_ACCEPTED_MIME must not include image/svg+xml")
         return self
 
     @property

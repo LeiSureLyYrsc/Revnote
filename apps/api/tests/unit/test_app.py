@@ -85,6 +85,12 @@ async def test_openapi_exposes_only_implemented_routes(client: AsyncClient) -> N
         "/api/v1/workspaces/{workspace_id}/sync/snapshot",
         "/api/v1/workspaces/{workspace_id}/tree",
         "/api/v1/workspaces/{workspace_id}/notes/{note_id}",
+        # -- Phase 5 attachments (additive; no existing path changed) -------- #
+        "/api/v1/capabilities",
+        "/api/v1/workspaces/{workspace_id}/attachments",
+        "/api/v1/workspaces/{workspace_id}/attachments/{attachment_id}/content",
+        "/api/v1/attachments/{attachment_id}",
+        "/api/v1/attachments/{attachment_id}/content",
     }
     assert schema["info"]["title"] == "Revnote API"
 

@@ -50,6 +50,7 @@ from revnote_api.kernel.errors import (
     WorkspaceNotFound,
     WriteBusy,
 )
+from revnote_api.storage.ports import StorageUnavailable
 
 __all__ = [
     "CODE_STATUS",
@@ -119,6 +120,22 @@ ERROR_SPECS: Final[dict[str, ErrorSpec]] = {
         ErrorSpec(409, "object_too_large", "The object exceeds the allowed size."),
         ErrorSpec(409, "snapshot_too_large", "The workspace is too large for a full snapshot."),
         ErrorSpec(409, "counter_overflow", "A workspace counter reached its limit."),
+        # -- attachments (Phase 5, additive) ---------------------------------- #
+        # A second upload to an id that is already ``ready``. The object is
+        # immutable, so re-sending is refused rather than silently accepted.
+        ErrorSpec(409, "attachment_already_ready", "The attachment is already uploaded."),
+        # The bytes the server read back did not hash to the declared digest.
+        # Nothing enters ``ready`` on this path, so the client may retry.
+        ErrorSpec(409, "attachment_hash_mismatch", "The uploaded bytes do not match the digest."),
+        # The ``pending`` row outlived the grace window and the GC may remove it.
+        ErrorSpec(409, "attachment_expired", "The upload was not completed in time."),
+        # The declared size (or the actual stream) exceeded the configured cap.
+        # Distinct from the middleware's ``payload_too_large`` so a client can
+        # tell "your body was too big for this path" from "your attachment is
+        # over the attachment limit".
+        ErrorSpec(413, "attachment_too_large", "The attachment exceeds the allowed size."),
+        # Never for ``image/svg+xml``: the allowlist is a security boundary (D9).
+        ErrorSpec(400, "attachment_unsupported_type", "This file type is not accepted."),
         # -- cursors ---------------------------------------------------------- #
         ErrorSpec(410, "cursor_expired", "The cursor is older than the retained history."),
         # -- transient -------------------------------------------------------- #
@@ -138,6 +155,14 @@ ERROR_SPECS: Final[dict[str, ErrorSpec]] = {
             503,
             "auth_temporarily_unavailable",
             "Authentication is temporarily unavailable.",
+            retryable=True,
+        ),
+        # The object store is not answering (or is not configured). Retryable
+        # because the client's bytes are fine; nothing was committed.
+        ErrorSpec(
+            503,
+            "attachment_storage_unavailable",
+            "Attachment storage is temporarily unavailable.",
             retryable=True,
         ),
         # -- server ----------------------------------------------------------- #
@@ -503,6 +528,25 @@ def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(SyncKernelError)
     async def _kernel_error(request: Request, exc: SyncKernelError) -> JSONResponse:
         return kernel_error_response(exc, get_request_id(request))
+
+    @app.exception_handler(StorageUnavailable)
+    async def _storage_unavailable(request: Request, exc: StorageUnavailable) -> JSONResponse:
+        """An unreachable or unconfigured object store is a 503, never a 500.
+
+        This handler exists because of *where* the failure is raised. The attachment
+        routes build their store in a FastAPI **dependency**, and dependencies resolve
+        before the route body - so a deployment with ``ATTACHMENTS_ENABLED=true`` and no
+        ``OBJECT_STORAGE_*`` reached the catch-all ``Exception`` handler and answered
+        ``500 internal``. That reads as "the server is broken" for a configuration that
+        is merely incomplete, and it contradicted the route contract's own promise of
+        ``attachment_storage_unavailable`` (503, retryable).
+
+        Only this class is mapped: a programming error must still surface as ``internal``
+        rather than hide behind a reassuring "retry later". ``retryable`` and the
+        ``Retry-After`` header come from :data:`ERROR_SPECS` through ``error_response``.
+        """
+        del exc  # the message can name an endpoint or a bucket; the code carries it
+        return error_response("attachment_storage_unavailable", get_request_id(request))
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

@@ -190,6 +190,43 @@ def test_the_push_budget_comes_from_configuration() -> None:
     assert limit_for_path("/", push_limit=configured) == DEFAULT_BODY_LIMIT_BYTES
 
 
+def test_the_attachment_upload_path_gets_its_own_budget() -> None:
+    """Phase 5: a binary upload must not be capped by the 2 MiB push budget.
+
+    The rule is matched exactly, because every *other* ``/api/v1/workspaces/``
+    request keeps the push allowance - widening the prefix would quietly give a
+    push batch (or any later route) a 25 MiB body.
+    """
+    configured = 8 * 1024 * 1024
+    upload = "/api/v1/workspaces/ws-1/attachments/att-1/content"
+
+    assert limit_for_path(upload, attachment_limit=configured) == configured
+    # Without the argument the module stays usable on its own.
+    assert limit_for_path(upload) == DEFAULT_BODY_LIMIT_BYTES
+    # Trailing slash (a client typo) must not fall back to the push budget.
+    assert limit_for_path(upload + "/", attachment_limit=configured) == configured
+
+    # Neighbours are untouched: the create call, the metadata reads, and every
+    # other workspace route still follow the push prefix.
+    assert (
+        limit_for_path("/api/v1/workspaces/ws-1/attachments", attachment_limit=configured)
+        == PUSH_BODY_LIMIT_BYTES
+    )
+    assert (
+        limit_for_path("/api/v1/workspaces/ws-1/sync/push", attachment_limit=configured)
+        == PUSH_BODY_LIMIT_BYTES
+    )
+    assert (
+        limit_for_path("/api/v1/workspaces/ws-1/tree", attachment_limit=configured)
+        == PUSH_BODY_LIMIT_BYTES
+    )
+    # An upload path missing a segment is not an upload path.
+    assert (
+        limit_for_path("/api/v1/workspaces/ws-1/attachments/content", attachment_limit=configured)
+        == PUSH_BODY_LIMIT_BYTES
+    )
+
+
 async def test_an_app_built_from_settings_enforces_the_configured_push_budget(
     settings: Settings,
 ) -> None:

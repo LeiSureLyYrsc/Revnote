@@ -56,6 +56,7 @@ markers = [
     "api: HTTP API behaviour over an in-process ASGI client",
     "api_concurrency: HTTP API behaviour with independent PostgreSQL connections",
     "transport: real socket / uvicorn transport behaviour (disconnects, cancellation)",
+    "attachments: Phase 5 attachment HTTP group (needs real PostgreSQL + real object storage)",
 ]
 
 # --------------------------------------------------------------------------- #

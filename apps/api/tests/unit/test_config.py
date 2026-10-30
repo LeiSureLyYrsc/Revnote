@@ -24,6 +24,11 @@ def test_defaults_allow_local_startup(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_ignores_unrelated_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compose/.env keys this service does not use must not raise."""
+    # This test is about *unrelated* keys, so the related one is cleared explicitly.
+    # Without this it only passes when the caller's shell happens to have no
+    # ``DATABASE_URL`` - and the suite is routinely run with one exported (the
+    # integration/api groups need it), which made this fail for the wrong reason.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("POSTGRES_USER", "revnote")
     monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
     monkeypatch.setenv("MINIO_ROOT_PASSWORD", "minio-secret")
@@ -302,6 +307,58 @@ def test_no_auth_secret_is_declared() -> None:
 
     assert not {name for name in declared if "secret" in name}
     assert "auth_secret" not in declared
+
+
+def test_phase5_attachment_settings_declare_no_credential_field() -> None:
+    """Object-storage credentials live in ``ObjectStorageSettings``, not here (D11).
+
+    ``Settings`` is the object the app factory logs and that the whole request
+    path touches; a ``*_secret_*``/``*_password`` field here would end up in a
+    boot line sooner or later. The storage credentials have their own class with
+    its own masked ``repr``. This test is the tripwire: it fails the moment
+    someone adds one here "just for convenience".
+    """
+    declared = set(Settings.model_fields)
+
+    assert not {name for name in declared if "secret" in name}
+    assert not {name for name in declared if name.endswith(("_secret", "_password", "_token"))}
+    # The Phase 5 names that *are* expected to be here, and they are policy.
+    assert {
+        "attachments_enabled",
+        "attachment_max_bytes",
+        "attachment_pending_grace_s",
+        "attachment_accepted_mime",
+    } <= declared
+
+
+def test_attachments_are_closed_by_default_with_a_narrow_allowlist() -> None:
+    """D12/D9: an unconfigured deployment advertises nothing and accepts little."""
+    settings = Settings(_env_file=None)
+
+    assert settings.attachments_enabled is False
+    assert settings.attachment_max_bytes == 26_214_400
+    assert settings.attachment_pending_grace_s == 86_400
+    assert settings.attachment_accepted_mime == [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "application/pdf",
+        "text/plain",
+    ]
+
+
+def test_svg_can_not_be_configured_back_into_the_allowlist() -> None:
+    """An SVG is a script-bearing document served from our own origin (D9).
+
+    The allowlist is a security boundary, so the refusal is a *startup* failure
+    rather than a per-request check someone could forget to keep.
+    """
+    with pytest.raises(ValidationError, match="svg"):
+        Settings(
+            _env_file=None,
+            attachment_accepted_mime=["image/png", "image/svg+xml"],
+        )
 
 
 def test_phase3_settings_repr_shows_no_credential_value(

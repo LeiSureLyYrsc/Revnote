@@ -122,6 +122,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The push budget is configuration (``SYNC_PUSH_MAX_BYTES``, D9), not a
         # constant: the middleware default exists only for standalone use.
         push_limit=settings.sync_push_max_bytes,
+        # Phase 5: the upload path gets its own configured budget. Passing the
+        # same number the storage write enforces keeps "allowed by the limiter,
+        # refused by the store" impossible.
+        attachment_limit=settings.attachment_max_bytes,
     )
     app.add_middleware(RequestIdMiddleware)
     # Outermost: it reads ``scope["state"]["request_id"]`` (populated by the

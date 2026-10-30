@@ -550,3 +550,25 @@ Windows 与 Linux 的二进制摘要不同：CI 用的是 Linux zip，固定为
 `4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c`，校验不符即失败。
 
 **停用旧进程**：本地验证全部通过后，只停止了 `minio.exe` 进程；其可执行文件与数据目录均保留未删。
+
+### RustFS 迁移后的 CI（同一提交连续两轮全绿）
+
+| 项 | 实际值 |
+|---|---|
+| SHA | `a5bd99105c71f07be171929772de3674f602d2a3` |
+| run | [`41015570298`](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41015570298) |
+| 第一轮 | `gh run watch --exit-status` = **0**，五 job 全 success |
+| 第二轮（`gh run rerun`） | `gh run watch --exit-status` = **0**，五 job 全 success |
+
+| job | 第一轮 | 第二轮 |
+|---|---|---|
+| api（lint + types + unit + postgres + http + migrations） | success | success |
+| **api-attachments（真实 PostgreSQL + 真实 RustFS）** | success | success |
+| web（lint + typecheck + build + markdown + unit + components） | success | success |
+| web-e2e（Chromium + 原生 API + 真实 PostgreSQL + RustFS） | success | success |
+| image（build + push to GHCR，`needs` 含 api-attachments） | success | success |
+
+CI 里 RustFS 的取用方式：下载官方 release 归档
+`rustfs-linux-x86_64-musl-v1.0.4.zip`，**先校验 SHA-256**
+`4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c`（不符即失败），
+解包后以 `server --address … --console-address …` 启动，再用 boto3 `create_bucket`（path-style）建桶。

@@ -1,6 +1,6 @@
 # Revnote
 
-Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 API；Joplin Server 协议仅是后续兼容适配器，非 Data API、非产品主路径。
+Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 API；Joplin Server 协议是**可选的兼容适配器**（Phase 6，默认关闭），不是 Data API、不是产品主路径。
 
 **当前为受控预览，不是公网生产部署。** Phase 4 已将 Web 接入 Phase 3 的认证与原生 HTTP push/pull/snapshot：本机持久化（IndexedDB）、会话轮换、冻结命令队列、离线可恢复、人工冲突处理与真实浏览器验收均已完成，验收证据见 [Phase 4 实际验收记录](docs/phase4-validation.md)。仍不提供完全离线冷启动、后台同步、附件、Joplin 桥与自动合并。API 可达不代表 Web 正文已保存；本地缓存不是备份。附件与完整部署不在本阶段范围内。
 
@@ -211,7 +211,21 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 
 - 已验证：**以 [Phase 5 实际验收记录](docs/phase5-validation.md) 各节的实际运行结果为准**；本文不复述任何未从该文件读到的数字或结论。该文件同时记录了已确认但尚未修复的缺陷（并发上传丢字节、E2E runner 存储生命周期未接线），阅读时须一并采信。**专项通过不等于整个阶段或发布已通过。**
 - 未验证：Docker 镜像在真实 Docker 主机上的可拉取与可运行性（本机无 Docker/daemon，无法验证，只能由 CI 运行结果证明）；公网部署（TLS、真实限流、备份恢复演练、生产反向代理）。
-- 未验证（附件 E2E）：`apps/web/e2e/attachments.spec.ts` 文件已存在，但 `apps/api/scripts/run_web_e2e.py` 未把 `OBJECT_STORAGE_*` 与 `ATTACHMENTS_ENABLED` 传给子进程，4 个附件 E2E 标签因此**没有真实浏览器证据**；详见验收记录 §B2。
+- 未验证（附件 E2E）：该条为 Phase 5 中段记录；Phase 5 收口前的修复已把 `S3_*` 与 `ATTACHMENTS_ENABLED` 注入 E2E 子进程（`run_web_e2e.py` 的 `ObjectStorage.child_values`/`export_to`），CI `web-e2e` 以真 RustFS 运行。Phase 6 复核未再改动该接线，证据见 [Phase 6 实际验收记录](docs/phase6-validation.md) §H。
+
+**Phase 6（Joplin Server 兼容桥）已实现**，范围与限制见 [桥说明](docs/phase6-joplin-bridge.md)，协议基线见 [Joplin 协议笔记](docs/joplin-protocol-notes.md)，范围决策见 [实施计划](docs/plan-phase6.md)：
+
+- 默认关闭：`JOPLIN_BRIDGE_ENABLED=false` 时兼容路由**不注册**，部署行为与 Phase 5 完全一致；开启后挂载 `/api/sessions`、`/api/items/root:/...`、`/api/locks`、`/api/batch_items`。
+- 身份：`POST /api/sessions` 用真实 `AuthService` 校验邮箱密码，随后**立即撤销**签发的原生 token 对；桥自己只保存随机会话 token 的 SHA-256。会话绑定登录时确定的唯一工作区。
+- 条目：笔记/文件夹按 Joplin item 文本格式读写，全部经 `SyncWriteService`（`seq`、ledger、CAS、tombstone 均沿用内核）；原生 UUID 仍是权威 id，`joplin_id_map` 只记录客户端自选 key 的映射。
+- Delta：把 `change_events` 压缩成 Joplin delta（create/update/delete 合并规则与上游一致），游标是原始 `seq`；非法游标返回 `400 resyncRequired`。
+- 锁：`sync` 可并存、`exclusive` 互斥，按客户端给出的 `<type>_<clientType>_<clientId>` 释放；锁表与 `change_events` 完全隔离。
+- 资源：`.resource/<key>` 走 Phase 5 附件状态机与 RustFS，**没有第二套存储**；仅接受既有 MIME 白名单。
+- `GET /api/v1/capabilities` 仅**加法**声明 `joplin_bridge {enabled, protocol_baseline, mount}`；原生 `/api/v1` 契约、错误封套与 Phase 5 附件接口不变。
+
+**Phase 6 明确不做**：Joplin Data API 作为产品基础、E2EE 服务端解密、分享、revision、附件删除（`.resource` 删除为已记录的 no-op）、自动三方合并、snapshot 分页、公网加固、参考 CLI、第二对象存储或 MinIO。
+
+验证以 [Phase 6 实际验收记录](docs/phase6-validation.md) 为准；该文件只写实际运行结果，未跑的小节会明确写「未运行」。
 
 ## Actions 与 GHCR
 

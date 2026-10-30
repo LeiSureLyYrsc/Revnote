@@ -4,7 +4,7 @@ Python3.12+、FastAPI、uv、SQLAlchemy2.x async、asyncpg、Alembic；只支持
 
 ## 范围
 
-- hello `/` 与进程存活 `/health` 不访问 PG/MinIO；业务端点位于 `/api/v1`。
+- hello `/` 与进程存活 `/health` 不访问 PG/the S3-compatible store；业务端点位于 `/api/v1`。
 - 认证提供注册/登录/轮换refresh/logout/me；默认关闭注册，密码8–256字符，Argon2id，不透明token，session绝对30d。
 - 原生同步push/pull/snapshot及tree/note只读API；无REST写包装，Web尚未接入。
 - 原六张内核表加auth_sessions/auth_access_tokens/auth_refresh_tokens/workspace_members，总计十张领域表。

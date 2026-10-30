@@ -19,7 +19,7 @@
 #   api-http         /api/v1 over an in-process ASGI client
 #   api-http-concurrency  real PostgreSQL + concurrent HTTP requests
 #   api-transport    a real TCP socket served by uvicorn (disconnect, RST)
-#   api-attachments  real PostgreSQL + real MinIO (its own job, below)
+#   api-attachments  real PostgreSQL + real RustFS (its own job, below)
 #
 # The first seven are produced and guarded by the `api` job. The eighth needs a
 # real object store, so it runs in `api-attachments` and is guarded there by
@@ -165,7 +165,7 @@ jobs:
 
       - name: Unit tests (must pass with no external service)
         # Proves create_app() boots and serves / with /health while PostgreSQL and
-        # MinIO are absent — the scaffold's core promise.
+        # RustFS are absent — the scaffold's core promise.
         run: uv run pytest apps/api/tests/unit -v --junitxml=api-unit.xml
 
       - name: PostgreSQL sequential behavior tests
@@ -183,7 +183,7 @@ jobs:
         # step is the deterministic, sequential tier.
         #
         # `attachments` is excluded because those cases carry the `api` marker
-        # too but need a real MinIO this job does not run. Selecting them here
+        # too but need a real RustFS this job does not run. Selecting them here
         # would not skip them: `GITHUB_ACTIONS` makes
         # `object_storage_is_required()` true, so a missing store is a hard
         # failure and this step would go red for a reason unrelated to the
@@ -218,7 +218,7 @@ jobs:
           # present in the report, or the group silently shrank.
           #
           # This table covers exactly the seven reports this job produces. The
-          # eighth group (api-attachments.xml) needs a real MinIO, is produced by
+          # eighth group (api-attachments.xml) needs a real RustFS, is produced by
           # the `api-attachments` job, and is pinned there by
           # `check_test_reports.py --group attachments`. Requiring it here would
           # ask this job for a file it never generates.
@@ -417,13 +417,13 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------------- #
-  # Attachments: real PostgreSQL + real MinIO, one case per load-bearing claim
+  # Attachments: real PostgreSQL + real RustFS, one case per load-bearing claim
   # of plan §7.1. Its own job because a fake store cannot satisfy these: the
   # digest is recomputed by re-reading the object, the single winner is decided
   # by a row lock plus a CAS predicate, and the GC case lists the real bucket.
   # ------------------------------------------------------------------------- #
   api-attachments:
-    name: api-attachments (real PostgreSQL + real MinIO)
+    name: api-attachments (real PostgreSQL + real RustFS)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -459,14 +459,15 @@ jobs:
       TEST_MIGRATION_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_attachments_ci_migrations
       REQUIRE_POSTGRES_TESTS: "1"
       REQUIRE_OBJECT_STORAGE_TESTS: "1"
-      # Read only by the MinIO start step, so the credential appears in one place.
-      MINIO_CI_ACCESS_KEY: revnote_minio_ci_only_user
-      MINIO_CI_SECRET_KEY: revnote_minio_ci_only_password
-      OBJECT_STORAGE_ENDPOINT: http://127.0.0.1:9000
-      OBJECT_STORAGE_BUCKET: revnote-attachments-ci
-      OBJECT_STORAGE_ACCESS_KEY: revnote_minio_ci_only_user
-      OBJECT_STORAGE_SECRET_KEY: revnote_minio_ci_only_password
-      OBJECT_STORAGE_SECURE: "false"
+      # Read only by the RustFS start step, so the credential appears in one place.
+      RUSTFS_CI_ACCESS_KEY: rustfs_ci_only_user
+      RUSTFS_CI_SECRET_KEY: revnote_store_ci_only_password
+      S3_ENDPOINT: http://127.0.0.1:9000
+      S3_BUCKET: revnote-attachments-ci
+      S3_ACCESS_KEY: rustfs_ci_only_user
+      S3_SECRET_KEY: revnote_store_ci_only_password
+      S3_SECURE: "false"
+      S3_REGION: us-east-1
       ATTACHMENTS_ENABLED: "true"
 
     steps:
@@ -487,31 +488,28 @@ jobs:
       - name: Sync workspace from the lock file
         run: uv sync --locked
 
-      - name: Start the pinned MinIO (official release binary)
-        # The official container images are no longer anonymously pullable: quay.io
-        # answers 401 for every tag and Docker Hub no longer hosts `minio/minio`, so a
-        # `services: minio` block fails the job before a single step runs. `dl.min.io`
-        # is 410 Gone as well. MinIO still publishes this exact release on its own
-        # GitHub releases, so the Linux amd64 binary is fetched from there and verified
-        # against the hash published beside it - same release, same provenance,
-        # different official channel. Not a rebuild, not a different S3 product.
+      - name: Start the pinned RustFS (official release archive)
+        # The S3-compatible store is RustFS, pinned by release and verified by digest
+        # before anything runs: an archive that does not match is a hard failure, not a
+        # warning. RustFS refuses to start without an explicit console address, so both
+        # listeners are bound here.
         env:
-          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
-          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+          RUSTFS_VERSION: "1.0.4"
+          RUSTFS_SHA256: 4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c
         run: |
           set -euo pipefail
-          asset="minio.linux-amd64.${MINIO_RELEASE}"
-          curl -fsSL --retry 3 -o /tmp/minio \
-            "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/${asset}"
-          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum -c -
-          chmod +x /tmp/minio
-          mkdir -p /tmp/minio-data
+          curl -fsSL --retry 3 -o /tmp/rustfs.zip \
+            "https://github.com/rustfs/rustfs/releases/download/${RUSTFS_VERSION}/rustfs-linux-x86_64-musl-v${RUSTFS_VERSION}.zip"
+          echo "${RUSTFS_SHA256}  /tmp/rustfs.zip" | sha256sum -c -
+          mkdir -p /tmp/rustfs /tmp/rustfs-data
+          unzip -q -o /tmp/rustfs.zip -d /tmp/rustfs
+          chmod +x /tmp/rustfs/rustfs
           # A background process outlives its step on a GitHub runner, which is why the
           # server is started here and polled in the next step rather than in one block.
-          MINIO_ROOT_USER="${MINIO_CI_ACCESS_KEY}" \
-          MINIO_ROOT_PASSWORD="${MINIO_CI_SECRET_KEY}" \
-            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
-              --console-address 127.0.0.1:0 > /tmp/minio.log 2>&1 &
+          RUSTFS_ACCESS_KEY="${RUSTFS_CI_ACCESS_KEY}" \
+          RUSTFS_SECRET_KEY="${RUSTFS_CI_SECRET_KEY}" \
+            nohup /tmp/rustfs/rustfs server --address 127.0.0.1:9000 \
+              --console-address 127.0.0.1:9001 /tmp/rustfs-data > /tmp/rustfs.log 2>&1 &
       - name: Wait for object storage and create the bucket
         # The project's own code, not a poller image and not `mc`: readiness is
         # `probe_store` (list_buckets) which answers "the store is reachable and
@@ -546,7 +544,7 @@ jobs:
           print(f"bucket ready: {ensure_bucket(store)}")
           PY
 
-      - name: Attachment HTTP behaviour (real PostgreSQL + real MinIO)
+      - name: Attachment HTTP behaviour (real PostgreSQL + real RustFS)
         # upload/download byte identity, the re-read digest, immutability once
         # ready, one winner for two concurrent uploads, the refusal planes, the
         # non-member 404 collapse, and the GC that lists the real bucket.
@@ -698,14 +696,14 @@ jobs:
       WEB_E2E_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_web_e2e_ci
       REQUIRE_POSTGRES_TESTS: "1"
       # External mode: the runner creates its own per-run bucket in this store and
-      # passes the values to its children, instead of trying to own a MinIO process
+      # passes the values to its children, instead of trying to own a RustFS process
       # (owned mode pins the Windows binary, which cannot exist on a Linux runner).
-      WEB_E2E_MINIO_ENDPOINT: http://127.0.0.1:9000
-      WEB_E2E_MINIO_ACCESS_KEY: revnote_minio_ci_only_user
-      WEB_E2E_MINIO_SECRET_KEY: revnote_minio_ci_only_password
+      WEB_E2E_S3_ENDPOINT: http://127.0.0.1:9000
+      WEB_E2E_S3_ACCESS_KEY: rustfs_ci_only_user
+      WEB_E2E_S3_SECRET_KEY: revnote_store_ci_only_password
       REQUIRE_OBJECT_STORAGE_TESTS: "1"
-      MINIO_CI_ACCESS_KEY: revnote_minio_ci_only_user
-      MINIO_CI_SECRET_KEY: revnote_minio_ci_only_password
+      RUSTFS_CI_ACCESS_KEY: rustfs_ci_only_user
+      RUSTFS_CI_SECRET_KEY: revnote_store_ci_only_password
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -717,31 +715,28 @@ jobs:
           enable-cache: true
       - name: Sync Python workspace
         run: uv sync --locked
-      - name: Start the pinned MinIO (official release binary)
-        # The official container images are no longer anonymously pullable: quay.io
-        # answers 401 for every tag and Docker Hub no longer hosts `minio/minio`, so a
-        # `services: minio` block fails the job before a single step runs. `dl.min.io`
-        # is 410 Gone as well. MinIO still publishes this exact release on its own
-        # GitHub releases, so the Linux amd64 binary is fetched from there and verified
-        # against the hash published beside it - same release, same provenance,
-        # different official channel. Not a rebuild, not a different S3 product.
+      - name: Start the pinned RustFS (official release archive)
+        # The S3-compatible store is RustFS, pinned by release and verified by digest
+        # before anything runs: an archive that does not match is a hard failure, not a
+        # warning. RustFS refuses to start without an explicit console address, so both
+        # listeners are bound here.
         env:
-          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
-          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+          RUSTFS_VERSION: "1.0.4"
+          RUSTFS_SHA256: 4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c
         run: |
           set -euo pipefail
-          asset="minio.linux-amd64.${MINIO_RELEASE}"
-          curl -fsSL --retry 3 -o /tmp/minio \
-            "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/${asset}"
-          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum -c -
-          chmod +x /tmp/minio
-          mkdir -p /tmp/minio-data
+          curl -fsSL --retry 3 -o /tmp/rustfs.zip \
+            "https://github.com/rustfs/rustfs/releases/download/${RUSTFS_VERSION}/rustfs-linux-x86_64-musl-v${RUSTFS_VERSION}.zip"
+          echo "${RUSTFS_SHA256}  /tmp/rustfs.zip" | sha256sum -c -
+          mkdir -p /tmp/rustfs /tmp/rustfs-data
+          unzip -q -o /tmp/rustfs.zip -d /tmp/rustfs
+          chmod +x /tmp/rustfs/rustfs
           # A background process outlives its step on a GitHub runner, which is why the
           # server is started here and polled in the next step rather than in one block.
-          MINIO_ROOT_USER="${MINIO_CI_ACCESS_KEY}" \
-          MINIO_ROOT_PASSWORD="${MINIO_CI_SECRET_KEY}" \
-            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
-              --console-address 127.0.0.1:0 > /tmp/minio.log 2>&1 &
+          RUSTFS_ACCESS_KEY="${RUSTFS_CI_ACCESS_KEY}" \
+          RUSTFS_SECRET_KEY="${RUSTFS_CI_SECRET_KEY}" \
+            nohup /tmp/rustfs/rustfs server --address 127.0.0.1:9000 \
+              --console-address 127.0.0.1:9001 /tmp/rustfs-data > /tmp/rustfs.log 2>&1 &
       - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:

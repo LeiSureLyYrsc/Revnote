@@ -1,5 +1,11 @@
 # Revnote 脚手架实施计划
 
+> **历史记录 / historical record.** 本文撰写时的 S3 后端为 MinIO。Phase 5 已迁移到
+> **RustFS 1.0.4**（官方 GitHub release，固定版本与 SHA-256），原因是 MinIO 官方镜像已下架
+> （registry 401 / Hub 404 / 下载站 410，实测见 `docs/phase5-validation.md`）。
+> 本文正文保留当时原样，未做改写。
+
+
 > 本计划经会话确认后进入 Build；文中的任务清单是实施范围，不代表验收已通过。实际启动方法和验证限制见根 README。
 >
 > 依据：已确认的会话需求、`docs/consensus-brief.md`、`docs/stack-blueprint.md`。本地任务提示文件不随仓库发布。

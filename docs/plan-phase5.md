@@ -1,5 +1,11 @@
 # Revnote Phase 5 实施计划
 
+> **历史记录 / historical record.** 本文撰写时的 S3 后端为 MinIO。Phase 5 已迁移到
+> **RustFS 1.0.4**（官方 GitHub release，固定版本与 SHA-256），原因是 MinIO 官方镜像已下架
+> （registry 401 / Hub 404 / 下载站 410，实测见 `docs/phase5-validation.md`）。
+> 本文正文保留当时原样，未做改写。
+
+
 > **用户已批准 D1–D19 推荐方案。**
 >
 > 状态：Plan 输出（未改代码、未提交、未推送）。Build 期基线以实际 `4abdcb0` 为准（起草时为 `3509b7c`）。

@@ -513,7 +513,7 @@ that is still open, and it is listed here because a reader of this protocol need
   benign — which is why the existing concurrency check passed. With **differing** payloads the loser can
   remove the object the winning row names, leaving a `ready` row with a digest and no bytes: every later
   `GET …/content` answers `503` with `details.reason = "object_missing"`. This was reproduced against real
-  PostgreSQL and real MinIO — see [`phase5-validation.md`](phase5-validation.md) §B1, where 11 of 12 rounds
+  PostgreSQL and a real S3-compatible store — see [`phase5-validation.md`](phase5-validation.md) §B1, where 11 of 12 rounds
   lost the bytes. A per-attempt nonce, or a cleanup scoped to the losing attempt's own bytes, is the fix;
   **neither is implemented here**, so concurrent uploads to one attachment must be treated as unsafe until
   it is.

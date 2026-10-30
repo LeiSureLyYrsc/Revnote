@@ -1,6 +1,9 @@
 ﻿# Phase 5 实际验收记录
 
-本文件仅记录实际运行结果。Phase 5 尚在实施，以下专项通过不代表完整阶段或发布已通过。
+本文件仅记录实际运行结果。
+
+> **关于 MinIO 的名称**：本文件中出现的 MinIO 是**历史实测记录**的一部分——正是那些 401/404/410 的实测结果促成了向 RustFS 的迁移。Phase 5 交付的代码、配置与 CI 已不含 MinIO，迁移过程与根因见下文「RustFS 迁移」一节。
+Phase 5 尚在实施，以下专项通过不代表完整阶段或发布已通过。
 
 ## 基线与约束
 
@@ -510,3 +513,40 @@ E2E 的 4 个附件标签（`attachment_upload_insert`、`attachment_cross_clien
 `attachment_authorization`、`attachment_offline_gate`）在**真实浏览器 + 真实 MinIO** 下全部通过；
 规格文件 `apps/web/e2e/attachments.spec.ts` 共 4 个 `test(...)`，全仓 spec 标题总数正好 **20**，
 `report-guard` 的自检因此自然转绿（未放宽任何断言）。
+
+## RustFS 迁移（本轮新增，用户决定）
+
+**决定**：S3 后端由 MinIO 全面换成 **RustFS 1.0.4**（Apache-2.0，官方 GitHub release，版本与 SHA-256 固定）。
+
+**根因（实测，非推断）**：MinIO 官方镜像已不可得——`quay.io/minio/minio` 对**所有**标签返回 401
+（含 2024 年旧标签与 `latest`），Docker Hub 已不再托管 `minio/minio`（仓库 API 404），
+`dl.min.io` 返回 410 Gone。
+
+**客户端保持通用 S3**：适配器由 `minio` SDK 改为 **boto3**，`addressing_style=path`、
+`signature_version=s3v4`、`retries.max_attempts=0`（失败由本项目分类，不让 SDK 静默重试）。
+依赖侧移除 `minio`（含 `pycryptodome`），加入 `boto3`。
+
+**变量命名**：`OBJECT_STORAGE_*` → `S3_*`；服务端凭据为 `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`；
+`REQUIRE_OBJECT_STORAGE_TESTS` 保持不变（已是通用名）。
+
+### 本地全门（真实本地 RustFS 1.0.4 + 真实临时 PostgreSQL）
+
+| 检查 | 实际结果 |
+|---|---|
+| `pytest apps/api/tests -q` | **1508 passed, 0 failed, 0 skipped** |
+| `pytest apps/api/tests/api -m attachments -q` | **24 passed** |
+| `ruff check` / `ruff format --check` | All checks passed / 136 files formatted |
+| `ty check`（CI 同一路径集 + `--extra-search-path apps/api/tests`） | **All checks passed** |
+| `pnpm lint:web` / `typecheck:web` / `test:web` / `build:web` | 0 / 0 / **0（213 cases）** / 0 |
+| `pnpm test:e2e`（全量 20 标签） | **通过**，`Web E2E full: passed; browser report guarded` |
+| `pnpm check:web-reports` | **0**：`vitest/full: 213 passed` / **`playwright/full: 20 passed; zero skips, retries or errors`** |
+
+本地 RustFS 启动方式（实测）：`rustfs server --address 127.0.0.1:19310 --console-address 127.0.0.1:19311 <data-dir>`，
+`RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` 每次随机生成、只经环境变量传递；**console 地址必须显式给出**，
+否则拒绝启动。数据目录 `D:\tmp\rustfs-data`。二进制 `D:\tools\rustfs\rustfs.exe`（v1.0.4，
+SHA-256 `3396617ec60905e72fb70fd99a0b2395e425edf495eb6499edbde6a5fa97d899`），**未下载任何新二进制**。
+
+Windows 与 Linux 的二进制摘要不同：CI 用的是 Linux zip，固定为
+`4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c`，校验不符即失败。
+
+**停用旧进程**：本地验证全部通过后，只停止了 `minio.exe` 进程；其可执行文件与数据目录均保留未删。

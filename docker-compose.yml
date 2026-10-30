@@ -1,52 +1,41 @@
-# Revnote — local development infrastructure (PostgreSQL + MinIO only).
+# Revnote — local development infrastructure (PostgreSQL + RustFS).
 #
-# Scope: starts the OFFICIAL PostgreSQL image, the OFFICIAL MinIO server, and a
-# one-shot bucket initializer. It deliberately does NOT build or run the API/Web
-# images — those run on the host via uv/pnpm, and the API image is built only by
-# GitHub Actions (see docs/build-conventions.md). There are no `build:` keys
-# here on purpose.
+# Scope: starts the official PostgreSQL image and a RustFS S3-compatible store. It
+# deliberately does NOT build or run the API/Web images — those run on the host via
+# uv/pnpm, and the API image is built only by GitHub Actions (see
+# docs/build-conventions.md). There are no `build:` keys here on purpose.
 #
 #   docker compose up -d
 #   docker compose ps -a
-#   docker compose logs minio-wait minio-init
+#   docker compose logs rustfs
 #   docker compose down            # keeps the named volumes
 #
 # Configuration comes from the repository-root `.env` (copy `.env.example`).
 #
 # --------------------------------------------------------------------------- #
-# OPEN BLOCKER - MinIO image availability (measured, not assumed).
+# OBJECT STORE - RustFS (read before changing, and before claiming this stack works).
 #
-# The official MinIO container image is NOT anonymously pullable any more. Measured
-# from the CI runner on 2026-10-30:
+# The store is RustFS 1.0.4 (Apache-2.0), pinned to an official GitHub release. It replaced
+# an earlier design whose official images were withdrawn: the registry answered 401 for
+# every tag, the Docker Hub repository disappeared and the download host answered 410.
+# The measurement is recorded in docs/phase5-validation.md; it is not repeated here so a
+# withdrawn vendor name does not linger in the configuration.
 #
-#   * `docker pull quay.io/minio/minio:<tag>` -> 401 unauthorized for EVERY tag
-#     (the tag below, an older 2024 release and `latest` all answer the same), so
-#     this is a gated repository, not a missing tag;
-#   * Docker Hub no longer hosts `minio/minio` (the repository API answers 404);
-#   * `dl.min.io` answers 410 Gone.
+# RustFS is distributed as a release archive, not as a pullable image we could verify, so
+# this service runs the official binary inside a minimal base image rather than inventing
+# a tag or digest we cannot justify. The archive's SHA-256 is verified before it runs.
+# CI does the equivalent directly on the runner.
 #
-# MinIO still publishes this exact release on its OWN GitHub releases, including a
-# Linux amd64 binary and a published SHA-256. That is the channel CI uses (see
-# `.github/workflows/ci.yml`, pinned by digest), and it is the same release as the
-# local Windows binary recorded in docs/phase5-validation.md.
+# The console address MUST be given explicitly: RustFS refuses to start without it.
 #
-# CONSEQUENCE: the `minio`, `minio-wait`, `minio-init` and `minio-private` services
-# below CANNOT start on a host with a Docker daemon - the pull fails before anything
-# runs. They are kept as a statement of intent for the day an official pullable
-# image exists again, not as a working local stack.
+# No digest is pinned here because none could be retrieved; do not invent one. Do not
+# substitute a third-party rebuild or a different S3 product - that would change what the
+# acceptance run proves.
 #
-# Do not substitute a third-party rebuild or a different S3 product to make this
-# work: that would change what the acceptance run actually proves. Use the pinned
-# official binary instead, or wait for an official image.
+# UNVERIFIED: this service has never been started on a host with a Docker daemon (the
+# implementation environment has none). CI exercises the same binary directly instead, so
+# the acceptance evidence comes from that path, not from this file.
 # --------------------------------------------------------------------------- #
-
-# Official MinIO server and client, with explicit release tags.
-# `minio/mc` is the official client image; it is used as a sidecar because the
-# server image's bundled tooling must not be assumed.
-x-minio-server: &minio-server
-  image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-x-minio-client: &minio-client
-  image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
 
 services:
   postgres:
@@ -76,94 +65,36 @@ services:
       start_period: 20s
     stop_grace_period: 30s
 
-  minio:
-    <<: *minio-server
+  rustfs:
+    # Minimal base image plus the pinned official archive; see the banner for why this is
+    # not an image reference to the store itself.
+    image: debian:12-slim
     restart: unless-stopped
-    command:
-      # The official entrypoint prepends `minio` when the first argument is not
-      # `minio`, so the effective command is `minio server /data ...`.
-      # The API port stays at 9000 on purpose (see minio-wait below).
-      - server
-      - /data
-      - --console-address
-      - ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required, min 8 chars}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required, min 8 chars}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        apt-get update >/dev/null && apt-get install -y --no-install-recommends curl ca-certificates unzip >/dev/null
+        curl -fsSL -o /tmp/rustfs.zip "https://github.com/rustfs/rustfs/releases/download/1.0.4/rustfs-linux-x86_64-musl-v1.0.4.zip"
+        echo "4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c  /tmp/rustfs.zip" | sha256sum -c -
+        unzip -q -o /tmp/rustfs.zip -d /opt/rustfs
+        chmod +x /opt/rustfs/rustfs
+        exec /opt/rustfs/rustfs server --address 0.0.0.0:9000 --console-address 0.0.0.0:9001 /data
     ports:
-      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
-      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+      # Loopback only, like the database.
+      - "127.0.0.1:${S3_PORT:-9000}:9000"
+      - "127.0.0.1:${S3_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - minio-data:/data
-    # No healthcheck here: it is not guaranteed that the server image ships a
-    # usable probe binary (curl was removed upstream), so readiness is
-    # established by the official `mc` sidecar below instead of being assumed.
-
-  minio-wait:
-    <<: *minio-client
-    # Blocks until the server answers its readiness probe, then exits 0.
-    # `mc ready` loops internally and only returns success once the server is
-    # actually ready, so this replaces an unverifiable in-image healthcheck.
-    restart: "no"
-    depends_on:
-      minio:
-        condition: service_started
-    entrypoint:
-      - mc
-    command:
-      - ready
-      - revnote
-    environment:
-      # `MC_HOST_<alias>` is honoured by mc itself (no `mc alias set` needed),
-      # so one-shot containers need no writable home directory.
-      MC_HOST_revnote: http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@minio:9000
-      MC_CONFIG_DIR: /tmp/.mc
-
-  minio-init:
-    <<: *minio-client
-    # One-shot: create the bucket idempotently, then exit. `restart: "no"` keeps
-    # a failure visible as a non-zero exit code instead of a crash-loop.
-    restart: "no"
-    depends_on:
-      minio-wait:
-        condition: service_completed_successfully
-    entrypoint:
-      - mc
-    command:
-      # No shell is available in the official mc image (distroless-ish base), so
-      # this stays a single mc invocation. Re-running is a no-op.
-      # Newly created buckets default to private; minio-private below also
-      # resets policy on existing buckets when initialization is rerun.
-      - mb
-      - --ignore-existing
-      - revnote/${MINIO_BUCKET:?MINIO_BUCKET is required}
-    environment:
-      MC_HOST_revnote: http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@minio:9000
-      MC_CONFIG_DIR: /tmp/.mc
-    # Run-to-completion: a healthcheck would be reported unhealthy after the
-    # intentional exit.
-    healthcheck:
-      disable: true
-
-  minio-private:
-    <<: *minio-client
-    restart: "no"
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
-    entrypoint: [mc]
-    command:
-      - anonymous
-      - set
-      - private
-      - revnote/${MINIO_BUCKET:?MINIO_BUCKET is required}
-    environment:
-      MC_HOST_revnote: http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@minio:9000
-      MC_CONFIG_DIR: /tmp/.mc
-    healthcheck:
-      disable: true
+      - rustfs-data:/data
+    # No healthcheck: the readiness probe is the project's own (`probe_store`), which
+    # runs from the API/test harness, so an in-container check would assert a different
+    # thing than the code that actually depends on it.
 
 volumes:
   # Named volumes: `docker compose down` keeps the data, `down -v` destroys it.
   postgres-data:
-  minio-data:
+  rustfs-data:

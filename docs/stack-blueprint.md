@@ -1,5 +1,11 @@
 # Stack Blueprint — FastAPI + SQLAlchemy Async Sync Kernel
 
+> **历史记录 / historical record.** 本文撰写时的 S3 后端为 MinIO。Phase 5 已迁移到
+> **RustFS 1.0.4**（官方 GitHub release，固定版本与 SHA-256），原因是 MinIO 官方镜像已下架
+> （registry 401 / Hub 404 / 下载站 410，实测见 `docs/phase5-validation.md`）。
+> 本文正文保留当时原样，未做改写。
+
+
 **Locked stack:** Python 3.12 · FastAPI · uv · SQLAlchemy 2.x async · PostgreSQL first (SQLite/MySQL reserved) · MinIO attachments.  
 **Architecture rule:** sync **kernel** owns correctness; Joplin Server protocol lives only in `adapters/joplin/`.  
 **Baseline compatibility:** Joplin client v3.7.x via adapter (see `joplin-protocol-notes.md`).

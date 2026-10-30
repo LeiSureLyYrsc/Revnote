@@ -4,11 +4,11 @@ Sync Kernel 优先的自有笔记同步服务。自有 Web 客户端走原生 AP
 
 **当前为受控预览，不是公网生产部署。** Phase 4 已将 Web 接入 Phase 3 的认证与原生 HTTP push/pull/snapshot：本机持久化（IndexedDB）、会话轮换、冻结命令队列、离线可恢复、人工冲突处理与真实浏览器验收均已完成，验收证据见 [Phase 4 实际验收记录](docs/phase4-validation.md)。仍不提供完全离线冷启动、后台同步、附件、Joplin 桥与自动合并。API 可达不代表 Web 正文已保存；本地缓存不是备份。附件与完整部署不在本阶段范围内。
 
-当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/MinIO 的镜像拉取与运行也尚未完成验收，详见下文限制。
+当前尚未选定项目许可证；公开源码不等于已授予开源许可。Compose/the S3-compatible store 的镜像拉取与运行也尚未完成验收，详见下文限制。
 
 ## 技术栈与目录
 
-Python 3.12+、FastAPI、uv、SQLAlchemy 2.x async、asyncpg、Alembic；仅 PostgreSQL。附件存储方向固定为 MinIO。
+Python 3.12+、FastAPI、uv、SQLAlchemy 2.x async、asyncpg、Alembic；仅 PostgreSQL。附件存储方向固定为 the S3-compatible store。
 
 Web：Vite、React 19、TypeScript、TanStack Router/Query、Tailwind CSS v4、TipTap。
 
@@ -23,7 +23,7 @@ docs/plan-phase4.md        已批准的 Web 持久化、会话、同步与浏览
 docs/phase4-validation.md  Phase 4 实际运行与发布证据
 docs/build-conventions.md Build补充约定
 .github/workflows/        检查与Actions→GHCR
-docker-compose.yml        官方PostgreSQL、MinIO、一次性私有建桶
+docker-compose.yml        官方PostgreSQL、the S3-compatible store、一次性私有建桶
 pyproject.toml / uv.lock   根Python workspace与唯一锁文件
 pnpm-workspace.yaml       Web workspace，根pnpm锁文件
 ```
@@ -53,19 +53,19 @@ pnpm install --frozen-lockfile
 
 已存在 `.env` 时不要覆盖；示例凭据仅供本机开发。修改 PG 凭据时同步调整 `DATABASE_URL`，密码包含特殊字符时需 URL 编码。
 
-`.env` 不提交。API、迁移通过 `--env-file .env` 显式加载；Vite 从根目录读取配置。只有 `VITE_` 前缀值可公开，数据库和 MinIO 凭据严禁加该前缀。
+`.env` 不提交。API、迁移通过 `--env-file .env` 显式加载；Vite 从根目录读取配置。只有 `VITE_` 前缀值可公开，数据库和 the S3-compatible store 凭据严禁加该前缀。
 
-### 启动 PostgreSQL 与 MinIO
+### 启动 PostgreSQL 与 the S3-compatible store
 
 ```powershell
 docker compose up -d
 docker compose ps -a
-docker compose logs minio-wait minio-init minio-private
+docker compose logs object store-wait object store-init object store-private
 ```
 
-预期：PostgreSQL 健康；`minio-wait` 就绪探测、`minio-init` 建桶、`minio-private` 私有策略设置均正常退出且退出码为 0。MinIO 服务本身不假定镜像内有探测工具，由官方 mc sidecar 检查就绪。若初始化失败，查看日志，不要把服务退出直接当成功。**MinIO 镜像尚未拉取验收，可能阻止整栈启动；可先用 `docker compose up -d postgres` 单独启动数据库。**
+预期：PostgreSQL 健康；`object store-wait` 就绪探测、`object store-init` 建桶、`object store-private` 私有策略设置均正常退出且退出码为 0。the S3-compatible store 服务本身不假定镜像内有探测工具，由官方 mc sidecar 检查就绪。若初始化失败，查看日志，不要把服务退出直接当成功。**the S3-compatible store 镜像尚未拉取验收，可能阻止整栈启动；可先用 `docker compose up -d postgres` 单独启动数据库。**
 
-默认本机端口：PG `5432`、MinIO API `9000`、MinIO Console `9001`。bucket 私有，不开放匿名访问。宿主机 API 默认使用 `127.0.0.1`；未来若容器化运行，内部地址与浏览器公开地址必须分开配置。
+默认本机端口：PG `5432`、the S3-compatible store API `9000`、the S3-compatible store Console `9001`。bucket 私有，不开放匿名访问。宿主机 API 默认使用 `127.0.0.1`；未来若容器化运行，内部地址与浏览器公开地址必须分开配置。
 
 ### 执行迁移
 
@@ -94,7 +94,7 @@ pnpm --filter @revnote/web dev --host 127.0.0.1
 
 Web 请求 `/api/health` 时，Vite **仅精确将该路径**转发至 API `/health`；业务 `/api/v1/...` 保留完整前缀原样转发。`API_PROXY_TARGET` 只由开发服务器读取；默认目标为 `http://127.0.0.1:8000`。不使用通配 CORS。生产静态构建不包含 Vite 代理，部署仍需同源反向代理。
 
-`/health` 只证明进程存活，**不检查 PG 或 MinIO**。依赖未启动仍可体验空编辑器，但迁移和数据库测试需要真实 PG。
+`/health` 只证明进程存活，**不检查 PG 或 the S3-compatible store**。依赖未启动仍可体验空编辑器，但迁移和数据库测试需要真实 PG。
 
 ## 检查与验收
 
@@ -176,8 +176,8 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 - 并发提交 `0473b17` 前，45 项真实 PostgreSQL 并发/原子性测试通过；完整 `pytest apps/api/tests -v` 为 **476 passed、0 skipped**（205.58s）。覆盖 8×20 连续 seq、同 op 并发重放、CAS 单赢家、事务故障回滚、末尾 ledger 真实冲突兜底、三连接提交/回滚可见性及提交确认丢失恢复。单独并发组耗时 51.56s，这些测试耗时不是生产吞吐指标。
 - 最终 CI 的三组 no-skip/必需用例守卫已用该次真实 JUnit 报告验证：普通 PG 121 项、并发/原子性 45 项、迁移 29 项，均无 skip/failure/error；Actions 结果以推送后的实际运行记录为准。
 - Web 构建通过，但编辑器入口约 859 kB（gzip 约 271 kB），仍有 chunk 大小警告；暂不为脚手架引入拆包优化工程。
-- 本机未检测到 Docker CLI/运行时。本地 PostgreSQL 验证使用仓库外临时实例和两个独立可丢弃库，不使用 SQLite；这**不证明 Compose 或 MinIO 可运行**。本次验收的临时实例已停止。
-- Compose 官方镜像在当前环境未完成拉取与运行验证；若官方 MinIO 分发源不可用，应停止并确认来源，不切换第三方镜像或其他 S3 产品。
+- 本机未检测到 Docker CLI/运行时。本地 PostgreSQL 验证使用仓库外临时实例和两个独立可丢弃库，不使用 SQLite；这**不证明 Compose 或 the S3-compatible store 可运行**。本次验收的临时实例已停止。
+- Compose 官方镜像在当前环境未完成拉取与运行验证；若官方 the S3-compatible store 分发源不可用，应停止并确认来源，不切换第三方镜像或其他 S3 产品。
 - GitHub 仓库为 [LeiSureLyYrsc/Revnote](https://github.com/LeiSureLyYrsc/Revnote)。Actions、API 镜像构建和 GHCR 发布状态以实际运行记录为准，文件已生成不代表已验收。
 
 **Phase 5（附件）已实现**，协议细节见 [附件 API 附录](docs/phase5-attachments-api.md)，范围与决策见 [实施计划](docs/plan-phase5.md)：
@@ -241,7 +241,7 @@ gh run view <run-id> --log-failed
 - `docker` 不存在/daemon 未启动：先安装并启动 Docker，再验收基础设施；不影响无 DB 的 hello/health 与编辑器演示。
 - API 请求失败：检查 API 终端、8000 端口和 `API_PROXY_TARGET`；修改 Vite 环境配置后重启 Web。
 - DB 连接失败：检查 PG 健康、端口、URL 与卷中原有凭据；修改 `.env` 不会自动重置已有 PG 数据卷的密码。
-- MinIO 初始化失败：检查 `minio-wait`、`minio-init`、`minio-private` 日志、凭据、bucket 名称及固定官方镜像版本是否可获取；凭据放入 `MC_HOST_` URL 时，特殊字符需要 URL 编码。
+- the S3-compatible store 初始化失败：检查 `object store-wait`、`object store-init`、`object store-private` 日志、凭据、bucket 名称及固定官方镜像版本是否可获取；凭据放入 `MC_HOST_` URL 时，特殊字符需要 URL 编码。
 - 生产构建后的静态文件没有 Vite 代理；生产同源反向代理另行规划。
 
 ## 内核边界
@@ -252,4 +252,4 @@ Phase 2 只做工作区锁分配 seq、对象/事件/成功账本同事务、DB 
 
 Kernel 内 seq/rev 保持整数，对外 JSON 使用十进制字符串。`min_retained_seq` 默认1，不推进、不清理；过期条件since<min_retained_seq-1。延迟event FK和ledger限制未来事件清理，清理策略必须协调引用与幂等窗口。写入顺序及取消/超时语义见 [内核补充](docs/phase2-sync-kernel-spec.md)。不shield业务COMMIT，提交期间取消或确认丢失不能当作回滚，应同op_id+payload重试确认；可疑连接invalidate。
 
-本阶段不实现：独立服务端 Outbox、自动三方合并、自动上传冲突副本、MinIO 附件、搜索、E2EE、Joplin 桥、snapshot 分页与 PWA。预签名 PUT 不天然防覆盖，HEAD/ETag 不等于 SHA-256；这些后续另行设计，不扩入本阶段。
+本阶段不实现：独立服务端 Outbox、自动三方合并、自动上传冲突副本、the S3-compatible store 附件、搜索、E2EE、Joplin 桥、snapshot 分页与 PWA。预签名 PUT 不天然防覆盖，HEAD/ETag 不等于 SHA-256；这些后续另行设计，不扩入本阶段。

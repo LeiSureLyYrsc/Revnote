@@ -1,5 +1,11 @@
 # Revnote 补充约定（Build 必须遵守；与 Plan 冲突时以此为准）
 
+> **历史记录 / historical record.** 本文撰写时的 S3 后端为 MinIO。Phase 5 已迁移到
+> **RustFS 1.0.4**（官方 GitHub release，固定版本与 SHA-256），原因是 MinIO 官方镜像已下架
+> （registry 401 / Hub 404 / 下载站 410，实测见 `docs/phase5-validation.md`）。
+> 本文正文保留当时原样，未做改写。
+
+
 ## Docker / GHCR
 - **本地禁止**对本仓做 `docker build` / `docker compose build`。
 - 镜像只经 **GitHub Actions** 构建并推 **GHCR**（`ghcr.io/<owner>/revnote-api` 等）。

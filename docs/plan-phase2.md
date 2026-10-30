@@ -1,5 +1,11 @@
 # Phase 2 实施计划：Sync Kernel 最小核心（已确认）
 
+> **历史记录 / historical record.** 本文撰写时的 S3 后端为 MinIO。Phase 5 已迁移到
+> **RustFS 1.0.4**（官方 GitHub release，固定版本与 SHA-256），原因是 MinIO 官方镜像已下架
+> （registry 401 / Hub 404 / 下载站 410，实测见 `docs/phase5-validation.md`）。
+> 本文正文保留当时原样，未做改写。
+
+
 本计划在会话中经用户确认进入 Build。它与本次 Phase 2 规格优先于上一阶段“不能建业务表、不能实现内核”的限制；本地禁止构建镜像、不改 Clash、只用 PostgreSQL 等约定继续生效。原始任务要求保留于 `phase2-sync-kernel-spec.md`，其中 Plan 模式措辞是历史上下文，不阻止此次已授权实施。
 
 ## 1. 范围与验收

@@ -42,9 +42,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Manifests only, so the dependency layer stays cached when app code changes.
-# `apps/api` must exist because it is a declared workspace member.
+# Every declared workspace member must have its `pyproject.toml` present: uv
+# resolves the whole workspace from the single root lock file, even when only
+# the API member is later installed.
 COPY pyproject.toml uv.lock .python-version /app/
 COPY apps/api/pyproject.toml /app/apps/api/pyproject.toml
+COPY apps/cli/pyproject.toml /app/apps/cli/pyproject.toml
 
 # Third-party runtime dependencies only:
 #   --locked                fail if uv.lock disagrees with pyproject.toml
@@ -63,7 +66,10 @@ COPY apps/api/alembic.ini /app/apps/api/alembic.ini
 COPY apps/api/migrations /app/apps/api/migrations
 COPY apps/api/README.md /app/apps/api/README.md
 
-RUN uv sync --locked --no-dev --no-editable
+# `--package revnote-api` selects the API member alone. Without it, this sync
+# would install every workspace member, including the Phase 8 reference CLI -
+# which is not part of the API image and whose sources are deliberately absent.
+RUN uv sync --locked --no-dev --no-editable --package revnote-api
 
 # Build-time sanity checks — a broken import must fail the build, not the deploy:
 #   1. the factory is importable and callable;

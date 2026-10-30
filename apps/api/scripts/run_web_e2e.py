@@ -8,14 +8,14 @@ child output, URLs, credentials and assertion bodies. See apps/web/e2e/README.md
 Object storage has exactly two modes, and neither one is a fake:
 
 ``owned``
-    No ``WEB_E2E_MINIO_ENDPOINT`` in the environment. The runner verifies the
-    pinned binary (``D:\\tools\\minio.exe``, SHA-256 below) and starts **its own**
+    No ``WEB_E2E_S3_ENDPOINT`` in the environment. The runner verifies the
+    pinned binary (``D:\\tools\\object store.exe``, SHA-256 below) and starts **its own**
     child on a reserved loopback port with a throwaway data directory and
     per-run credentials, then polls readiness through the project's own adapter.
 
 ``external``
-    ``WEB_E2E_MINIO_ENDPOINT`` is set. That address, plus
-    ``WEB_E2E_MINIO_ACCESS_KEY``/``WEB_E2E_MINIO_SECRET_KEY``, describes a store
+    ``WEB_E2E_S3_ENDPOINT`` is set. That address, plus
+    ``WEB_E2E_S3_ACCESS_KEY``/``WEB_E2E_S3_SECRET_KEY``, describes a store
     the caller owns (the CI service container). The runner creates one bucket per
     run and never starts a server.
 
@@ -340,30 +340,30 @@ def wait_http(process: subprocess.Popen[bytes], url: str, run_id: str | None = N
 # real object storage (owned child or caller-owned endpoint)
 # --------------------------------------------------------------------------- #
 
-#: The pinned real MinIO binary used by ``owned`` mode on this box. Both values
+#: The pinned real RustFS binary used by ``owned`` mode on this box. Both values
 #: are recorded in docs/phase5-validation.md; the hash is compared before every
 #: launch and a mismatch refuses to start (no silent substitution, no download).
-MINIO_BINARY = Path(r"D:\tools\minio.exe")
-MINIO_BINARY_SHA256 = "af709e6ba68488404e85acdd22a3030d0f5e56a108d4b27d744f18ceb50861b4"
+S3_BINARY = Path(r"D:\tools\rustfs\rustfs.exe")
+S3_BINARY_SHA256 = "3396617ec60905e72fb70fd99a0b2395e425edf495eb6499edbde6a5fa97d899"
 
 #: Data directories go under ``D:\tmp`` on purpose. ``%TEMP%`` is on ``C:`` here,
-#: which has ~5 GB free, and MinIO answers ``XMinioStorageFull`` (HTTP 507) on a
+#: which has ~5 GB free, and an object store refuses to serve usefully on a volume
 #: volume below its own free-space floor - which the adapter correctly translates
 #: into ``attachment_storage_unavailable`` and turns into 14 false failures. The
 #: real storage tests therefore never use the default temp directory.
-MINIO_TMP_ROOT = Path(r"D:\tmp")
+S3_TMP_ROOT = Path(r"D:\tmp")
 
 #: Bucket prefix for one run. S3 legal (lowercase, hyphens), recognisable, and
-#: never the bucket a developer's ``OBJECT_STORAGE_BUCKET`` names.
-MINIO_BUCKET_PREFIX = "revnote-att-"
+#: never the bucket a developer's ``S3_BUCKET`` names.
+S3_BUCKET_PREFIX = "revnote-att-"
 
 #: Bound for one store preparation. Creating a bucket and probing readiness on a
 #: store that is already listening is sub-second; this only stops a wedged store
 #: from hanging the whole browser suite.
-MINIO_READY_DEADLINE_S = 60.0
+S3_READY_DEADLINE_S = 60.0
 
 #: Poll interval for readiness. The probe itself is a real adapter call.
-MINIO_READY_INTERVAL_S = 0.1
+S3_READY_INTERVAL_S = 0.1
 
 
 class ObjectStorage:
@@ -427,12 +427,13 @@ class ObjectStorage:
         values here, so this dict is never printed, logged or persisted.
         """
         return {
-            "OBJECT_STORAGE_ENDPOINT": self.endpoint,
-            "OBJECT_STORAGE_BUCKET": self.bucket,
-            "OBJECT_STORAGE_ACCESS_KEY": self._access_key,
-            "OBJECT_STORAGE_SECRET_KEY": self._secret_key,
-            "OBJECT_STORAGE_SECURE": "false",
-            "OBJECT_STORAGE_TIMEOUT_S": "10",
+            "S3_ENDPOINT": self.endpoint,
+            "S3_BUCKET": self.bucket,
+            "S3_ACCESS_KEY": self._access_key,
+            "S3_SECRET_KEY": self._secret_key,
+            "S3_SECURE": "false",
+            "S3_TIMEOUT_S": "10",
+            "S3_REGION": "us-east-1",
             "ATTACHMENTS_ENABLED": "true",
             # Set explicitly for every child: a store was promised to this run, so
             # the acceptance group must connect or fail. This is the release gate.
@@ -443,7 +444,7 @@ class ObjectStorage:
         """The project's real ``S3BlobStore`` bound to this run's store.
 
         Readiness is polled **through the product's own adapter**, not through a
-        bare HTTP probe on ``/minio/health/ready``: the question this runner has
+        bare HTTP probe on its own readiness endpoint: the question this runner has
         to answer is "can the code that will serve requests reach its bucket",
         and only the adapter answers that (credentials, TLS flag, bucket
         existence, SDK timeout all included).
@@ -530,7 +531,7 @@ async def _await_storage_ready(storage: ObjectStorage) -> None:
     from revnote_api.storage.bootstrap import probe_store
 
     store = storage.adapter()
-    deadline = time.monotonic() + MINIO_READY_DEADLINE_S
+    deadline = time.monotonic() + S3_READY_DEADLINE_S
     while time.monotonic() < deadline:
         if storage.process is not None and storage.process.poll() is not None:
             raise LifecycleError("The owned object store exited before becoming ready.")
@@ -540,33 +541,33 @@ async def _await_storage_ready(storage: ObjectStorage) -> None:
         except Exception:
             # A transport failure is "not ready yet" here; the deadline decides.
             pass
-        await asyncio.sleep(MINIO_READY_INTERVAL_S)
+        await asyncio.sleep(S3_READY_INTERVAL_S)
     raise LifecycleError(
         f"Object storage at {storage.host_port} did not become ready before the deadline."
     )
 
 
-def verify_minio_binary() -> str:
+def verify_s3_binary() -> str:
     """Refuse to launch an unverified binary; return the digest actually read.
 
     The pin is a security boundary, not bookkeeping: this runner spawns whatever
     sits at that path. A mismatch or a missing file is a fixed failure rather
     than a fallback (a downloaded or rebuilt binary must be a deliberate change).
     """
-    if not MINIO_BINARY.is_file():
+    if not S3_BINARY.is_file():
         raise LifecycleError(
             "The pinned object-store binary is absent; owned mode cannot start. "
-            "Set WEB_E2E_MINIO_ENDPOINT to use an external store instead."
+            "Set WEB_E2E_S3_ENDPOINT to use an external store instead."
         )
     digest = hashlib.sha256()
     try:
-        with MINIO_BINARY.open("rb") as handle:
+        with S3_BINARY.open("rb") as handle:
             for block in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(block)
     except OSError:
         raise LifecycleError("The pinned object-store binary could not be read.") from None
     actual = digest.hexdigest()
-    if actual != MINIO_BINARY_SHA256:
+    if actual != S3_BINARY_SHA256:
         raise LifecycleError(
             "The pinned object-store binary does not match its recorded SHA-256; "
             "refusing to start it."
@@ -577,17 +578,17 @@ def verify_minio_binary() -> str:
 def start_owned_storage(
     run_id: str, owned: list[subprocess.Popen[bytes]], env: dict[str, str]
 ) -> ObjectStorage:
-    """Start our own real MinIO child on a reserved loopback port and prepare its bucket.
+    """Start our own real RustFS child on a reserved loopback port and prepare its bucket.
 
     Everything here is per-run: port, data directory, credential pair and bucket
-    name. The data directory lives under :data:`MINIO_TMP_ROOT` (a ``D:`` path),
-    never ``%TEMP%``, because MinIO refuses to run usefully on a volume below its
+    name. The data directory lives under :data:`S3_TMP_ROOT` (a ``D:`` path),
+    never ``%TEMP%``, because an object store refuses to run usefully on a volume below its
     free-space floor and the system temp directory is on the small volume here.
     """
-    verify_minio_binary()
+    verify_s3_binary()
     access_key = f"revnote{run_id[:16]}"
     secret_key = f"secret_{run_id}"
-    data_dir = MINIO_TMP_ROOT / f"revnote-minio-{run_id[:16]}"
+    data_dir = S3_TMP_ROOT / f"revnote-s3-{run_id[:16]}"
     try:
         data_dir.mkdir(parents=True, exist_ok=False)
     except OSError:
@@ -600,25 +601,32 @@ def start_owned_storage(
     port = reservation.getsockname()[1]
     reservation.close()
     child_env = dict(env)
-    # Selected by the caller as ``owned`` mode, so a stray MINIO_* in the shell
+    # Selected by the caller as ``owned`` mode, so a stray RUSTFS_*/S3_* in the shell
     # (scrubbed by ``child_environment``) is irrelevant; these are the only ones
     # the child sees.
     child_env.update(
-        MINIO_ROOT_USER=access_key,
-        MINIO_ROOT_PASSWORD=secret_key,
-        MINIO_BROWSER="off",
+        RUSTFS_ACCESS_KEY=access_key,
+        RUSTFS_SECRET_KEY=secret_key,
     )
+    # RustFS refuses to start without an explicit console address, so it gets its own
+    # reserved loopback port rather than a placeholder.
+    try:
+        console_reservation = reserve_port(0)
+    except LifecycleError:
+        shutil.rmtree(data_dir, ignore_errors=True)
+        raise
+    console_port = console_reservation.getsockname()[1]
+    console_reservation.close()
     try:
         process = spawn(
             [
-                str(MINIO_BINARY),
+                str(S3_BINARY),
                 "server",
-                str(data_dir),
                 "--address",
                 f"127.0.0.1:{port}",
                 "--console-address",
-                "127.0.0.1:0",
-                "--quiet",
+                f"127.0.0.1:{console_port}",
+                str(data_dir),
             ],
             child_env,
             REPO_ROOT,
@@ -631,7 +639,7 @@ def start_owned_storage(
         endpoint=f"http://127.0.0.1:{port}",
         access_key=access_key,
         secret_key=secret_key,
-        bucket=f"{MINIO_BUCKET_PREFIX}{run_id[:24]}",
+        bucket=f"{S3_BUCKET_PREFIX}{run_id[:24]}",
         owned_by_runner=True,
         process=process,
         data_dir=data_dir,
@@ -641,30 +649,29 @@ def start_owned_storage(
 
 
 def external_storage(run_id: str) -> ObjectStorage:
-    """Describe the caller-owned store named by ``WEB_E2E_MINIO_ENDPOINT``.
+    """Describe the caller-owned store named by ``WEB_E2E_S3_ENDPOINT``.
 
     Absent credentials are a hard failure: this mode promises a real store, and
     an anonymous adapter can only fail later with a confusing 503.
     """
-    raw_endpoint = os.environ.get("WEB_E2E_MINIO_ENDPOINT", "").strip()
-    access_key = os.environ.get("WEB_E2E_MINIO_ACCESS_KEY", "").strip()
-    secret_key = os.environ.get("WEB_E2E_MINIO_SECRET_KEY", "").strip()
+    raw_endpoint = os.environ.get("WEB_E2E_S3_ENDPOINT", "").strip()
+    access_key = os.environ.get("WEB_E2E_S3_ACCESS_KEY", "").strip()
+    secret_key = os.environ.get("WEB_E2E_S3_SECRET_KEY", "").strip()
     if not raw_endpoint or not access_key or not secret_key:
         raise LifecycleError(
-            "WEB_E2E_MINIO_ENDPOINT requires WEB_E2E_MINIO_ACCESS_KEY and "
-            "WEB_E2E_MINIO_SECRET_KEY as well."
+            "WEB_E2E_S3_ENDPOINT requires WEB_E2E_S3_ACCESS_KEY and WEB_E2E_S3_SECRET_KEY as well."
         )
     host = re.sub(r"^https?://", "", raw_endpoint).rsplit("@", 1)[-1].rstrip("/")
     if not re.fullmatch(r"(?:127\.0\.0\.1|localhost|::1):\d{1,5}", host):
         # The browser suite talks to the API only, so a non-loopback store is not
         # a leak by itself - but this runner is not the place to invent a policy
         # for one. Refuse, and let the caller say what they meant.
-        raise LifecycleError("WEB_E2E_MINIO_ENDPOINT must be a loopback host:port for this runner.")
+        raise LifecycleError("WEB_E2E_S3_ENDPOINT must be a loopback host:port for this runner.")
     return ObjectStorage(
         endpoint=raw_endpoint if "://" in raw_endpoint else f"http://{raw_endpoint}",
         access_key=access_key,
         secret_key=secret_key,
-        bucket=f"{MINIO_BUCKET_PREFIX}{run_id[:24]}",
+        bucket=f"{S3_BUCKET_PREFIX}{run_id[:24]}",
         owned_by_runner=False,
         port=int(host.rsplit(":", 1)[1]),
     )
@@ -744,8 +751,8 @@ def object_storage_is_promised() -> bool:
 
 
 def external_storage_requested() -> bool:
-    """``WEB_E2E_MINIO_ENDPOINT`` selects the caller-owned store; absent means owned."""
-    return bool(os.environ.get("WEB_E2E_MINIO_ENDPOINT", "").strip())
+    """``WEB_E2E_S3_ENDPOINT`` selects the caller-owned store; absent means owned."""
+    return bool(os.environ.get("WEB_E2E_S3_ENDPOINT", "").strip())
 
 
 def _bucket_wide_purge() -> Callable[[object, str], None]:
@@ -780,7 +787,7 @@ async def start_object_storage(
     """Start (or adopt) this run's real store; the bucket comes next.
 
     Two modes, decided by the environment and by nothing else: a caller-owned store
-    when ``WEB_E2E_MINIO_ENDPOINT`` is set, otherwise our own pinned child. An owned
+    when ``WEB_E2E_S3_ENDPOINT`` is set, otherwise our own pinned child. An owned
     child is appended to ``owned`` so the lifecycle's single teardown loop sees it.
 
     Split from :func:`prepare_object_storage` on purpose. ``main`` needs the object
@@ -828,10 +835,10 @@ async def prepare_object_storage(storage: ObjectStorage, env: dict[str, str]) ->
     # not publish them is a failure, not a near miss. ``REQUIRE_OBJECT_STORAGE_TESTS``
     # is included because the acceptance group must never silently deselect itself.
     required = (
-        "OBJECT_STORAGE_ENDPOINT",
-        "OBJECT_STORAGE_BUCKET",
-        "OBJECT_STORAGE_ACCESS_KEY",
-        "OBJECT_STORAGE_SECRET_KEY",
+        "S3_ENDPOINT",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
         "ATTACHMENTS_ENABLED",
         REQUIRE_OBJECT_STORAGE_TESTS_ENV,
     )
@@ -856,7 +863,7 @@ def _storage_failure(mode: str, detail: str) -> LifecycleError:
         f" {REQUIRE_OBJECT_STORAGE_TESTS_ENV}=1 was requested, so this run cannot continue "
         "without a store."
         if object_storage_is_promised()
-        else " Set WEB_E2E_MINIO_ENDPOINT to a prepared store, or install the pinned binary."
+        else " Set WEB_E2E_S3_ENDPOINT to a prepared store, or install the pinned binary."
     )
     return LifecycleError(f"The {mode} object store {detail}.{promised}")
 
@@ -871,16 +878,16 @@ def child_environment(database_url: str, run_id: str) -> dict[str, str]:
         "SYNC_",
         "SERVER_",
         "VITE_",
-        # Phase 5. Without these three a developer who exported their own MinIO
+        # Phase 5. Without these three a developer who exported their own the object store
         # or attachment settings (a real compose stack, a shared bucket) would
         # have them inherited by the API, Vite and the browser child: the API
         # would then talk to a store this run does not own, and
         # ``REQUIRE_OBJECT_STORAGE_TESTS=1`` would prove the developer's bucket
         # instead of this run's. The prefixes are scrubbed and the per-run
         # values are set explicitly below.
-        "MINIO_",
+        "S3_",
+        "RUSTFS_",
         "ATTACHMENT_",
-        "OBJECT_STORAGE_",
     )
     env = {
         key: value
@@ -1206,7 +1213,7 @@ def print_lifecycle_diagnostics(
         f"vite={process_alive(web) if web is not None else 'absent'} "
         # The object store is an owned child too, so "exited" here is the quickest
         # explanation for a wall of attachment failures.
-        f"minio={process_alive(storage.process) if storage and storage.process else 'absent'}",
+        f"s3={process_alive(storage.process) if storage and storage.process else 'absent'}",
         file=sys.stderr,
     )
     print(

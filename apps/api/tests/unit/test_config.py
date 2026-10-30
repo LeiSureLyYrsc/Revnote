@@ -31,7 +31,7 @@ def test_ignores_unrelated_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("POSTGRES_USER", "revnote")
     monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
-    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "minio-secret")
+    monkeypatch.setenv("RUSTFS_SECRET_KEY", "local-placeholder")
     monkeypatch.setenv("SOMETHING_ELSE_ENTIRELY", "1")
 
     settings = Settings(_env_file=None)
@@ -331,8 +331,19 @@ def test_phase5_attachment_settings_declare_no_credential_field() -> None:
     } <= declared
 
 
-def test_attachments_are_closed_by_default_with_a_narrow_allowlist() -> None:
-    """D12/D9: an unconfigured deployment advertises nothing and accepts little."""
+def test_attachments_are_closed_by_default_with_a_narrow_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D12/D9: an unconfigured deployment advertises nothing and accepts little.
+
+    The acceptance environment exports ``ATTACHMENTS_ENABLED=true`` (the real-storage
+    suites need it), so the switch is cleared explicitly here. Without that this test
+    asserts the harness rather than the default, and fails for the wrong reason.
+    """
+    monkeypatch.delenv("ATTACHMENTS_ENABLED", raising=False)
+    monkeypatch.delenv("ATTACHMENT_MAX_BYTES", raising=False)
+    monkeypatch.delenv("ATTACHMENT_PENDING_GRACE_S", raising=False)
+    monkeypatch.delenv("ATTACHMENT_ACCEPTED_MIME", raising=False)
     settings = Settings(_env_file=None)
 
     assert settings.attachments_enabled is False

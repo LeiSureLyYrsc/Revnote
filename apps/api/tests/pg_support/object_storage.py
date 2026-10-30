@@ -14,12 +14,12 @@ The contract (identical in shape to ``REQUIRE_POSTGRES_TESTS``)
 ``REQUIRE_OBJECT_STORAGE_TESTS``
     ``1`` (truthy) => the four variables below are mandatory. Absent or malformed is a
     :class:`ObjectStorageRequirementError`, which the fixtures turn into ``pytest.fail``.
-``OBJECT_STORAGE_ENDPOINT``
+``S3_ENDPOINT``
     ``http://127.0.0.1:9000`` or bare ``host:9000``.
-``OBJECT_STORAGE_ACCESS_KEY`` / ``OBJECT_STORAGE_SECRET_KEY``
+``S3_ACCESS_KEY`` / ``S3_SECRET_KEY``
     Credentials for the store the test run owns. Local development reuses the compose
     root pair; CI uses a bucket-scoped user.
-``OBJECT_STORAGE_BUCKET``
+``S3_BUCKET``
     Optional here. The suite always creates its **own** bucket (see
     :func:`unique_bucket_name`) so a test run can never touch a real bucket that merely
     happens to share the configured name - which is why this variable is *not* read.
@@ -49,12 +49,12 @@ from typing import Final
 __all__ = [
     "CI_ENV_VARS",
     "FALSY_VALUES",
-    "OBJECT_STORAGE_ACCESS_KEY_ENV",
-    "OBJECT_STORAGE_BUCKET_ENV",
-    "OBJECT_STORAGE_ENDPOINT_ENV",
-    "OBJECT_STORAGE_SECRET_KEY_ENV",
-    "OBJECT_STORAGE_TIMEOUT_S_ENV",
     "REQUIRE_OBJECT_STORAGE_TESTS_ENV",
+    "S3_ACCESS_KEY_ENV",
+    "S3_BUCKET_ENV",
+    "S3_ENDPOINT_ENV",
+    "S3_SECRET_KEY_ENV",
+    "S3_TIMEOUT_S_ENV",
     "ObjectStorageRequirementError",
     "ObjectStorageTarget",
     "describe",
@@ -69,14 +69,14 @@ __all__ = [
 #: "a missing store is a failure".
 REQUIRE_OBJECT_STORAGE_TESTS_ENV: Final[str] = "REQUIRE_OBJECT_STORAGE_TESTS"
 
-OBJECT_STORAGE_ENDPOINT_ENV: Final[str] = "OBJECT_STORAGE_ENDPOINT"
-OBJECT_STORAGE_ACCESS_KEY_ENV: Final[str] = "OBJECT_STORAGE_ACCESS_KEY"
-OBJECT_STORAGE_SECRET_KEY_ENV: Final[str] = "OBJECT_STORAGE_SECRET_KEY"
+S3_ENDPOINT_ENV: Final[str] = "S3_ENDPOINT"
+S3_ACCESS_KEY_ENV: Final[str] = "S3_ACCESS_KEY"
+S3_SECRET_KEY_ENV: Final[str] = "S3_SECRET_KEY"
 #: Not read by this module. Listed so the reader can see the deliberate omission:
 #: the suite creates a per-run bucket instead of borrowing the configured one.
-OBJECT_STORAGE_BUCKET_ENV: Final[str] = "OBJECT_STORAGE_BUCKET"
+S3_BUCKET_ENV: Final[str] = "S3_BUCKET"
 #: Optional override for the per-call deadline; defaults to the settings default.
-OBJECT_STORAGE_TIMEOUT_S_ENV: Final[str] = "OBJECT_STORAGE_TIMEOUT_S"
+S3_TIMEOUT_S_ENV: Final[str] = "S3_TIMEOUT_S"
 
 #: A CI run must never silently pass because nothing was configured. Mirrors
 #: ``pg_testing.CI_ENV_VARS`` so the two suites agree on what "this is CI" means.
@@ -179,19 +179,19 @@ def require_object_storage(*, bucket: str | None = None) -> ObjectStorageTarget:
     run a real failure instead of a skip.
     """
     # Imported lazily: this module must stay importable with no SDK installed, so the
-    # unit tier can exercise the environment contract on a machine without minio.
+    # unit tier can exercise the environment contract on a machine without the SDK.
     from revnote_api.storage.settings import ObjectStorageSettings
 
-    endpoint = _required(OBJECT_STORAGE_ENDPOINT_ENV)
-    access_key = _required(OBJECT_STORAGE_ACCESS_KEY_ENV)
-    secret_key = _required(OBJECT_STORAGE_SECRET_KEY_ENV)
+    endpoint = _required(S3_ENDPOINT_ENV)
+    access_key = _required(S3_ACCESS_KEY_ENV)
+    secret_key = _required(S3_SECRET_KEY_ENV)
 
-    raw_timeout = os.environ.get(OBJECT_STORAGE_TIMEOUT_S_ENV, "").strip()
+    raw_timeout = os.environ.get(S3_TIMEOUT_S_ENV, "").strip()
     try:
         timeout_s = float(raw_timeout) if raw_timeout else DEFAULT_TIMEOUT_S
     except ValueError as exc:
         raise ObjectStorageRequirementError(
-            f"{OBJECT_STORAGE_TIMEOUT_S_ENV} must be a number of seconds, got a non-numeric value"
+            f"{S3_TIMEOUT_S_ENV} must be a number of seconds, got a non-numeric value"
         ) from exc
 
     try:
@@ -209,7 +209,7 @@ def require_object_storage(*, bucket: str | None = None) -> ObjectStorageTarget:
     except Exception as exc:
         raise ObjectStorageRequirementError(
             "the object-storage environment is not usable: "
-            f"{OBJECT_STORAGE_ENDPOINT_ENV} or {OBJECT_STORAGE_TIMEOUT_S_ENV} is invalid"
+            f"{S3_ENDPOINT_ENV} or {S3_TIMEOUT_S_ENV} is invalid"
         ) from exc
 
     return ObjectStorageTarget(
@@ -306,38 +306,49 @@ def purge_and_drop_bucket(store: object, bucket: str | None = None) -> None:
     bucket-wide delete lives here, in test support, behind a name that says what it
     does.
     """
-    from minio import Minio
-    from minio.deleteobjects import DeleteObject
+    # Imported lazily: the environment-contract half of this module must stay usable on
+    # a machine without the S3 SDK, and only the cleanup helper genuinely needs a client.
+    import boto3
+    from botocore.config import Config
 
     settings = getattr(store, "settings", store)
     client = getattr(store, "client", None)
     if client is None:
-        client = Minio(
-            settings.host_port,
-            access_key=settings.access_key,
-            secret_key=settings.secret_key,
-            secure=settings.is_secure,
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings.endpoint,
+            aws_access_key_id=settings.access_key,
+            aws_secret_access_key=settings.secret_key,
+            region_name=settings.region,
+            use_ssl=settings.is_secure,
+            config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 0}),
         )
     name = bucket or settings.bucket
     problems: list[str] = []
 
     try:
-        listing = client.list_objects(name, recursive=True)
-        try:
-            keys = [item.object_name for item in listing if item.object_name]
-        finally:
-            closer = getattr(listing, "close", None)
-            if callable(closer):
-                closer()
-        if keys:
-            for _ in client.remove_objects(name, [DeleteObject(key) for key in keys]):
-                # Drain: the deletions happen as this generator is consumed.
-                pass
+        paginator = client.get_paginator("list_objects_v2")
+        keys = [
+            item["Key"]
+            for page in paginator.paginate(Bucket=name)
+            for item in page.get("Contents", ()) or ()
+            if item.get("Key")
+        ]
+        # Batched because one delete request is capped at 1000 keys, and an error is
+        # reported per key inside a 200 response - so the Errors list, not the status,
+        # says whether the bucket is actually empty.
+        for start in range(0, len(keys), 500):
+            batch = keys[start : start + 500]
+            response = client.delete_objects(
+                Bucket=name, Delete={"Objects": [{"Key": key} for key in batch]}
+            )
+            if response.get("Errors"):
+                raise RuntimeError("batch reported errors")
     except Exception as exc:
         problems.append(f"could not empty the bucket ({type(exc).__name__})")
 
     try:
-        client.remove_bucket(name)
+        client.delete_bucket(Bucket=name)
     except Exception as exc:
         problems.append(f"could not drop the bucket ({type(exc).__name__})")
 

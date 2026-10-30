@@ -1,9 +1,9 @@
-"""The attachment endpoints over HTTP, against **real PostgreSQL and real MinIO**.
+"""The attachment endpoints over HTTP, against **real PostgreSQL and a real S3-compatible store**.
 
 This module is the load-bearing evidence for the Phase 5 attachment claims (plan §7.1).
 Nothing here is faked: the app is ``create_app(settings)``, the schema comes from the
 real Alembic chain, the bearer token is a real one, and the bytes really travel through
-the MinIO adapter into a private bucket this run owns.
+the S3 adapter into a private bucket this run owns.
 
 Why no double is acceptable at this layer
 -----------------------------------------
@@ -20,7 +20,7 @@ store can only restate what the code already believes:
   the bucket and querying the table afterwards.
 
 The environment contract is Lane B's (:mod:`pg_support.object_storage`):
-``REQUIRE_OBJECT_STORAGE_TESTS=1`` plus ``OBJECT_STORAGE_*``. When storage was promised
+``REQUIRE_OBJECT_STORAGE_TESTS=1`` plus ``S3_*``. When storage was promised
 and is not usable, :func:`require_object_storage` raises and :func:`object_storage`
 turns that into a **failure**, never a skip: a skipped attachment suite is
 indistinguishable from a passing one in CI.
@@ -42,10 +42,10 @@ import pytest
 from pg_support.api_harness import ApiHarness, open_api
 from pg_support.auth_support import Account
 from pg_support.object_storage import (
-    OBJECT_STORAGE_ACCESS_KEY_ENV,
-    OBJECT_STORAGE_BUCKET_ENV,
-    OBJECT_STORAGE_ENDPOINT_ENV,
-    OBJECT_STORAGE_SECRET_KEY_ENV,
+    S3_ACCESS_KEY_ENV,
+    S3_BUCKET_ENV,
+    S3_ENDPOINT_ENV,
+    S3_SECRET_KEY_ENV,
     ObjectStorageRequirementError,
     ObjectStorageTarget,
     describe,
@@ -113,10 +113,10 @@ def _storage_environment(
     expected to be set already (``require_object_storage`` demanded them); the bucket is
     per-run and therefore forced here.
     """
-    monkeypatch.setenv(OBJECT_STORAGE_BUCKET_ENV, object_storage.bucket)
-    monkeypatch.setenv(OBJECT_STORAGE_ENDPOINT_ENV, object_storage.endpoint)
-    monkeypatch.setenv(OBJECT_STORAGE_ACCESS_KEY_ENV, object_storage.access_key)
-    monkeypatch.setenv(OBJECT_STORAGE_SECRET_KEY_ENV, object_storage.secret_key)
+    monkeypatch.setenv(S3_BUCKET_ENV, object_storage.bucket)
+    monkeypatch.setenv(S3_ENDPOINT_ENV, object_storage.endpoint)
+    monkeypatch.setenv(S3_ACCESS_KEY_ENV, object_storage.access_key)
+    monkeypatch.setenv(S3_SECRET_KEY_ENV, object_storage.secret_key)
     return object_storage
 
 
@@ -141,15 +141,21 @@ def store(object_storage: ObjectStorageTarget) -> S3BlobStore:
 
 
 def _objects_under(store: S3BlobStore, workspace_id: uuid.UUID) -> list[str]:
-    """Every object key this workspace wrote (``ws/<ws>/...``), in listing order."""
+    """Every object key this workspace wrote (``ws/<ws>/...``), in listing order.
+
+    Uses the paginator rather than one ``list_objects_v2`` call: a single page caps at
+    1000 keys, so a truncated listing would make "exactly one object" assertions pass for
+    the wrong reason on a busy store.
+    """
     prefix = f"ws/{workspace_id}/"
-    listing = store.client.list_objects(store.settings.bucket, prefix=prefix, recursive=True)
-    try:
-        return sorted(item.object_name for item in listing if item.object_name)
-    finally:
-        closer = getattr(listing, "close", None)
-        if callable(closer):
-            closer()
+    paginator = store.client.get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=store.settings.bucket, Prefix=prefix):
+        for item in page.get("Contents", ()) or ():
+            key = item.get("Key")
+            if key:
+                keys.append(key)
+    return sorted(keys)
 
 
 # --------------------------------------------------------------------------- #

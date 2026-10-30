@@ -8,7 +8,7 @@ Scaffold rules baked into this module:
   neither is set the value defaults to ``local``.
 * **Unknown environment variables are ignored** (``extra="ignore"``). The repo
   root ``.env`` is shared with docker-compose and carries ``POSTGRES_*`` /
-  ``MINIO_*`` keys this service must tolerate.
+  ``RUSTFS_*`` keys this service must tolerate.
 * **PostgreSQL via asyncpg is the only supported backend.** Any other driver
   (``sqlite``, ``postgresql+psycopg``, bare ``postgresql://``) is rejected at
   validation time, so a misconfigured deployment fails fast at boot.

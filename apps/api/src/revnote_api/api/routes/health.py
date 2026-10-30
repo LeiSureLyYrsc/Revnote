@@ -5,7 +5,7 @@ Unchanged behaviour from the scaffold, now living in a package so its siblings
 the old ``api/routes.py`` module name.
 
 ``GET /health`` reports **process liveness only** - it never opens a database
-connection, so it keeps returning ``200`` while PostgreSQL / MinIO are down.
+connection, so it keeps returning ``200`` while PostgreSQL / the object store are down.
 Deep dependency checks belong to a future ``/health/ready`` and must not be mixed
 into this endpoint. Neither route is versioned: probes must not need to know the
 API version.

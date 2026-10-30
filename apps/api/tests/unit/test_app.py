@@ -1,7 +1,7 @@
 """HTTP tests for the scaffold: hello + liveness must work with no services.
 
 The tests run the *real* lifespan (startup and shutdown), so they also prove
-that booting and stopping the app never requires PostgreSQL or MinIO.
+that booting and stopping the app never requires PostgreSQL or an object store.
 """
 
 from __future__ import annotations

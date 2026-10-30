@@ -120,7 +120,7 @@ USER 10001:10001
 EXPOSE 8000
 
 # Probe the real liveness endpoint with the stdlib (the slim base has no curl).
-# `/health` is a pure process check that never touches PostgreSQL or MinIO, so a
+# `/health` is a pure process check that never touches PostgreSQL or an object store, so a
 # database outage can never turn into a container restart loop. The port comes
 # from PORT, with the image default as a fallback.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

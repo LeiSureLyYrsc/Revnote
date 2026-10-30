@@ -1,7 +1,7 @@
 """Shared pytest fixtures for the Revnote API scaffold.
 
 * The **unit** tests never touch a network service: ``create_app()`` boots with
-  defaults, so ``GET /`` and ``GET /health`` pass with PostgreSQL / MinIO absent.
+  defaults, so ``GET /`` and ``GET /health`` pass with PostgreSQL / the object store absent.
 * ``TEST_DATABASE_URL`` gates the PostgreSQL integration tests:
   - unset -> skipped (no local server required);
   - set   -> they **must** connect; a connection error is a hard failure and is

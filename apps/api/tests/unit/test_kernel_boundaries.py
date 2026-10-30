@@ -60,7 +60,7 @@ FORBIDDEN_MODULES = (
     "uvicorn",
     "httpx",
     "pydantic",
-    "minio",
+    "boto3",
     "revnote_api.api",
     "revnote_api.app",
     "revnote_api.main",

@@ -3,7 +3,7 @@
 Contract:
 
 * ``create_app()`` returns a fully configured app without touching PostgreSQL,
-  MinIO or any other external service — import and startup stay side-effect
+  an object store or any other external service — import and startup stay side-effect
   free (the engine is lazy, see :mod:`revnote_api.db.engine`).
 * The lifespan disposes the async engine on shutdown so ``uvicorn`` exits
   cleanly without dangling pooled connections.

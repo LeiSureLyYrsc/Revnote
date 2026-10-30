@@ -121,7 +121,24 @@ pnpm test:web                          # vitest/full: cases=215; errors=0
 
 ---
 
-## 6. 未运行 / 不声称
+## 6. CI 证据
+
+代码 SHA `6f0f50f69eb2f9a3a00e65a3a60597a30c51b092`：
+
+| 轮次 | run | 结果 |
+|---|---|---|
+| 第 1 轮 | [41040922425](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41040922425)（attempt 1） | 五个 job 全绿：api / api-attachments / web / web-e2e / image |
+| 第 2 轮 | 同一 run 的 attempt 2（[41040922425](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41040922425)） | 五个 job 全绿 |
+
+同一 SHA 连续两轮、五个 job（含真 RustFS 的 `api-attachments` 与 `web-e2e`、含 GHCR `image`）均 success。`api` job 产出并守卫 `api-cli.xml`（48 项，7 个承重用例）。
+
+修复记录（诚实保留）：前一个 SHA `b0b4dea` 的 run [41040267992](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41040267992) 中 api/api-attachments/web/web-e2e 四组绿，`image` 红：Dockerfile 只复制了 `apps/api` 的 workspace 清单，新增 `apps/cli` 成员后 `uv sync --locked` 无法解析工作区。修复为复制两个成员的 `pyproject.toml`，并用 `--package revnote-api` 只安装 API 成员（参考 CLI 不进 API 镜像）。该修复在 `6f0f50f` 上以两轮全绿验证。
+
+本文件自身的 CI 证据提交是 docs-only；代码行为的验收以上表为准，文档提交另按其自身 CI 运行验证。
+
+---
+
+## 7. 未运行 / 不声称
 
 以下项目本机**未运行**，本记录不据此声称通过；它们由推送后的 CI 或后续环境验证：
 
@@ -134,7 +151,7 @@ pnpm test:web                          # vitest/full: cases=215; errors=0
 
 ---
 
-## 7. 安全与边界核对
+## 8. 安全与边界核对
 
 - 未打印 API key、RustFS 凭据、session token 或密码；CLI 测试断言 stdout/stderr 不含保存的 access token。
 - 未提交 `.env`、凭据、trace/HAR/storageState。
@@ -145,8 +162,9 @@ pnpm test:web                          # vitest/full: cases=215; errors=0
 
 ---
 
-## 8. 本地收尾
+## 9. 本地收尾
 
 - 临时 PostgreSQL 由外部控制器停止（`revnote_phase2_pg.py stop`），状态文件删除。
 - pytest 临时目录与配置目录位于 `D:\tmp\...`；未向 C: 写入缓存或大产物。
-- 本记录将在推送与 CI 完成后追加「CI 证据」小节（同一 SHA 连续两轮）。
+- 图标/镜像验证只在 CI；本地 Dockerfile 装配用 `D:\tmp\revnote-docker-sim` 模拟两层 `uv sync`（layer1/layer2 均 0，导入成功、无 pytest、无 revnote_cli），模拟目录已删除。
+- 合并前最后核对：工作区除根目录既有的未跟踪 `phase*.md` 草稿外无未提交文件；草稿未提交、未删除。

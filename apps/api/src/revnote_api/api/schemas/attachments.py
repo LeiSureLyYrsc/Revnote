@@ -39,6 +39,7 @@ __all__ = [
     "AttachmentResponse",
     "CapabilitiesResponse",
     "CapabilityAttachment",
+    "CapabilityJoplinBridge",
     "CreateAttachmentRequest",
     "CreateAttachmentResponse",
     "UploadContentResponse",
@@ -189,6 +190,29 @@ class CapabilityAttachment(_WireModel):
     ]
 
 
+class CapabilityJoplinBridge(_WireModel):
+    """The ``joplin_bridge`` object of the capabilities response (Phase 6, additive).
+
+    Purely informational: a Joplin client never calls this route. It exists so a
+    Revnote client (or an operator's smoke test) can tell whether the
+    compatibility surface is mounted on this deployment without probing a route
+    that may legitimately be absent.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(description="Whether this deployment mounts the Joplin compatibility routes."),
+    ]
+    protocol_baseline: Annotated[
+        str,
+        Field(description="The Joplin Server protocol generation this bridge targets."),
+    ]
+    mount: Annotated[
+        str,
+        Field(description="Path prefix the compatibility routes are mounted under."),
+    ] = "/api"
+
+
 class CapabilitiesResponse(_WireModel):
     """``GET /capabilities`` - always ``200``, even when attachments are disabled.
 
@@ -198,3 +222,6 @@ class CapabilitiesResponse(_WireModel):
     """
 
     attachments: CapabilityAttachment
+    #: Phase 6, additive. An old client ignores an unknown object; a new one can
+    #: tell "bridge off" from "bridge missing" without a second request.
+    joplin_bridge: CapabilityJoplinBridge

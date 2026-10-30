@@ -287,7 +287,10 @@ async def test_capabilities_reports_the_effective_policy(app: AttachmentsHarness
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == {"attachments"}
+    # Phase 6 adds one sibling object; the Phase 5 object itself is unchanged.
+    assert set(body) == {"attachments", "joplin_bridge"}
+    assert body["joplin_bridge"]["enabled"] is False
+    assert body["joplin_bridge"]["protocol_baseline"] == "3.7"
     attachment_support = body["attachments"]
     assert attachment_support["enabled"] is True
     assert attachment_support["max_bytes"] == app.api.settings.attachment_max_bytes

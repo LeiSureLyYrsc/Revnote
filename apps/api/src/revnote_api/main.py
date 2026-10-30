@@ -38,7 +38,7 @@ from revnote_api.api.middleware.safe_logging import (
     RouteTemplateMiddleware,
     install_log_redaction,
 )
-from revnote_api.api.router import router
+from revnote_api.api.router import build_router
 from revnote_api.config import Settings, get_settings
 from revnote_api.db.engine import dispose_engines
 from revnote_api.db.session import reset_session_state
@@ -100,7 +100,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_log_redaction()
 
     install_error_handlers(app)
-    app.include_router(router)
+    app.include_router(build_router(settings))
+    if settings.joplin_bridge_enabled:
+        # The bridge has its own envelope ({"error", "code"}); registering its
+        # handler here keeps every Joplin-shaped concern inside the adapter.
+        from revnote_api.adapters.joplin.routes import install as install_joplin_bridge
+
+        install_joplin_bridge(app)
 
     # Order matters. Starlette runs middleware in reverse registration order for
     # the request, so the *last* added is outermost: request id must be outermost

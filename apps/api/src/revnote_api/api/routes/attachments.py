@@ -51,6 +51,7 @@ from revnote_api.api.schemas.attachments import (
     AttachmentResponse,
     CapabilitiesResponse,
     CapabilityAttachment,
+    CapabilityJoplinBridge,
     CreateAttachmentRequest,
     CreateAttachmentResponse,
     UploadContentResponse,
@@ -175,7 +176,11 @@ async def capabilities(request: Request) -> Response:
             enabled=bool(getattr(settings, "attachments_enabled", False)),
             max_bytes=policy.max_bytes,
             accepted_mime=list(policy.accepted_mime) or list(ACCEPTED_MIME_DEFAULT),
-        )
+        ),
+        joplin_bridge=CapabilityJoplinBridge(
+            enabled=bool(getattr(settings, "joplin_bridge_enabled", False)),
+            protocol_baseline=str(getattr(settings, "joplin_protocol_baseline", "3.7")),
+        ),
     )
     return Response(
         content=payload.model_dump_json(),

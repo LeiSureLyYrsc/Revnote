@@ -136,12 +136,18 @@ def test_kernel_does_not_import_the_service_layer() -> None:
 
 
 def test_no_fastapi_route_or_auth_surface_was_added() -> None:
-    """Phase 2 adds no HTTP/auth/adapter tables or routes (plan §1)."""
-    assert not (SRC / "adapters").exists()
+    """Nothing below the adapter layer carries HTTP or bulk-DDL surface.
+
+    Phase 6 adds ``adapters/joplin`` *above* the services (D4); the rule this
+    test protects is unchanged: the kernel and the services stay framework-free
+    and may not import the adapter package.
+    """
     for path in [*_kernel_files(), *sorted(SERVICES_DIR.glob("*.py"))]:
         text = path.read_text(encoding="utf-8")
         for forbidden in ("APIRouter", "@router", "Depends(", "create_all", "drop_all"):
             assert forbidden not in text, f"{path.name} contains {forbidden!r}"
+        imported = _imports_of(path)
+        assert not any(name.startswith("revnote_api.adapters") for name in imported), path.name
 
 
 def test_services_package_exports_the_single_write_entry_point() -> None:

@@ -19,6 +19,12 @@
 #   api-http         /api/v1 over an in-process ASGI client
 #   api-http-concurrency  real PostgreSQL + concurrent HTTP requests
 #   api-transport    a real TCP socket served by uvicorn (disconnect, RST)
+#   api-attachments  real PostgreSQL + real MinIO (its own job, below)
+#
+# The first seven are produced and guarded by the `api` job. The eighth needs a
+# real object store, so it runs in `api-attachments` and is guarded there by
+# `check_test_reports.py --group attachments` — a job can only guard reports it
+# actually produced.
 
 name: ci
 
@@ -171,7 +177,15 @@ jobs:
         # `api` covers auth, push, pull, snapshot and the read endpoints. The
         # concurrency and transport proofs have their own groups below, so this
         # step is the deterministic, sequential tier.
-        run: uv run pytest apps/api/tests/api -v -m "api and not api_concurrency and not transport" --junitxml=api-http.xml
+        #
+        # `attachments` is excluded because those cases carry the `api` marker
+        # too but need a real MinIO this job does not run. Selecting them here
+        # would not skip them: `GITHUB_ACTIONS` makes
+        # `object_storage_is_required()` true, so a missing store is a hard
+        # failure and this step would go red for a reason unrelated to the
+        # seven groups it guards. They run in `api-attachments` instead, where
+        # `image.needs` gates on them.
+        run: uv run pytest apps/api/tests/api -v -m "api and not api_concurrency and not transport and not attachments" --junitxml=api-http.xml
 
       - name: HTTP API concurrency proofs (independent PostgreSQL connections)
         # Dense sequence allocation over HTTP, pull during push, the N+1
@@ -198,6 +212,12 @@ jobs:
           # Names are the load-bearing cases from the phase 3 prompt; an
           # equivalently named case is acceptable but the *set* below must be
           # present in the report, or the group silently shrank.
+          #
+          # This table covers exactly the seven reports this job produces. The
+          # eighth group (api-attachments.xml) needs a real MinIO, is produced by
+          # the `api-attachments` job, and is pinned there by
+          # `check_test_reports.py --group attachments`. Requiring it here would
+          # ask this job for a file it never generates.
           required = {
               "api-unit.xml": set(),
               "api-integration.xml": {
@@ -274,7 +294,19 @@ jobs:
           PY
 
       - name: Reusable API report guard (same seven-group inventory)
-        run: uv run python apps/api/scripts/check_test_reports.py
+        # Named group by group rather than left to the default: the script's default
+        # is all eight, and the eighth (api-attachments) is produced by the
+        # `api-attachments` job, not here. The same seven-file slice is what the
+        # inline guard above pins by case name.
+        run: |
+          uv run python apps/api/scripts/check_test_reports.py \
+            --group unit \
+            --group integration \
+            --group concurrency \
+            --group migrations \
+            --group http \
+            --group http-concurrency \
+            --group transport
 
       - name: Alembic upgrade head (documented repo-root command)
         # Alembic reads DATABASE_URL from Settings, so it is supplied here only —
@@ -293,10 +325,10 @@ jobs:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: uv run alembic -c apps/api/alembic.ini check
 
-      - name: Verify exactly the Phase 3 domain tables exist
-        # Inspect the real catalog; the ten domain tables of phases 2-3 (kernel
-        # six + auth four) and nothing else. Detailed constraints are verified by
-        # PostgreSQL tests.
+      - name: Verify exactly the Phase 5 domain tables exist
+        # Inspect the real catalog; the eleven domain tables of phases 2-3-5
+        # (kernel six + auth four + attachments one) and nothing else. Detailed
+        # constraints are verified by PostgreSQL tests.
         env:
           DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
         run: |
@@ -345,11 +377,13 @@ jobs:
                   "auth_access_tokens",
                   "auth_refresh_tokens",
                   "workspace_members",
+                  # phase 5 attachments
+                  "attachments",
               }
               if set(tables) != expected:
                   print(f"::error::schema mismatch: expected {sorted(expected)}, got {tables}")
                   return 1
-              print("OK: Phase 3 schema applied, exactly ten domain tables")
+              print("OK: Phase 5 schema applied, exactly eleven domain tables")
               return 0
 
 
@@ -375,6 +409,196 @@ jobs:
             api-http.xml
             api-http-concurrency.xml
             api-transport.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ------------------------------------------------------------------------- #
+  # Attachments: real PostgreSQL + real MinIO, one case per load-bearing claim
+  # of plan §7.1. Its own job because a fake store cannot satisfy these: the
+  # digest is recomputed by re-reading the object, the single winner is decided
+  # by a row lock plus a CAS predicate, and the GC case lists the real bucket.
+  # ------------------------------------------------------------------------- #
+  api-attachments:
+    name: api-attachments (real PostgreSQL + real MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        # Same server and same options as the `api` job, with its own database so
+        # the two jobs can never read or poison each other's rows.
+        image: postgres:17.11-alpine3.23
+        env:
+          POSTGRES_USER: revnote
+          POSTGRES_PASSWORD: revnote_ci_only_password
+          POSTGRES_DB: revnote_attachments_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username revnote --dbname revnote_attachments_ci --timeout=5"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 20s
+
+      minio:
+        # The official image on the tag docker-compose.yml pins, so the container
+        # CI tests against and the one a developer runs are one release.
+        image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+        # The image's entrypoint prepends `minio` when the first argument is not
+        # `minio`, so the effective command is `minio server /data`.
+        command: server /data
+        env:
+          # MinIO's own documented names for its root identity.
+          MINIO_ROOT_USER: revnote_minio_ci_only_user
+          MINIO_ROOT_PASSWORD: revnote_minio_ci_only_password
+        ports:
+          - 9000:9000
+        # Deliberately NO Docker health-check options here: this image's built-in
+        # probe is not verified, and a service whose check never reports healthy
+        # fails the job before a single step runs. Readiness is polled below by
+        # our adapter instead.
+
+    env:
+      # Both promises are gates, not hints: with these set, a test that cannot
+      # reach PostgreSQL or the object store fails hard and never skips (D14).
+      # DATABASE_URL and APP_ENV stay unset for the same reason as the `api` job.
+      TEST_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_attachments_ci
+      # Required by pg_targets, which proves the business and migration DSNs are
+      # two different databases. No migration round trip runs in this job, so
+      # nothing ever connects to it; a missing database is therefore not a fault.
+      TEST_MIGRATION_DATABASE_URL: postgresql+asyncpg://revnote:revnote_ci_only_password@127.0.0.1:5432/revnote_attachments_ci_migrations
+      REQUIRE_POSTGRES_TESTS: "1"
+      REQUIRE_OBJECT_STORAGE_TESTS: "1"
+      OBJECT_STORAGE_ENDPOINT: http://127.0.0.1:9000
+      OBJECT_STORAGE_BUCKET: revnote-attachments-ci
+      OBJECT_STORAGE_ACCESS_KEY: revnote_minio_ci_only_user
+      OBJECT_STORAGE_SECRET_KEY: revnote_minio_ci_only_password
+      OBJECT_STORAGE_SECURE: "false"
+      ATTACHMENTS_ENABLED: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv (pinned)
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            apps/api/pyproject.toml
+
+      - name: Sync workspace from the lock file
+        run: uv sync --locked
+
+      - name: Wait for object storage and create the bucket
+        # The project's own code, not a poller image and not `mc`: readiness is
+        # `probe_store` (list_buckets) which answers "the store is reachable and
+        # accepts our credentials" and needs no bucket to exist. Polling
+        # `ready()` here would deadlock - it is `bucket_exists`, and the bucket
+        # is created by the very next call.
+        run: |
+          uv run python - <<'PY'
+          import time
+
+          from revnote_api.storage.bootstrap import ensure_bucket, probe_store
+          from revnote_api.storage.s3 import S3BlobStore
+          from revnote_api.storage.settings import ObjectStorageSettings
+
+          # Bounded, and generous: a real probe costs one call on a warm store,
+          # so the deadline only matters when the service is slow to listen.
+          DEADLINE_S = 120.0
+          INTERVAL_S = 2.0
+
+          store = S3BlobStore(ObjectStorageSettings())
+          deadline = time.monotonic() + DEADLINE_S
+          while time.monotonic() < deadline:
+              if probe_store(store):
+                  break
+              time.sleep(INTERVAL_S)
+          else:
+              raise SystemExit(
+                  f"object storage at {store.settings.masked_endpoint} did not answer "
+                  f"before the {DEADLINE_S:.0f}s deadline; no bucket was created."
+              )
+          print(f"reachable: {store.settings.diagnostics}")
+          print(f"bucket ready: {ensure_bucket(store)}")
+          PY
+
+      - name: Attachment HTTP behaviour (real PostgreSQL + real MinIO)
+        # upload/download byte identity, the re-read digest, immutability once
+        # ready, one winner for two concurrent uploads, the refusal planes, the
+        # non-member 404 collapse, and the GC that lists the real bucket.
+        run: uv run pytest apps/api/tests/api -m attachments -v --junitxml=api-attachments.xml
+
+      - name: Guard - the twelve attachment cases ran, passed, and skipped nothing
+        # The same treatment the `api` job gives its seven groups: parse the JUnit
+        # XML and count real elements, so an equivalently named case cannot
+        # substitute for a missing one and a skip is never acceptance. Kept in
+        # lockstep with check_test_reports.py's api-attachments entry; the script
+        # below is the authority, this is the readable copy in the file.
+        run: |
+          uv run python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # One name per load-bearing claim of plan §7.1.
+          required = {
+              # §2 the whole happy path, bytes verified byte-identical.
+              "test_upload_then_download_is_byte_identical",
+              # D6: a re-read digest, not an ETag or a client claim.
+              "test_the_declared_digest_is_verified_against_the_stored_bytes",
+              "test_a_wrong_declared_digest_is_refused_and_leaves_no_ready_row",
+              # D5: the object is immutable once ready.
+              "test_a_second_upload_to_a_ready_attachment_is_refused_and_changes_nothing",
+              # D5: one winner, one object, for two concurrent PUTs.
+              "test_two_concurrent_uploads_produce_one_winner_and_one_object",
+              # A lost response plus a client retry is still one ready row.
+              "test_replaying_the_same_upload_after_a_commit_is_still_one_row",
+              # D20: metadata, content and upload all collapse to 404 for a non-member.
+              "test_a_non_member_cannot_read_metadata_content_or_upload",
+              # 413 and 400 on the two refusal planes.
+              "test_a_declared_size_over_the_cap_is_attachment_too_large",
+              "test_an_svg_upload_is_refused",
+              # D3: an attachment never touches the sync kernel.
+              "test_an_attachment_never_moves_the_sync_cursor_or_the_event_log",
+              # D8: the GC collects expired pending rows and leaves ready ones.
+              "test_gc_removes_expired_pending_rows_and_leaves_ready_ones",
+              # interface §4: the immutable four-segment storage key.
+              "test_the_object_lives_under_the_contract_key",
+          }
+          path = "api-attachments.xml"
+          try:
+              cases = list(ET.parse(path).getroot().iter("testcase"))
+          except (OSError, ET.ParseError) as exc:
+              print(f"::error::{path}: {exc}")
+              sys.exit(1)
+          rejected = [c for c in cases if any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
+          missing = required - {c.attrib.get("name") for c in cases}
+          print(f"{path}: tests={len(cases)} rejected={len(rejected)} missing={sorted(missing)}")
+          if not cases or rejected or missing:
+              print(f"::error::acceptance incomplete: {path}")
+              sys.exit(1)
+          PY
+
+      - name: Guard the attachment acceptance report
+        # Focused-group mode on purpose: this job produces one of the eight report
+        # groups, so demanding the other seven here would ask for files it never
+        # generates. The `api` job's guard covers its own seven.
+        run: uv run python apps/api/scripts/check_test_reports.py --group attachments
+
+      - name: Upload the attachments test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: api-attachments-reports
+          path: api-attachments.xml
           if-no-files-found: warn
           retention-days: 7
 
@@ -493,7 +717,7 @@ jobs:
   # ------------------------------------------------------------------------- #
   image:
     name: image (build + push to GHCR)
-    needs: [api, web, web-e2e]
+    needs: [api, api-attachments, web, web-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

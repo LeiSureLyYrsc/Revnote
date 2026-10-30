@@ -1,8 +1,10 @@
-"""Guard the exact seven Phase 3 API report groups without printing failure bodies.
+"""Guard the exact eight API report groups without printing failure bodies.
 
-By default every CI group is required. Repeat --group for focused verification;
-that does not stand in for the default full group gate. --full-report optionally
-checks an additional aggregate report, never instead of the seven group reports.
+Seven are the Phase 3 groups and one, ``api-attachments``, is the Phase 5
+real-PostgreSQL-plus-real-MinIO group. By default every one of the eight is
+required. Repeat --group for focused verification; that does not stand in for
+the default full group gate. --full-report optionally checks an additional
+aggregate report, never instead of the eight group reports.
 """
 
 from __future__ import annotations
@@ -14,8 +16,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# Exact extraction of the Phase 3 ci.yml acceptance inventory. Do not replace
-# these names with total counts: a larger unrelated group cannot prove a case ran.
+# Exact extraction of the CI acceptance inventory. Do not replace these names
+# with total counts: a larger unrelated group cannot prove a case ran.
 REQUIRED: dict[str, set[str]] = {
     "api-unit.xml": set(),
     "api-integration.xml": {
@@ -75,6 +77,34 @@ REQUIRED: dict[str, set[str]] = {
         "test_socket_disconnect_stops_batch",
         "test_commit_survives_a_lost_response",
         "test_the_probe_serves_http_on_a_real_socket",
+    },
+    # Phase 5: real PostgreSQL + real object storage, one case per load-bearing
+    # claim of plan §7.1. A fake store cannot satisfy these: the digest is
+    # recomputed by re-reading the object, the single winner is decided by a row
+    # lock plus a CAS predicate, and the GC case lists the real bucket.
+    "api-attachments.xml": {
+        # §2 the whole happy path, bytes verified byte-identical.
+        "test_upload_then_download_is_byte_identical",
+        # D6: a re-read digest, not an ETag or a client claim.
+        "test_the_declared_digest_is_verified_against_the_stored_bytes",
+        "test_a_wrong_declared_digest_is_refused_and_leaves_no_ready_row",
+        # D5: the object is immutable once ready.
+        "test_a_second_upload_to_a_ready_attachment_is_refused_and_changes_nothing",
+        # D5: one winner, one object, for two concurrent PUTs.
+        "test_two_concurrent_uploads_produce_one_winner_and_one_object",
+        # A lost response plus a client retry is still one ready row.
+        "test_replaying_the_same_upload_after_a_commit_is_still_one_row",
+        # D20: metadata, content and upload all collapse to 404 for a non-member.
+        "test_a_non_member_cannot_read_metadata_content_or_upload",
+        # 413 and 400 on the two refusal planes.
+        "test_a_declared_size_over_the_cap_is_attachment_too_large",
+        "test_an_svg_upload_is_refused",
+        # D3: an attachment never touches the sync kernel.
+        "test_an_attachment_never_moves_the_sync_cursor_or_the_event_log",
+        # D8: the GC collects expired pending rows and leaves ready ones.
+        "test_gc_removes_expired_pending_rows_and_leaves_ready_ones",
+        # interface §4: the immutable four-segment storage key.
+        "test_the_object_lives_under_the_contract_key",
     },
 }
 GROUPS = {filename.removeprefix("api-").removesuffix(".xml"): filename for filename in REQUIRED}
@@ -138,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"api/full: {exc}", file=sys.stderr)
             failed = True
     if args.group:
-        print("Focused group evidence only; the default seven-group gate is still required.")
+        print("Focused group evidence only; the default eight-group gate is still required.")
     return int(failed)
 
 

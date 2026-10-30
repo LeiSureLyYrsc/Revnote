@@ -21,6 +21,22 @@ export const E2E_LABELS = [
   'cursor_integrity',
   'markdown_preservation',
   'mobile_layout',
+  // Phase 5 (interface §9): real object storage through the API proxy.
+  // `attachment_upload_insert`      - upload -> ready -> Markdown reference in
+  //                                   the note body -> sync -> reload -> preview
+  //                                   fetches the real bytes back.
+  // `attachment_cross_client_read`  - a second BrowserContext pulls the
+  //                                   reference and downloads identical bytes.
+  // `attachment_authorization`      - another account gets 404, an over-limit
+  //                                   body gets 413, a disallowed MIME is
+  //                                   refused; the body text survives all three.
+  // `attachment_offline_gate`       - offline: the entry point is disabled with
+  //                                   a stated reason, no binary reaches
+  //                                   IndexedDB, and the body text is kept.
+  'attachment_upload_insert',
+  'attachment_cross_client_read',
+  'attachment_authorization',
+  'attachment_offline_gate',
 ] as const
 
 export type Runner = 'vitest' | 'playwright'

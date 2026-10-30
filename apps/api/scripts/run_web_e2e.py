@@ -1,9 +1,27 @@
-"""Own a real API/Vite/browser test run against a fresh external PostgreSQL database.
+"""Own a real API/Vite/browser test run against fresh PostgreSQL and real object storage.
 
 The caller owns PostgreSQL and creates a third, empty, disposable database. This
 runner never starts/stops PostgreSQL, drops a database, reads a development env
 file, or attaches to a pre-existing HTTP service. Diagnostics deliberately omit
 child output, URLs, credentials and assertion bodies. See apps/web/e2e/README.md.
+
+Object storage has exactly two modes, and neither one is a fake:
+
+``owned``
+    No ``WEB_E2E_MINIO_ENDPOINT`` in the environment. The runner verifies the
+    pinned binary (``D:\\tools\\minio.exe``, SHA-256 below) and starts **its own**
+    child on a reserved loopback port with a throwaway data directory and
+    per-run credentials, then polls readiness through the project's own adapter.
+
+``external``
+    ``WEB_E2E_MINIO_ENDPOINT`` is set. That address, plus
+    ``WEB_E2E_MINIO_ACCESS_KEY``/``WEB_E2E_MINIO_SECRET_KEY``, describes a store
+    the caller owns (the CI service container). The runner creates one bucket per
+    run and never starts a server.
+
+In both modes a store that cannot be prepared is a **hard failure**, never a
+skip: ``REQUIRE_OBJECT_STORAGE_TESTS=1`` is exported to every child, and a
+skipped attachment group is indistinguishable from a passing one.
 """
 
 from __future__ import annotations
@@ -318,9 +336,552 @@ def wait_http(process: subprocess.Popen[bytes], url: str, run_id: str | None = N
     raise LifecycleError("An owned HTTP server did not become ready before the deadline.")
 
 
+# --------------------------------------------------------------------------- #
+# real object storage (owned child or caller-owned endpoint)
+# --------------------------------------------------------------------------- #
+
+#: The pinned real MinIO binary used by ``owned`` mode on this box. Both values
+#: are recorded in docs/phase5-validation.md; the hash is compared before every
+#: launch and a mismatch refuses to start (no silent substitution, no download).
+MINIO_BINARY = Path(r"D:\tools\minio.exe")
+MINIO_BINARY_SHA256 = "af709e6ba68488404e85acdd22a3030d0f5e56a108d4b27d744f18ceb50861b4"
+
+#: Data directories go under ``D:\tmp`` on purpose. ``%TEMP%`` is on ``C:`` here,
+#: which has ~5 GB free, and MinIO answers ``XMinioStorageFull`` (HTTP 507) on a
+#: volume below its own free-space floor - which the adapter correctly translates
+#: into ``attachment_storage_unavailable`` and turns into 14 false failures. The
+#: real storage tests therefore never use the default temp directory.
+MINIO_TMP_ROOT = Path(r"D:\tmp")
+
+#: Bucket prefix for one run. S3 legal (lowercase, hyphens), recognisable, and
+#: never the bucket a developer's ``OBJECT_STORAGE_BUCKET`` names.
+MINIO_BUCKET_PREFIX = "revnote-att-"
+
+#: Bound for one store preparation. Creating a bucket and probing readiness on a
+#: store that is already listening is sub-second; this only stops a wedged store
+#: from hanging the whole browser suite.
+MINIO_READY_DEADLINE_S = 60.0
+
+#: Poll interval for readiness. The probe itself is a real adapter call.
+MINIO_READY_INTERVAL_S = 0.1
+
+
+class ObjectStorage:
+    """One run's real object store: where it is, and which bucket is ours.
+
+    Deliberately holds no printable credential. ``describe()`` renders
+    ``host:port`` and the bucket; the access key and the secret key live in the
+    private attributes and only ever travel into a child's environment.
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        bucket: str,
+        owned_by_runner: bool,
+        process: subprocess.Popen[bytes] | None = None,
+        data_dir: Path | None = None,
+        port: int | None = None,
+    ) -> None:
+        self.endpoint = endpoint
+        self._access_key = access_key
+        self._secret_key = secret_key
+        self.bucket = bucket
+        self.owned_by_runner = owned_by_runner
+        self.process = process
+        self.data_dir = data_dir
+        self.port = port
+        #: Set by ``export_to`` once the bucket really exists. A teardown must not
+        #: try to purge a bucket that was never created: the preparation failure is
+        #: the only failure the caller should see.
+        self._bucket_created = False
+        #: Set by ``discard`` when the bucket could not be fully removed. Reported
+        #: by the runner's ``finally`` instead of being mistaken for a clean exit.
+        self._cleanup_incomplete = False
+
+    # -- safe rendering ------------------------------------------------------ #
+
+    @property
+    def host_port(self) -> str:
+        """``host:port`` exactly as the adapter receives it (credentials removed)."""
+        return re.sub(r"^https?://", "", self.endpoint).rsplit("@", 1)[-1].rstrip("/")
+
+    def describe(self) -> str:
+        """The only printable form: address, bucket and which mode produced them."""
+        mode = "owned" if self.owned_by_runner else "external"
+        return f"mode={mode} endpoint={self.host_port} bucket={self.bucket}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"ObjectStorage({self.describe()})"
+
+    # -- environment --------------------------------------------------------- #
+
+    def child_values(self) -> dict[str, str]:
+        """The per-run settings every owned child gets, replacing inherited ones.
+
+        Returns the storage-connection names the *API* reads
+        (``OBJECT_STORAGE_*``) plus the two attachment switches. Credentials are
+        values here, so this dict is never printed, logged or persisted.
+        """
+        return {
+            "OBJECT_STORAGE_ENDPOINT": self.endpoint,
+            "OBJECT_STORAGE_BUCKET": self.bucket,
+            "OBJECT_STORAGE_ACCESS_KEY": self._access_key,
+            "OBJECT_STORAGE_SECRET_KEY": self._secret_key,
+            "OBJECT_STORAGE_SECURE": "false",
+            "OBJECT_STORAGE_TIMEOUT_S": "10",
+            "ATTACHMENTS_ENABLED": "true",
+            # Set explicitly for every child: a store was promised to this run, so
+            # the acceptance group must connect or fail. This is the release gate.
+            "REQUIRE_OBJECT_STORAGE_TESTS": "1",
+        }
+
+    def adapter(self):
+        """The project's real ``S3BlobStore`` bound to this run's store.
+
+        Readiness is polled **through the product's own adapter**, not through a
+        bare HTTP probe on ``/minio/health/ready``: the question this runner has
+        to answer is "can the code that will serve requests reach its bucket",
+        and only the adapter answers that (credentials, TLS flag, bucket
+        existence, SDK timeout all included).
+        """
+        from revnote_api.storage.s3 import S3BlobStore
+        from revnote_api.storage.settings import ObjectStorageSettings
+
+        return S3BlobStore(
+            ObjectStorageSettings(
+                _env_file=None,
+                endpoint=self.endpoint,
+                bucket=self.bucket,
+                access_key=self._access_key,
+                secret_key=self._secret_key,
+                secure=False,
+                timeout_s=10.0,
+            )
+        )
+
+    async def export_to(self, env: dict[str, str]) -> None:
+        """Create this run's bucket through the adapter and copy its values into ``env``.
+
+        This is the one step that makes a store *usable* by this run, so it is also
+        the step that fails loudly: ``export_to`` either leaves ``env`` with the
+        complete per-run ``OBJECT_STORAGE_*``/``ATTACHMENTS_ENABLED`` set (and the
+        bucket existing) or raises a fixed :class:`LifecycleError`. It never half
+        succeeds, because a child started without these values would silently run
+        against no store at all.
+        """
+        from revnote_api.storage.bootstrap import ensure_bucket
+
+        await _await_storage_ready(self)
+        try:
+            ensure_bucket(self.adapter())
+        except Exception as exc:
+            # The type only: an SDK message can quote the endpoint or a bucket.
+            raise LifecycleError(
+                f"Object storage at {self.host_port} could not create this run's bucket "
+                f"({type(exc).__name__})."
+            ) from None
+        self._bucket_created = True
+        env.update(self.child_values())
+
+    async def discard(self) -> None:
+        """Delete every object in this run's bucket, then the bucket.
+
+        Order is the contract, not a convenience: S3 refuses to delete a
+        non-empty bucket. Each step is attempted even when the previous one
+        failed, and a failure is recorded on the instance so ``finally`` can note
+        it without replacing the error that caused the teardown.
+
+        A bucket that was never created is nothing to remove: ``export_to`` raises
+        before setting :attr:`_bucket_created`, and the original preparation
+        failure must not be followed by a misleading cleanup failure.
+        """
+        if not self._bucket_created:
+            return
+        try:
+            purge_and_drop_bucket = _bucket_wide_purge()
+            store = self.adapter()
+            purge_and_drop_bucket(store, self.bucket)
+        except Exception:
+            # Deliberately broad and deliberately swallowed here: this runs on the
+            # unwind path, the flag is what the caller asked for, and a raise would
+            # mask the failure that caused the teardown.
+            self._cleanup_incomplete = True
+
+
+async def _await_storage_ready(storage: ObjectStorage) -> None:
+    """Poll until the store *itself* answers, or fail.
+
+    No fixed sleep loop: the wait is a bounded retry of a real probe, so a fast
+    store costs one call and a slow one is still bounded.
+
+    **Why not ``adapter().ready()`` here.** ``BlobStore.ready()`` is
+    ``bucket_exists``: it answers "is *this run's* bucket there". That is the right
+    question for a serving process, and the wrong one for this function - the
+    bucket is created by :meth:`ObjectStorage.export_to` *after* this wait returns,
+    so polling it would wait for something only the next step can produce. (Found
+    exactly that deadlock: owned mode timed out after the full deadline with a
+    perfectly healthy server.) Readiness here is therefore "the server accepts us
+    and the SDK can reach it", which is what the following bucket creation needs.
+    """
+    from revnote_api.storage.bootstrap import probe_store
+
+    store = storage.adapter()
+    deadline = time.monotonic() + MINIO_READY_DEADLINE_S
+    while time.monotonic() < deadline:
+        if storage.process is not None and storage.process.poll() is not None:
+            raise LifecycleError("The owned object store exited before becoming ready.")
+        try:
+            if probe_store(store):
+                return
+        except Exception:
+            # A transport failure is "not ready yet" here; the deadline decides.
+            pass
+        await asyncio.sleep(MINIO_READY_INTERVAL_S)
+    raise LifecycleError(
+        f"Object storage at {storage.host_port} did not become ready before the deadline."
+    )
+
+
+def verify_minio_binary() -> str:
+    """Refuse to launch an unverified binary; return the digest actually read.
+
+    The pin is a security boundary, not bookkeeping: this runner spawns whatever
+    sits at that path. A mismatch or a missing file is a fixed failure rather
+    than a fallback (a downloaded or rebuilt binary must be a deliberate change).
+    """
+    if not MINIO_BINARY.is_file():
+        raise LifecycleError(
+            "The pinned object-store binary is absent; owned mode cannot start. "
+            "Set WEB_E2E_MINIO_ENDPOINT to use an external store instead."
+        )
+    digest = hashlib.sha256()
+    try:
+        with MINIO_BINARY.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        raise LifecycleError("The pinned object-store binary could not be read.") from None
+    actual = digest.hexdigest()
+    if actual != MINIO_BINARY_SHA256:
+        raise LifecycleError(
+            "The pinned object-store binary does not match its recorded SHA-256; "
+            "refusing to start it."
+        )
+    return actual
+
+
+def start_owned_storage(
+    run_id: str, owned: list[subprocess.Popen[bytes]], env: dict[str, str]
+) -> ObjectStorage:
+    """Start our own real MinIO child on a reserved loopback port and prepare its bucket.
+
+    Everything here is per-run: port, data directory, credential pair and bucket
+    name. The data directory lives under :data:`MINIO_TMP_ROOT` (a ``D:`` path),
+    never ``%TEMP%``, because MinIO refuses to run usefully on a volume below its
+    free-space floor and the system temp directory is on the small volume here.
+    """
+    verify_minio_binary()
+    access_key = f"revnote{run_id[:16]}"
+    secret_key = f"secret_{run_id}"
+    data_dir = MINIO_TMP_ROOT / f"revnote-minio-{run_id[:16]}"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=False)
+    except OSError:
+        raise LifecycleError("Could not create a throwaway object-store data directory.") from None
+    try:
+        reservation = reserve_port(0)
+    except LifecycleError:
+        shutil.rmtree(data_dir, ignore_errors=True)
+        raise
+    port = reservation.getsockname()[1]
+    reservation.close()
+    child_env = dict(env)
+    # Selected by the caller as ``owned`` mode, so a stray MINIO_* in the shell
+    # (scrubbed by ``child_environment``) is irrelevant; these are the only ones
+    # the child sees.
+    child_env.update(
+        MINIO_ROOT_USER=access_key,
+        MINIO_ROOT_PASSWORD=secret_key,
+        MINIO_BROWSER="off",
+    )
+    try:
+        process = spawn(
+            [
+                str(MINIO_BINARY),
+                "server",
+                str(data_dir),
+                "--address",
+                f"127.0.0.1:{port}",
+                "--console-address",
+                "127.0.0.1:0",
+                "--quiet",
+            ],
+            child_env,
+            REPO_ROOT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        shutil.rmtree(data_dir, ignore_errors=True)
+        raise LifecycleError("The owned object store could not be started.") from None
+    owned.append(process)
+    storage = ObjectStorage(
+        endpoint=f"http://127.0.0.1:{port}",
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=f"{MINIO_BUCKET_PREFIX}{run_id[:24]}",
+        owned_by_runner=True,
+        process=process,
+        data_dir=data_dir,
+        port=port,
+    )
+    return storage
+
+
+def external_storage(run_id: str) -> ObjectStorage:
+    """Describe the caller-owned store named by ``WEB_E2E_MINIO_ENDPOINT``.
+
+    Absent credentials are a hard failure: this mode promises a real store, and
+    an anonymous adapter can only fail later with a confusing 503.
+    """
+    raw_endpoint = os.environ.get("WEB_E2E_MINIO_ENDPOINT", "").strip()
+    access_key = os.environ.get("WEB_E2E_MINIO_ACCESS_KEY", "").strip()
+    secret_key = os.environ.get("WEB_E2E_MINIO_SECRET_KEY", "").strip()
+    if not raw_endpoint or not access_key or not secret_key:
+        raise LifecycleError(
+            "WEB_E2E_MINIO_ENDPOINT requires WEB_E2E_MINIO_ACCESS_KEY and "
+            "WEB_E2E_MINIO_SECRET_KEY as well."
+        )
+    host = re.sub(r"^https?://", "", raw_endpoint).rsplit("@", 1)[-1].rstrip("/")
+    if not re.fullmatch(r"(?:127\.0\.0\.1|localhost|::1):\d{1,5}", host):
+        # The browser suite talks to the API only, so a non-loopback store is not
+        # a leak by itself - but this runner is not the place to invent a policy
+        # for one. Refuse, and let the caller say what they meant.
+        raise LifecycleError("WEB_E2E_MINIO_ENDPOINT must be a loopback host:port for this runner.")
+    return ObjectStorage(
+        endpoint=raw_endpoint if "://" in raw_endpoint else f"http://{raw_endpoint}",
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=f"{MINIO_BUCKET_PREFIX}{run_id[:24]}",
+        owned_by_runner=False,
+        port=int(host.rsplit(":", 1)[1]),
+    )
+
+
+def stop_owned_storage(storage: ObjectStorage | None) -> bool:
+    """Stop an owned store, remove its data directory, confirm the port was released.
+
+    Returns ``True`` when cleanup has to be reported. Only an ``owned`` store has
+    a child to stop: an external one is left exactly as it was found, because the
+    caller owns its lifetime.
+    """
+    if storage is None or not storage.owned_by_runner:
+        return False
+    incomplete = bool(getattr(storage, "_cleanup_incomplete", False))
+    if storage.process is not None:
+        try:
+            stop_owned(storage.process)
+        except (OSError, subprocess.SubprocessError):
+            incomplete = True
+    if storage.data_dir is not None:
+        shutil.rmtree(storage.data_dir, ignore_errors=True)
+    if storage.port is not None and not _port_released(storage.port):
+        incomplete = True
+    return incomplete
+
+
+def _port_released(port: int) -> bool:
+    """True once nothing listens on ``127.0.0.1:port`` any more.
+
+    Probed by *binding* it again rather than by asking the OS for a connection
+    table: a bind is the same operation the next run's ``reserve_port`` performs,
+    so this confirms the thing that actually has to be true.
+    """
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+            probe.listen(1)
+            return True
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            probe.close()
+    return False
+
+
+#: The same promise variable the attachment suite reads
+#: (``pg_support.object_storage``). Truthiness matches it exactly, so a caller and
+#: the children of a run can never disagree about what counts as "promised".
+REQUIRE_OBJECT_STORAGE_TESTS_ENV = "REQUIRE_OBJECT_STORAGE_TESTS"
+
+#: Truthy spellings this runner treats as "no". Deliberately the same set the
+#: suite uses (``pg_support.object_storage.FALSY_VALUES``).
+FALSY_ENV_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+#: ``pg_support`` is not an installed package: it lives beside the suite it serves.
+#: Appended (never inserted) so it cannot shadow an installed module of that name.
+PG_SUPPORT_ROOT = REPO_ROOT / "apps" / "api" / "tests"
+
+
+def object_storage_is_promised() -> bool:
+    """Whether the *caller* promised a real store via ``REQUIRE_OBJECT_STORAGE_TESTS``.
+
+    Read from the caller's environment, never from ``env``: ``child_environment``
+    scrubs the value and ``export_to`` sets the per-child one, so reading the child
+    copy would let this runner satisfy a promise it made to itself.
+    """
+    return os.environ.get(REQUIRE_OBJECT_STORAGE_TESTS_ENV, "").strip().lower() not in (
+        FALSY_ENV_VALUES
+    )
+
+
+def external_storage_requested() -> bool:
+    """``WEB_E2E_MINIO_ENDPOINT`` selects the caller-owned store; absent means owned."""
+    return bool(os.environ.get("WEB_E2E_MINIO_ENDPOINT", "").strip())
+
+
+def _bucket_wide_purge() -> Callable[[object, str], None]:
+    """Resolve the suite's bucket-wide purge, or fail with a fixed message.
+
+    ``purge_and_drop_bucket`` deliberately lives in test support rather than in the
+    product: emptying a whole bucket is exactly the operation
+    ``revnote_api.storage.bootstrap.purge_prefix`` refuses to express (it requires a
+    non-empty prefix). Importing it here keeps that single implementation instead of
+    growing a second, subtly different delete in this script.
+
+    The import is deferred and path-augmented because the runner is executed as a
+    script from ``apps/api/scripts``: ``apps/api/tests`` is neither on ``sys.path``
+    nor an installed distribution, so a bare module-level import would fail at
+    teardown time - the worst possible moment to discover it.
+    """
+    if str(PG_SUPPORT_ROOT) not in sys.path:
+        sys.path.append(str(PG_SUPPORT_ROOT))
+    try:
+        from pg_support.object_storage import purge_and_drop_bucket
+    except Exception:
+        # Fixed message: an ImportError can quote a filesystem path.
+        raise LifecycleError(
+            "The object-storage cleanup support is unavailable; this run's bucket may remain."
+        ) from None
+    return purge_and_drop_bucket
+
+
+async def start_object_storage(
+    run_id: str, owned: list[subprocess.Popen[bytes]], env: dict[str, str]
+) -> ObjectStorage:
+    """Start (or adopt) this run's real store; the bucket comes next.
+
+    Two modes, decided by the environment and by nothing else: a caller-owned store
+    when ``WEB_E2E_MINIO_ENDPOINT`` is set, otherwise our own pinned child. An owned
+    child is appended to ``owned`` so the lifecycle's single teardown loop sees it.
+
+    Split from :func:`prepare_object_storage` on purpose. ``main`` needs the object
+    *before* the bucket exists, so its ``finally`` can discard and stop whatever was
+    already created when preparation fails. One fused helper would either leak an
+    owned child or leave ``storage`` unbound at exactly the moment cleanup matters.
+    """
+    mode = "external" if external_storage_requested() else "owned"
+    try:
+        return (
+            external_storage(run_id)
+            if mode == "external"
+            else start_owned_storage(run_id, owned, env)
+        )
+    except LifecycleError:
+        raise
+    except Exception as exc:
+        # Only the type: a spawn or SDK message can quote a path or an endpoint.
+        raise _storage_failure(mode, f"could not be started ({type(exc).__name__})") from None
+
+
+async def prepare_object_storage(storage: ObjectStorage, env: dict[str, str]) -> None:
+    """Create this run's bucket and publish the per-run values into ``env``.
+
+    Called by ``main`` **before any child is spawned**: the migration, the API, Vite
+    and the browser all read the same ``env``, and a child started earlier would run
+    with ``ATTACHMENTS_ENABLED`` unset - the upload entry point disabled and the
+    required attachment labels unreachable.
+
+    Every failure is a fixed :class:`LifecycleError`. Nothing here degrades into
+    "continue without a store": a run that cannot prepare its bucket fails, because a
+    skipped attachment group cannot be told apart from a passing one.
+    """
+    mode = "owned" if storage.owned_by_runner else "external"
+    try:
+        await storage.export_to(env)
+    except LifecycleError:
+        raise
+    except Exception as exc:
+        raise _storage_failure(
+            mode, f"could not prepare this run's bucket ({type(exc).__name__})"
+        ) from None
+    # Assert the outcome rather than trusting it: the whole point of this step is the
+    # *set of values the children receive*, so a store that was constructed but did
+    # not publish them is a failure, not a near miss. ``REQUIRE_OBJECT_STORAGE_TESTS``
+    # is included because the acceptance group must never silently deselect itself.
+    required = (
+        "OBJECT_STORAGE_ENDPOINT",
+        "OBJECT_STORAGE_BUCKET",
+        "OBJECT_STORAGE_ACCESS_KEY",
+        "OBJECT_STORAGE_SECRET_KEY",
+        "ATTACHMENTS_ENABLED",
+        REQUIRE_OBJECT_STORAGE_TESTS_ENV,
+    )
+    unpublished = [name for name in required if not env.get(name)]
+    if unpublished:
+        raise _storage_failure(
+            mode,
+            "was prepared but published no per-run values for "
+            f"{', '.join(unpublished)} in the child environment",
+        )
+
+
+def _storage_failure(mode: str, detail: str) -> LifecycleError:
+    """One fixed, credential-free message for every store failure.
+
+    ``mode`` is a literal this module chose (``owned``/``external``) and ``detail`` is
+    either a literal or an exception *type* - never a path, endpoint, bucket key or
+    SDK message. The trailing clause names the promise when the caller made one, so a
+    log says whether the run merely needed a store or had been told one was present.
+    """
+    promised = (
+        f" {REQUIRE_OBJECT_STORAGE_TESTS_ENV}=1 was requested, so this run cannot continue "
+        "without a store."
+        if object_storage_is_promised()
+        else " Set WEB_E2E_MINIO_ENDPOINT to a prepared store, or install the pinned binary."
+    )
+    return LifecycleError(f"The {mode} object store {detail}.{promised}")
+
+
 def child_environment(database_url: str, run_id: str) -> dict[str, str]:
     """No inherited app settings can redirect a test to a development target."""
-    prefixes = ("DATABASE_", "DB_", "AUTH_", "ARGON2_", "SYNC_", "SERVER_", "VITE_")
+    prefixes = (
+        "DATABASE_",
+        "DB_",
+        "AUTH_",
+        "ARGON2_",
+        "SYNC_",
+        "SERVER_",
+        "VITE_",
+        # Phase 5. Without these three a developer who exported their own MinIO
+        # or attachment settings (a real compose stack, a shared bucket) would
+        # have them inherited by the API, Vite and the browser child: the API
+        # would then talk to a store this run does not own, and
+        # ``REQUIRE_OBJECT_STORAGE_TESTS=1`` would prove the developer's bucket
+        # instead of this run's. The prefixes are scrubbed and the per-run
+        # values are set explicitly below.
+        "MINIO_",
+        "ATTACHMENT_",
+        "OBJECT_STORAGE_",
+    )
     env = {
         key: value
         for key, value in os.environ.items()
@@ -626,6 +1187,7 @@ def print_lifecycle_diagnostics(
     api_url: str,
     web_url: str,
     control: TestControl | None,
+    storage: ObjectStorage | None = None,
 ) -> None:
     """Bounded, credential-free state of the owned lifecycle at failure time.
 
@@ -641,7 +1203,10 @@ def print_lifecycle_diagnostics(
         "Owned processes: "
         f"api-initial={process_alive(api) if api is not None else 'absent'} "
         f"api-current={process_alive(current) if current is not None else 'absent'} "
-        f"vite={process_alive(web) if web is not None else 'absent'}",
+        f"vite={process_alive(web) if web is not None else 'absent'} "
+        # The object store is an owned child too, so "exited" here is the quickest
+        # explanation for a wall of attachment failures.
+        f"minio={process_alive(storage.process) if storage and storage.process else 'absent'}",
         file=sys.stderr,
     )
     print(
@@ -649,6 +1214,11 @@ def print_lifecycle_diagnostics(
         f"web-proxy={probe_status(f'{web_url}/api/health')}",
         file=sys.stderr,
     )
+    if storage is not None:
+        # ``describe()`` renders mode/endpoint/bucket and holds no credential: the
+        # access and secret keys live in private attributes that only ever travel
+        # into a child's environment.
+        print(f"Object storage: {storage.describe()}", file=sys.stderr)
     if control is not None:
         print(control.describe(), file=sys.stderr)
 
@@ -887,7 +1457,16 @@ def main(argv: list[str] | None = None) -> int:
     reservations: list[socket.socket] = []
     job = WindowsJob() if os.name == "nt" else None
     control: TestControl | None = None
+    storage: ObjectStorage | None = None
     try:
+        # Object storage first: its per-run values must be in ``env`` before the
+        # migration, the API, Vite and the browser are spawned, or every one of them
+        # starts without ``ATTACHMENTS_ENABLED`` and the upload entry point stays
+        # disabled. A store that cannot be prepared is a hard failure here - never a
+        # run that continues with no bucket, which would turn a required attachment
+        # group into something indistinguishable from a passing one.
+        storage = asyncio.run(start_object_storage(run_id, owned, env))
+        asyncio.run(prepare_object_storage(storage, env))
         api_socket = reserve_port(args.api_port)
         reservations.append(api_socket)
         web_socket = reserve_port(args.web_port)
@@ -992,6 +1571,20 @@ def main(argv: list[str] | None = None) -> int:
         # Cleanup must never replace the failure that caused it: a raise inside
         # `finally` would hide the original evidence (and skip the safe output).
         cleanup_failed = False
+        # The bucket goes before its server: S3 refuses to delete a non-empty bucket,
+        # and stopping the child first would leave the bucket behind on every run.
+        # This is the plan's documented order (objects -> bucket -> process), and the
+        # reason it is worth being explicit is that a leaked bucket outlives the run
+        # and is invisible until someone audits the store.
+        if storage is not None:
+            try:
+                asyncio.run(storage.discard())
+            except Exception:
+                cleanup_failed = True
+            try:
+                stop_owned_storage(storage)
+            except (OSError, subprocess.SubprocessError):
+                cleanup_failed = True
         try:
             if control is not None:
                 control.close()

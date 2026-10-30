@@ -25,6 +25,14 @@
 # release tags. They are a statement of intent, NOT a verified pull: no digest
 # is pinned because none could be retrieved, and no digest may be invented.
 #
+# The server tag is RELEASE.2025-09-07T16-13-09Z rather than the earlier
+# RELEASE.2025-09-06T17-38-46Z because 09-06 publishes no Windows asset, and the
+# local real-storage acceptance run uses the OFFICIAL Windows build of 09-07
+# (SHA-256 and provenance in docs/phase5-validation.md). Compose and CI pin the
+# same tag so the container and the binary under local acceptance are one
+# release. That still proves nothing about pullability: nobody has pulled this
+# tag on a Docker host yet.
+#
 # CONSEQUENCE: the MinIO portion is NOT accepted as runnable yet. Confirm an
 # official pull and review the selected release's security status before use.
 # Do not substitute a third-party rebuild without explicit approval.
@@ -38,7 +46,7 @@
 # `minio/mc` is the official client image; it is used as a sidecar because the
 # server image's bundled tooling must not be assumed.
 x-minio-server: &minio-server
-  image: quay.io/minio/minio:RELEASE.2025-09-06T17-38-46Z
+  image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
 x-minio-client: &minio-client
   image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
 

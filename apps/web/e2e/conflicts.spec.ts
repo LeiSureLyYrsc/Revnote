@@ -23,10 +23,18 @@ test('manual_conflict independent browser clients preserve base local remote and
     await page.getByRole('button', { name: /^冲突与恢复/ }).click()
     const panel = page.getByTestId('conflict-panel')
     await expect(panel.getByRole('button', { name: '以本地内容提交', exact: true }).first()).toBeVisible()
-    same(await panel.getByLabel('基础版本', { exact: true }).last().textContent(), 'shared-base')
-    same(await panel.getByLabel('本地版本', { exact: true }).last().textContent(), 'retained-local')
-    same(await panel.getByLabel('远端版本', { exact: true }).last().textContent(), 'new-remote')
-    await panel.getByRole('button', { name: '以本地内容提交', exact: true }).last().click()
+    // Scope to the record that carries this local version rather than reading
+    // ``.last()`` across whatever records happen to be rendered. A second recovery
+    // record can appear while the panel is open (that is what the rest of this case
+    // tests), and ``.last()`` would then read - or click - the wrong one. The
+    // assertions are unchanged in what they require of base/local/remote; they are
+    // now about *one* record instead of whichever happened to be last.
+    const record = panel.locator('article').filter({ hasText: 'retained-local' })
+    await expect(record).toHaveCount(1)
+    await expect(record.getByLabel('基础版本', { exact: true })).toHaveText('shared-base')
+    await expect(record.getByLabel('本地版本', { exact: true })).toHaveText('retained-local')
+    await expect(record.getByLabel('远端版本', { exact: true })).toHaveText('new-remote')
+    await record.getByRole('button', { name: '以本地内容提交', exact: true }).click()
     // A third version commits after the resolution UI was opened, before the
     // explicit local CAS is submitted. It must produce another preserved conflict.
     await edit(rival, 'remote-advanced-again')
@@ -36,8 +44,12 @@ test('manual_conflict independent browser clients preserve base local remote and
       const state = await localState(page)
       return state.recoveryRecords.some(record => !record.resolved && record.local?.bodyMd === 'retained-local' && record.remote?.body_md === 'remote-advanced-again')
     }).toBe(true)
-    await panel.getByRole('button', { name: '以本地内容提交', exact: true }).last().click()
-    await panel.getByRole('button', { name: '确认以本地内容提交', exact: true }).click()
+    // The newest record is the one whose remote version advanced; identify it by that
+    // text instead of by position, for the same reason as above.
+    const advanced = panel.locator('article').filter({ hasText: 'remote-advanced-again' })
+    await expect(advanced).toHaveCount(1)
+    await advanced.getByRole('button', { name: '以本地内容提交', exact: true }).click()
+    await advanced.getByRole('button', { name: '确认以本地内容提交', exact: true }).click()
     await serverBody(request, identity, id, 'retained-local')
     await idle(page)
     expect((await localState(page)).recoveryRecords.some(record => record.resolved && record.local?.bodyMd === 'retained-local')).toBe(true)

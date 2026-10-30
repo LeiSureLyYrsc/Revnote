@@ -186,6 +186,48 @@ api/full: passed=1157 required=46; zero skips/failures/errors
 
 另修正两处自身问题：报告守卫用例不再硬编码 spec 行号（改为从文件解析，保持严格但不受无关编辑影响）；`resync_preservation` 标题按 Oracle A 项改为「保留」语义。
 
+### CI 稳定性：同一 SHA 连续三轮全绿
+
+对 `c57c77a`（run **40982876850**，`push` 事件，headSha 精确匹配）在 attempt 1 通过之后重跑两次。**三次 attempt 的四个作业全部 success**：
+
+| 作业 | attempt 1 | attempt 2 | attempt 3 |
+|---|---|---|---|
+| api（lint + types + unit + postgres integration + http + migrations） | success | success | success |
+| web（lint + typecheck + build + markdown + unit + components） | success | success | success |
+| web-e2e（Chromium + native API + real PostgreSQL） | success | success | success |
+| image（build + push to GHCR） | success | success | success |
+
+因此接管竞态修复在三次独立执行下稳定成立，包含此前失败的 web-e2e 作业；`image` 仅在所有检查通过后运行，符合发布门禁设计。
+
+### 我在验证方法上连续犯的四个错误（记录以免重犯）
+
+全部为我的 harness 缺陷，**没有一次是真实测试失败**：
+
+1. 用 `| Out-Null` 吞掉输出后再读 `$LASTEXITCODE`，得到虚假的 `255`。
+2. owned PG 控制器虚拟环境被系统清理后，读到**残留的旧绿色报告**而误判通过（因退出码不一致才发现）。
+3. `pnpm.cmd` 是 `.cmd` 包装层，`--grep "a|b"` 中的 `|` 被 `cmd.exe` 当作管道，把 `manual_conflict` 当成命令执行（`'manual_conflict' 不是内部或外部命令`）；`--grep "(a|b)"` 同样失败。对照证明：同一命令只传单个标签时 `exit=0` 且输出 `Web E2E focused: passed`。
+4. runner 的 `playwright_args` 是 `argparse.REMAINDER`，转发浏览器选项必须以 `--` 起始（runner 自行剥离）。
+
+修正后的验证方式：每次只跑一个标签（路径中不出现管道符）、以参数列表直接调用 subprocess，且每轮**同时要求**退出码 0、runner 自身的 `Web E2E focused: passed` 标志行、以及本轮新生成的报告文件，缺一即判失败。
+
+### 本地定向重复验证（针对历史 flaky 用例）
+
+`single_writer_takeover` 与 `manual_conflict` 都曾在无代码变更的情况下失败过，因此单独做重复验证。每次只跑一个标签（避免 `pnpm.cmd` 对 `|` 的解析问题），每轮先删除 focused 报告，并要求退出码 0 + runner 自身通过标志行 + 本轮新报告同时成立：
+
+```text
+round 1 single_writer_takeover: exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 1 manual_conflict:        exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 2 single_writer_takeover: exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 2 manual_conflict:        exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 3 single_writer_takeover: exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 3 manual_conflict:        exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 4 single_writer_takeover: exit=0 cases=1 passed=1 attempts_gt1=0 OK
+round 4 manual_conflict:        exit=0 cases=1 passed=1 attempts_gt1=0 OK
+FOCUSED_FAILURES=0 of 8
+```
+
+收尾再跑一次全量：`cases=16 passed=16 errors=0 attempts_gt1=0 labels=16`，退出码 0。
+
 ## 全量真实浏览器验收（本地最终通过）
 
 本地门禁（已提交代码状态，全新一次性数据库）：`pnpm test:e2e` →
@@ -271,6 +313,12 @@ b92f70c test(web): confirm the writer crash for real on linux ci
 提交后状态门禁：`uv sync --locked` 0、`pnpm install --frozen-lockfile` 0、`ruff check` 0、`ruff format --check` 0、`lint:web` 0（0 error / 2 既有 Fast Refresh 提示）、`typecheck:web` 0、`test:markdown` 7/7、`build:web` 0、`test:web` 176 passed、报告守卫 `vitest/full 176` 与 `playwright/full 16` 均零 skip/retry/error。
 
 范围核验：`apps/api/src` 与 `alembic/versions` 零改动；禁词扫描 0 命中；无 `.env`、HAR、storageState、报告产物被跟踪；仓库根用户提示文件保持未跟踪且未删除。
+
+## 阶段结论
+
+Phase 4 的本地实现与验收已完成，远端 CI 对最终 SHA `c57c77a` 连续三次全绿（含 web-e2e 与 image）。交付范围为受控预览：真实浏览器 → 同源代理 → 真实 API → 真实 PostgreSQL 的完整链路已由 16 个承重用例证明，含刷新持久化、离线恢复、响应丢失不重复写、ACK 不吞后续编辑、人工冲突、远端删除恢复、双标签交接、refresh 不确定性、账号隔离、游标与重建、Markdown 原文保护与 390px 布局。
+
+仍未提供（本阶段明确不做）：完全离线冷启动、页面关闭后的后台同步、PWA/Service Worker、附件/MinIO、Joplin 桥、自动三方合并、snapshot 分页、搜索与公网加固。本机缓存不是磁盘加密，也不能替代备份；受控预览不等于公网生产就绪。
 
 ## 首次整合 Web 检查（浏览器前）
 

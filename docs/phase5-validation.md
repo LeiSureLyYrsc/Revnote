@@ -572,3 +572,26 @@ CI 里 RustFS 的取用方式：下载官方 release 归档
 `rustfs-linux-x86_64-musl-v1.0.4.zip`，**先校验 SHA-256**
 `4924ad4b699b9f59943051efedae2d1eb6d4cac503a1b0384c4b25f7c2c31b5c`（不符即失败），
 解包后以 `server --address … --console-address …` 启动，再用 boto3 `create_bucket`（path-style）建桶。
+
+### 最终提交与 CI（同一提交连续两轮全绿）
+
+| SHA | run | 第一轮 | 第二轮（`gh run rerun`） |
+|---|---|---|---|
+| `a5bd99105c71f07be171929772de3674f602d2a3` | [`41015570298`](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41015570298) | **全绿**（exit 0） | **全绿**（exit 0） |
+| `6dd0e4c38c9b0c0dd9c42a1159452bee0c79f2d3` | [`41017943531`](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41017943531) | **全绿**（exit 0） | **全绿**（exit 0） |
+
+两轮的五个 job（api / api-attachments / web / web-e2e / image）均为 `success`。
+`api-attachments` 与 `web-e2e` 在 CI 上使用真实 RustFS（按归档 SHA-256 校验后启动）。
+
+### 记录一次真实的 flake 与它的修复
+
+`manual_conflict`（`conflicts.spec.ts`）在只改文档的提交上也连续失败过多次。诊断与处理：
+
+- 该用例用 `panel.getByLabel(...).last()` 读取三条版本投影，并用 `.last()` 点击解决按钮。
+  这只在「面板只渲染一条恢复记录」时成立，而同一用例**故意**会创建第二条记录——于是
+  `.last()` 指向的是面板恰好最后绘制的那一条，属于真实的竞态。报告按设计隐去了断言文本，
+  所以 CI 只能告诉我们标签与位置，不能告诉我们哪一条读取失败。
+- 修复方式：把每条断言**限定到它描述的那条记录**（用本地/远端版本文本定位），并改为 web-first
+  的 `toHaveText`，让它等待该记录出现而不是在某一瞬间采样列表；同时用 `toHaveCount(1)`
+  把该用例本就假设的状态显式固定下来。三条期望值与原来完全相同，没有放宽。
+- 修复后本地重复运行 3/3 通过，CI 上 `6dd0e4c` 连续两轮全绿（其中 `web-e2e` 两个轮次都通过）。

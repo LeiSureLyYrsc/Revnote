@@ -101,9 +101,10 @@ Web 请求 `/api/health` 时，Vite **仅精确将该路径**转发至 API `/hea
 Phase 4 的批准范围见 [实施计划](docs/plan-phase4.md)，进行中的实际运行结果见 [Phase 4 验收记录](docs/phase4-validation.md)。记录中的专项通过不等于整个阶段或发布已通过。
 
 ```powershell
-uv run ruff check apps/api
-uv run ruff format --check apps/api
+uv run ruff check apps/api apps/cli
+uv run ruff format --check apps/api apps/cli
 uv run pytest apps/api/tests
+uv run pytest apps/cli/tests
 pnpm --filter @revnote/web lint
 pnpm --filter @revnote/web typecheck
 pnpm --filter @revnote/web build
@@ -150,7 +151,7 @@ Remove-Item Env:WEB_E2E_DATABASE_URL
 
 runner 显式迁移并拥有 API/Vite/浏览器子进程，在 finally 清理，不接管既有服务、不读取开发 `.env`；PG 的停止责任属于外部控制器。不要在含适用根 `.env` 的工作区运行此 runner；使用独立测试工作区，不删除用户开发配置。详见 [浏览器验收清单](apps/web/e2e/README.md)。默认关闭 trace、HAR、storageState、视频与截图，报告仅保存 hash、固定标签和计数，不提交认证状态、正文或数据库目录。
 
-Web 报告门禁要求各组非零、无 skip/todo/failure/error、无 retries/only 且覆盖承重标签。focused 报告与 full 分目录，局部绿色不代替全量验收。`check:api-reports` 要求当前 CI 七组 JUnit 报告及原有承重名称，不以总数替代覆盖。
+Web 报告门禁要求各组非零、无 skip/todo/failure/error、无 retries/only 且覆盖承重标签。focused 报告与 full 分目录，局部绿色不代替全量验收。`check:api-reports` 默认要求当前 CI 十组 JUnit 报告（`api` job 八组 + `api-attachments` job 的 attachments/joplin 两组）及原有承重名称，不以总数替代覆盖。
 
 ### 认证与原生 API
 
@@ -237,6 +238,18 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 - 本阶段**没有**新迁移、没有服务端快照租约表、没有跨请求长事务；并发写入由 `pull since=as_of_seq` 补齐，不把更新泄漏进已钉页。
 
 **Phase 7 明确不做**：自动三方合并、参考 CLI、公网加固、附件进入事件流、Joplin 功能扩张、MinIO/第二对象存储。验证以 [Phase 7 实际验收记录](docs/phase7-validation.md) 为准。
+
+**Phase 8（参考 CLI）已实现**，范围与决策见 [实施计划](docs/plan-phase8.md)，命令契约见 [参考 CLI 说明](docs/phase8-reference-cli.md)，实际证据见 [Phase 8 验收记录](docs/phase8-validation.md)：
+
+- 新 workspace 成员 `apps/cli`（`revnote-cli`），入口 `revnote`；`uv sync --locked` 后 `uv run --package revnote-cli revnote --help` 可用。它是原生 `/api/v1` 的第二官方消费者，不实现 Joplin 协议方言。
+- 认证：`login` / `refresh` / `logout` / `me`；token 只写用户配置目录（Windows `%APPDATA%\revnote`，可用 `REVNOTE_CONFIG_DIR` 覆盖），不打印、不进仓库；access 过期时一次自动 refresh。
+- 只读：`tree`、`note get`、`capabilities`（后者无需登录）。
+- 同步：`sync snapshot` 感知 `snapshot_pagination` 后按 `limit`+`cursor` 拼页，钉住首页 `as_of_seq`，跨页去重，最多 1000 页；无能力时回退 legacy 无参路径。`sync pull` 默认连续拉完游标；`sync push` 支持原始 ops 文件与 note create/update。
+- 冲突诚实失败：服务端 409 或 push 结果 `status=conflict` 时 CLI 以 **4** 退出并在 stderr 给出固定错误码；不自动合并、不覆盖、不重试。退出码表：0 成功 / 2 用法 / 3 认证 / 4 冲突 / 5 API/网络 / 6 未找到。
+- 附件最小闭环：`attachment upload`（建 pending + 代理 PUT + `X-Content-SHA256`）、`attachment download`（流式）、`attachment info`；没有预签名、没有第二存储。
+- CI：`api` job 增加 `api-cli.xml` 报告与 no-skip 守卫，`check_test_reports.py` 默认十组；既有五 job 形状不变。
+- **明确不做**：自动三方合并、Joplin CLI、PyPI 发布、后台守护/TUI、公网加固、附件删除/GC、MinIO。
+- 本阶段**无服务端迁移**、无 `/api/v1` 契约改动；Web/Joplin/附件/快照分页语义保持 Phase 7 不变。
 
 ## Actions 与 GHCR
 

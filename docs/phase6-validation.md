@@ -87,11 +87,24 @@ Notes on what the 17 bridge cases prove (one case per claim of plan §3.2):
 
 ## 4. CI
 
-Status: **pending push**. It will be filled with the actual run id, the job
-results, and the second run on the same SHA. Until then this section is not
-evidence.
+The workflow is unchanged in shape: the same five jobs. `api-attachments` now
+also runs `-m joplin` and produces `api-joplin.xml`, guarded by
+`check_test_reports.py --group joplin` (17 required case names).
+
+Rounds 1 and 2 below are the **same SHA**, run back to back, on the
+implementation commit before this evidence file was added.
 
 | Round | SHA | Run | api | api-attachments (incl. `-m joplin`) | web | web-e2e | image |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | — | — | — | — | — | — | — |
-| 2 (same SHA) | — | — | — | — | — | — | — |
+| 1 | `eb743f5` | [41024247226](https://github.com/LeiSureLyYrsc/Revnote/actions/runs/41024247226) | success | success | success | success | success |
+| 2 (same SHA) | `eb743f5` | same run, attempt 2 | success | success | success | success | success |
+
+Both rounds: `conclusion=success`, five jobs `success`, no skipped acceptance
+case. The `api-attachments` job therefore produced both the 24-case Phase 5
+report and the 17-case Joplin report on a real RustFS.
+
+This evidence commit changes the tip; per the build rule the tip was then run
+twice more on its own SHA. Those two runs (same run id, attempts 1 and 2) are
+recorded with their links in
+`.slim/deepwork/phase6-build/progress.md` (local, git-ignored), because a file
+cannot contain the SHA of the commit that adds it.

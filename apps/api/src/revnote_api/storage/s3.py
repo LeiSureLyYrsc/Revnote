@@ -1,36 +1,48 @@
-"""The S3/MinIO adapter: the only module in the service that knows a store exists.
+"""The S3 adapter: the only module in the service that knows a store exists.
+
+The store is any S3-compatible server. The bundled development and CI target is
+RustFS, but nothing here may depend on that: the client is boto3 with path-style
+addressing, so the same code serves a local RustFS, a gateway, or a managed S3
+bucket without a branch. Vendor names belong in deployment configuration, not in
+the adapter.
 
 Design notes that matter
 ------------------------
-**Everything runs off the event loop.** The MinIO SDK is synchronous and
-``urllib3``-backed, so every call goes through :meth:`S3BlobStore._call`, which
-wraps it in :func:`asyncio.to_thread` under an explicit ``asyncio.wait_for``
-deadline. Without the deadline a hung socket would pin a thread from the default
-executor *and* the awaiting task forever, and enough of those would wedge the
-process - the timeout is what turns "the store is having a bad day" into a
-``StorageUnavailable`` the caller can retry.
+**Everything runs off the event loop.** boto3 is synchronous and ``urllib3``-backed,
+so every call goes through :meth:`S3BlobStore._call`, which wraps it in
+:func:`asyncio.to_thread` under an explicit ``asyncio.wait_for`` deadline. Without
+the deadline a hung socket would pin a thread from the default executor *and* the
+awaiting task forever, and enough of those would wedge the process - the timeout is
+what turns "the store is having a bad day" into a ``StorageUnavailable`` the caller
+can retry.
 
 **The upload never holds the object in memory.** ``put`` pulls from the caller's
 async iterator 64 KiB at a time, hashing and counting as it goes, and spools those
 bytes into a ``SpooledTemporaryFile`` that stays in RAM only for small objects and
 rolls over to disk past a fixed threshold. The SDK then streams *out of the spool*
-with an exact length, which is the one shape it can upload without either buffering
-the whole object itself or guessing a multipart part size. Memory is therefore
-O(chunk) plus a constant; the object lands on disk before it lands in the store,
-and a 25 MiB attachment cannot become a 25 MiB allocation per concurrent uploader.
+with an exact ``ContentLength``, which is the one shape it can upload without either
+buffering the whole object itself or guessing a multipart part size. Memory is
+therefore O(chunk) plus a constant; the object lands on disk before it lands in the
+store, and a 25 MiB attachment cannot become a 25 MiB allocation per concurrent
+uploader.
 
 **Two hashes, one truth.** ``put`` measures what it wrote; ``digest`` re-reads the
 object and measures it again (D6). Neither an ETag nor a ``Content-Length`` is
-consulted: both are the store's *claim* about the object, and the whole point is an
-independent measurement. ``put``'s digest is the first opinion; only the pair is
-evidence.
+consulted for that second measurement: both are the store's *claim* about the
+object, and the whole point is an independent measurement. ``put``'s digest is the
+first opinion; only the pair is evidence.
 
-**No SDK exception escapes unshaped.** ``minio`` raises ``S3Error`` whose message
-embeds the object key, the bucket, the request id and whatever the server echoed -
-``InvalidResponseError`` even embeds a response *body*. All of it is translated to
-``StorageUnavailable`` (or its ``StorageClientError`` subclass for faults a retry
-cannot fix) carrying a fixed phrase plus structured classification (the S3 code, the
-HTTP status). The original stays on ``__cause__``, which only a local debugger sees.
+**No SDK exception escapes unshaped.** A ``ClientError`` carries the object key, the
+bucket, the request id and whatever the server echoed; ``BotoCoreError`` variants
+can embed a URL. All of it is translated to ``StorageUnavailable`` (or its
+``StorageClientError`` subclass for faults a retry cannot fix) carrying a fixed
+phrase plus structured classification (the S3 code, the HTTP status). The original
+stays on ``__cause__``, which only a local debugger sees.
+
+**Retries are off in the client.** ``retries={"max_attempts": 0}`` on purpose: this
+adapter already classifies failure and the caller decides whether to retry, so a
+hidden SDK retry loop would silently multiply both the latency of a dead store and
+the apparent size of the timeout above it.
 
 **Nothing here logs.** Not a key, not a MIME value, not a byte count, not a
 credential. A store call knows all four, and every one of them is user data or an
@@ -47,8 +59,9 @@ import tempfile
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Final
 
-from minio import Minio
-from minio.error import InvalidResponseError, MinioException, S3Error, ServerError
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 from revnote_api.storage.ports import (
     BlobDigest,
@@ -79,7 +92,7 @@ SPOOL_MAX_BYTES: Final[int] = CHUNK_SIZE * 8
 #: S3 codes that mean "this key is not there". Only these become
 #: :meth:`S3BlobStore.stat` returning ``None``; everything else still raises.
 _MISSING_OBJECT_CODES: Final[frozenset[str]] = frozenset(
-    {"NoSuchKey", "NoSuchObject", "NoSuchVersion", "ResourceNotFound"}
+    {"NoSuchKey", "NoSuchObject", "NoSuchVersion", "NotFound", "ResourceNotFound"}
 )
 
 #: Codes that mean "the store answered, but this deployment is wrong": the bucket is
@@ -90,9 +103,9 @@ _CONFIGURATION_CODES: Final[frozenset[str]] = frozenset(
     {
         "AccessDenied",
         "InvalidAccessKeyId",
+        "InvalidBucketName",
         "NoSuchBucket",
         "SignatureDoesNotMatch",
-        "XMinioInvalidObjectName",
     }
 )
 
@@ -125,7 +138,7 @@ class _MissingObject(StorageUnavailable):
 
 
 class S3BlobStore:
-    """A :class:`~revnote_api.storage.ports.BlobStore` over the official SDK.
+    """A :class:`~revnote_api.storage.ports.BlobStore` over boto3.
 
     One instance per process is fine: the SDK's ``urllib3`` pool is thread-safe and
     every call here is stateless, so two concurrent uploads cannot observe each
@@ -136,7 +149,7 @@ class S3BlobStore:
         self,
         settings: ObjectStorageSettings,
         *,
-        client: Minio | None = None,
+        client: Any | None = None,
         timeout_s: float | None = None,
     ) -> None:
         """Build an adapter; ``client`` exists so a unit test can inject a fake.
@@ -160,14 +173,15 @@ class S3BlobStore:
         return self._settings
 
     @property
-    def client(self) -> Minio:
+    def client(self) -> Any:
         """The SDK client this adapter drives.
 
         Exposed for the ops helpers in :mod:`revnote_api.storage.bootstrap`, which
         need bucket administration and bulk deletes the port deliberately does not
-        offer. It is **not** a seam for request paths: everything the service may do
-        goes through the port, and reaching for this from a route would be the exact
-        layering break the port exists to prevent.
+        offer, and for the acceptance tests that inspect the real bucket. It is
+        **not** a seam for request paths: everything the service may do goes through
+        the port, and reaching for this from a route would be the exact layering
+        break the port exists to prevent.
         """
         return self._client
 
@@ -207,6 +221,9 @@ class S3BlobStore:
         Empty chunks are skipped rather than treated as end-of-stream: an async
         iterator may legitimately yield ``b""`` between reads, and stopping there
         would truncate the object at a point the client never chose.
+
+        A zero-byte body is accepted here and rejected by the *service*: "you sent
+        nothing" is a request problem, and the store is not the layer that owns it.
         """
         if max_bytes < 0:
             raise ValueError("max_bytes must not be negative")
@@ -237,11 +254,11 @@ class S3BlobStore:
             await self._call(
                 "put",
                 self._client.put_object,
-                self._settings.bucket,
-                key,
-                spool,
-                total,
-                content_type=content_type or "application/octet-stream",
+                Bucket=self._settings.bucket,
+                Key=key,
+                Body=spool,
+                ContentLength=total,
+                ContentType=content_type or "application/octet-stream",
             )
         return digest
 
@@ -252,7 +269,7 @@ class S3BlobStore:
 
         Every stored byte is pulled back through the same chunk size used to write it
         and hashed again, so the result measures the object rather than describing
-        it. ``stat_object``/``etag`` are deliberately not used: an ETag is not
+        it. ``head_object``/``ETag`` are deliberately not used for this: an ETag is not
         necessarily a content digest (multipart, SSE, replication all change it), and
         even an exact one is the store reporting on itself - which is exactly the
         claim this call exists to check.
@@ -262,20 +279,21 @@ class S3BlobStore:
         response = await self._call(
             "digest",
             self._client.get_object,
-            self._settings.bucket,
-            key,
+            Bucket=self._settings.bucket,
+            Key=key,
         )
+        body = response["Body"]
         try:
             while True:
-                piece = await self._call("digest", response.read, CHUNK_SIZE)
+                piece = await self._call("digest", body.read, CHUNK_SIZE)
                 if not piece:
                     break
-                if not isinstance(piece, bytes):  # pragma: no cover - urllib3 contract
+                if not isinstance(piece, bytes):  # pragma: no cover - SDK contract
                     raise StorageUnavailable("object storage returned a non-bytes read")
                 hasher.update(piece)
                 total += len(piece)
         finally:
-            await _release(response)
+            await _release(body)
         return BlobDigest(sha256_hex=hasher.hexdigest(), size=total)
 
     async def stat(self, key: str) -> BlobStat | None:
@@ -289,13 +307,13 @@ class S3BlobStore:
         try:
             result = await self._call(
                 "stat",
-                self._client.stat_object,
-                self._settings.bucket,
-                key,
+                self._client.head_object,
+                Bucket=self._settings.bucket,
+                Key=key,
             )
         except _MissingObject:
             return None
-        return BlobStat(key=key, size=int(getattr(result, "size", 0)))
+        return BlobStat(key=key, size=int(result.get("ContentLength", 0)))
 
     def iter_chunks(self, key: str, *, chunk_size: int = CHUNK_SIZE) -> AsyncIterator[bytes]:
         """Stream one object in bounded chunks; ``StorageUnavailable`` if absent.
@@ -306,7 +324,7 @@ class S3BlobStore:
         believes is stored. The object is therefore opened *before* the first byte is
         yielded (see :meth:`_iter_chunks`).
 
-        Backpressure is the async generator's own: each ``response.read`` runs on a
+        Backpressure is the async generator's own: each ``body.read`` runs on a
         worker thread only when the consumer asks for the next chunk, so a slow client
         stalls the store read instead of filling a buffer.
         """
@@ -319,26 +337,27 @@ class S3BlobStore:
 
         Shaped as an async generator so cancellation is honest: when the client
         disconnects Starlette stops iterating, ``GeneratorExit`` runs the ``finally``,
-        and the SDK response is released back to the pool. Buffering the object into a
-        queue first would leak the connection - and the pooled socket - on exactly the
-        failure path that is most common in production.
+        and the SDK body is closed. Buffering the object into a queue first would leak
+        the connection - and the pooled socket - on exactly the failure path that is
+        most common in production.
         """
         response = await self._call(
             "read",
             self._client.get_object,
-            self._settings.bucket,
-            key,
+            Bucket=self._settings.bucket,
+            Key=key,
         )
+        body = response["Body"]
         try:
             while True:
-                piece = await self._call("read", response.read, chunk_size)
+                piece = await self._call("read", body.read, chunk_size)
                 if not piece:
                     return
-                if not isinstance(piece, bytes):  # pragma: no cover - urllib3 contract
+                if not isinstance(piece, bytes):  # pragma: no cover - SDK contract
                     raise StorageUnavailable("object storage returned a non-bytes read")
                 yield piece
         finally:
-            await _release(response)
+            await _release(body)
 
     # -- delete ------------------------------------------------------------- #
 
@@ -352,9 +371,9 @@ class S3BlobStore:
         try:
             await self._call(
                 "delete",
-                self._client.remove_object,
-                self._settings.bucket,
-                key,
+                self._client.delete_object,
+                Bucket=self._settings.bucket,
+                Key=key,
             )
         except _MissingObject:
             # S3 DELETE is specified as idempotent and answers 204 for an absent key,
@@ -369,20 +388,23 @@ class S3BlobStore:
 
         Answers ``False`` instead of raising: a readiness probe that throws cannot
         distinguish "not ready yet" from "the probe itself is broken". The probe is
-        deliberately shallow (``bucket_exists``) - a deep probe would need write access
+        deliberately shallow (``head_bucket``) - a deep probe would need write access
         on a health endpoint, which is a much worse thing to expose than a slightly
         weaker check.
+
+        Note this answers "is *my* bucket there", which is why the bootstrap waiter
+        polls :func:`revnote_api.storage.bootstrap.probe_store` instead: a bucket that
+        is created one step later can never satisfy this probe.
         """
         try:
-            return bool(
-                await self._call(
-                    "ready",
-                    self._client.bucket_exists,
-                    self._settings.bucket,
-                )
+            await self._call(
+                "ready",
+                self._client.head_bucket,
+                Bucket=self._settings.bucket,
             )
         except BlobStoreError:
             return False
+        return True
 
     # -- internals ---------------------------------------------------------- #
 
@@ -398,8 +420,8 @@ class S3BlobStore:
         The single funnel every adapter call goes through, which is what makes the
         timeout claim true: there is no second path to the SDK that could forget it.
         Every exception is translated here (see :meth:`_translate`), so no raw
-        ``minio`` exception - whose message embeds the object key, the bucket, the
-        request id and, in one case, a response body - ever leaves this module.
+        ``botocore`` exception - whose fields include the object key, the bucket, the
+        request id and sometimes a URL - ever leaves this module.
         """
         try:
             return await asyncio.wait_for(
@@ -439,68 +461,73 @@ class S3BlobStore:
         """
         if isinstance(exc, _MissingObject):
             return exc
-        if isinstance(exc, S3Error):
-            code = exc.code or "unknown"
-            status = getattr(getattr(exc, "response", None), "status", None)
-            if code in _MISSING_OBJECT_CODES:
-                return _MissingObject(f"object is absent during {operation} ({code})")
+        if isinstance(exc, ClientError):
+            error = getattr(exc, "response", {}).get("Error", {}) or {}
+            metadata = getattr(exc, "response", {}).get("ResponseMetadata", {}) or {}
+            code = str(error.get("Code", "unknown"))
+            status = metadata.get("HTTPStatusCode")
+            # Configuration codes are tested FIRST: ``NoSuchBucket`` arrives with a
+            # 404, and the generic 404 fallback below would otherwise report a missing
+            # bucket as "the object is gone" - which is how a masked outage becomes a
+            # silent re-upload into a bucket that does not exist.
             if code in _CONFIGURATION_CODES:
                 return StorageClientError(
                     f"object storage rejected {operation} ({code}, http {status})"
                 )
+            if code in _MISSING_OBJECT_CODES or status == 404:
+                return _MissingObject(f"object is absent during {operation} ({code})")
             return StorageUnavailable(
                 f"object storage failed during {operation} ({code}, http {status})"
             )
-        if isinstance(exc, ServerError):
+        if isinstance(exc, BotoCoreError):
+            # Connection/timeout/config failures. The class name is safe; the message
+            # can embed an endpoint, a bucket or a credential-shaped parameter.
             return StorageUnavailable(
-                f"object storage failed during {operation} (http {exc.status_code})"
+                f"object storage was unreachable during {operation} ({type(exc).__name__})"
             )
-        if isinstance(exc, InvalidResponseError):
-            # Its message embeds the response *body*; only the fact is kept.
-            return StorageUnavailable(f"object storage answered {operation} with a non-S3 body")
-        if isinstance(exc, MinioException):
-            return StorageUnavailable(f"object storage failed during {operation} (sdk)")
         if isinstance(exc, _TRANSPORT_ERRORS):
             return StorageUnavailable(f"object storage was unreachable during {operation}")
         if isinstance(exc, ValueError):
-            # The SDK validates keys and bucket names with ``ValueError``; a rejected
-            # argument is our bug or a malformed key, never a transient condition.
+            # A rejected argument is our bug or a malformed key, never a transient
+            # condition.
             return StorageClientError(f"object storage rejected {operation} (invalid argument)")
         return StorageUnavailable(f"object storage failed during {operation} (unexpected)")
 
 
-async def _release(response: Any) -> None:
-    """Close and release an SDK response without letting the cleanup raise.
+async def _release(body: Any) -> None:
+    """Close and release an SDK body without letting the cleanup raise.
 
-    ``release_conn`` returns the socket to the pool; if it fails the connection is
-    already unusable and the exception would replace whatever the ``finally`` is
-    unwinding - including the real reason the read stopped. Swallowed on purpose.
+    ``close`` returns the socket to the pool; if it fails the connection is already
+    unusable and the exception would replace whatever the ``finally`` is unwinding -
+    including the real reason the read stopped. Swallowed on purpose.
     """
-    closer = getattr(response, "close", None)
+    closer = getattr(body, "close", None)
     if callable(closer):
         with contextlib.suppress(Exception):
             closer()
-    releaser = getattr(response, "release_conn", None)
-    if callable(releaser):
-        with contextlib.suppress(Exception):
-            releaser()
 
 
-def _build_client(settings: ObjectStorageSettings) -> Minio:
-    """Construct the SDK client from settings.
+def _build_client(settings: ObjectStorageSettings) -> Any:
+    """Construct the boto3 client from settings.
 
-    ``secure`` comes from :attr:`ObjectStorageSettings.is_secure`, which reconciles an
-    ``https://`` endpoint with the separate flag. The SDK is given the bare
-    ``host:port`` because it prepends the scheme itself.
-
-    The SDK's own ``urllib3`` pool is left at its defaults deliberately: it already
-    retries idempotent 5xx responses, and giving it a second, differently-tuned retry
-    policy here would multiply the two - so the visible retry budget would no longer
-    be the one the timeout describes.
+    Path-style addressing is explicit rather than inferred: a local S3-compatible
+    server has no wildcard DNS for virtual-host buckets, and the difference between
+    the two styles is the single most common reason a working credential appears
+    broken. ``retries`` is zero because this module classifies failure itself (see the
+    module docstring).
     """
-    return Minio(
-        settings.host_port,
-        access_key=settings.access_key,
-        secret_key=settings.secret_key,
-        secure=settings.is_secure,
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.endpoint,
+        aws_access_key_id=settings.access_key,
+        aws_secret_access_key=settings.secret_key,
+        region_name=settings.region,
+        use_ssl=settings.is_secure,
+        config=Config(
+            s3={"addressing_style": "path"},
+            signature_version="s3v4",
+            connect_timeout=settings.timeout_s,
+            read_timeout=settings.timeout_s,
+            retries={"max_attempts": 0},
+        ),
     )

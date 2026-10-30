@@ -5,7 +5,7 @@ The package exists to keep one arrow honest: ``services -> storage.ports``, neve
 ``Protocol`` and the exception types) and imports nothing third-party, so the service
 layer can be imported and unit-tested without an object-store SDK in the picture.
 
-``s3`` is the only module that imports ``minio``, and it is the only place that knows
+``s3`` is the only module that imports the S3 SDK, and it is the only place that knows
 a bucket, an endpoint or a credential exists. ``settings`` reads the connection
 configuration and masks its credential values in ``repr``; ``bootstrap`` holds the
 create-bucket and purge-prefix helpers, which are for operators and tests and are

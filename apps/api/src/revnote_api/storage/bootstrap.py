@@ -12,7 +12,7 @@ the audience they are written for.
 Importable without side effects
 -------------------------------
 Nothing runs at import: no client is constructed, no environment is read, no bucket is
-touched. A module-level ``Minio(...)`` would make merely importing the package attempt
+touched. A module-level client would make merely importing the package attempt
 a connection and pull credentials into a module global, which is both surprising and a
 needless failure mode for the unit suite.
 
@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Final
+
+from botocore.exceptions import ClientError
 
 from revnote_api.storage.ports import BlobStoreError
 
@@ -77,16 +79,15 @@ def ensure_bucket(store_or_settings: S3BlobStore | ObjectStorageSettings) -> str
     """
     client, settings = _resolve(store_or_settings)
     try:
-        if not client.bucket_exists(settings.bucket):
-            client.make_bucket(settings.bucket)
+        if not _bucket_exists(client, settings.bucket):
+            client.create_bucket(Bucket=settings.bucket)
     except BlobStoreError:
         raise
     except Exception as exc:
         # ``from exc`` keeps the S3 code reachable for a debugger while the message
         # names only the *setting* and the address - never a credential or a key.
         raise BucketBootstrapError(
-            "could not create the configured OBJECT_STORAGE_BUCKET "
-            f"(endpoint={settings.masked_endpoint})"
+            f"could not create the configured S3_BUCKET (endpoint={settings.masked_endpoint})"
         ) from exc
     return settings.bucket
 
@@ -110,7 +111,7 @@ def probe_store(store_or_settings: S3BlobStore | ObjectStorageSettings) -> bool:
     """
     client, _settings = _resolve(store_or_settings)
     try:
-        list(client.list_buckets())
+        client.list_buckets()
     except Exception:
         # Deliberately broad: "not reachable yet" spans transport errors, auth
         # rejections during startup and SDK mapping quirks. The caller's deadline
@@ -214,21 +215,18 @@ def _resolve(
 def _iter_keys(client: Any, bucket: str, prefix: str) -> Iterator[str]:
     """Every key under ``prefix``, as a flat iterator.
 
-    ``recursive=True`` because object keys have no hierarchy: a non-recursive listing
-    would filter by a synthetic ``/`` delimiter and silently miss the deeper segments
-    of a ``ws/{id}/att/{id}/{nonce}`` key. The listing handle is closed in a
-    ``finally`` so an abandoned purge does not leak its HTTP response.
+    Paginated by hand because S3 caps one listing page at 1000 keys: a single
+    ``list_objects_v2`` call would silently truncate a large purge and report success
+    for the part it happened to see. Object keys have no real hierarchy, so the
+    listing is flat and every segment of a ``ws/{id}/att/{id}/{nonce}`` key is
+    included.
     """
-    listing = client.list_objects(bucket, prefix=prefix, recursive=True)
-    try:
-        for item in listing:
-            key = getattr(item, "object_name", None)
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for item in page.get("Contents", ()) or ():
+            key = item.get("Key")
             if isinstance(key, str) and key:
                 yield key
-    finally:
-        closer = getattr(listing, "close", None)
-        if callable(closer):
-            closer()
 
 
 def _batched(keys: Iterator[str], size: int) -> Iterator[list[str]]:
@@ -246,12 +244,30 @@ def _batched(keys: Iterator[str], size: int) -> Iterator[list[str]]:
 def _remove_batch(client: Any, bucket: str, keys: list[str]) -> tuple[int, int]:
     """Delete one batch; return ``(removed, failed)`` counts.
 
-    The SDK's ``remove_objects`` is a generator that yields one error per object it
-    could not delete, so it must be drained to completion - the deletions happen as it
-    is consumed, and abandoning it early leaves objects in place while reporting
-    success.
+    S3 reports per-key outcomes in ``Errors`` while still returning ``200`` for the
+    request as a whole, so a batch is only "done" once the error list has been read -
+    counting the request status alone would report a failed delete as success.
     """
-    from minio.deleteobjects import DeleteObject
-
-    failed = sum(1 for _ in client.remove_objects(bucket, [DeleteObject(k) for k in keys]))
+    response = client.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": key} for key in keys], "Quiet": False},
+    )
+    failed = len(response.get("Errors", ()) or ())
     return len(keys) - failed, failed
+
+
+def _bucket_exists(client: Any, bucket: str) -> bool:
+    """Whether ``bucket`` exists, treating "absent" as a normal answer.
+
+    A ``head_bucket`` 404 arrives as a ``ClientError``; a 403 on some servers also
+    means "not there for you", which is indistinguishable from absent at this layer
+    and is handled by the caller's create attempt rather than guessed at here.
+    """
+    try:
+        client.head_bucket(Bucket=bucket)
+    except ClientError as exc:
+        metadata = getattr(exc, "response", {}).get("ResponseMetadata", {}) or {}
+        if metadata.get("HTTPStatusCode") == 404:
+            return False
+        raise
+    return True

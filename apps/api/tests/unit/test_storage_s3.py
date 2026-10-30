@@ -1,4 +1,4 @@
-"""The S3 adapter against a fake client: chunked digest math, limits, error mapping.
+"""The S3 adapter against a fake boto3 client: chunked digest math, limits, error mapping.
 
 Why a fake client and not a real store
 -------------------------------------
@@ -11,7 +11,7 @@ all. Real round trips are the real-storage suite's job, behind
 
 The fake is a real object with real methods, not a ``Mock``: the adapter has to keep
 working when the SDK's exact attribute surface changes, and a mock would happily
-accept a call shape the real SDK rejects. ``FakeMinio`` therefore *asserts* the shape
+accept a call shape the real SDK rejects. ``FakeS3Client`` therefore *asserts* the shape
 of every call it receives.
 """
 
@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from minio.error import InvalidResponseError, S3Error, ServerError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from revnote_api.storage import s3 as s3_module
 from revnote_api.storage.ports import BlobDigest, BlobTooLarge, StorageUnavailable
@@ -69,12 +69,17 @@ class FakeResponse:
         self.released += 1
 
 
-class FakeMinio:
-    """The subset of ``minio.Minio`` the adapter uses, with call-shape assertions.
+class FakeS3Client:
+    """The subset of a boto3 S3 client the adapter uses, with call-shape assertions.
 
     ``objects`` is the store: ``{key: bytes}``. Every mutation goes through it, so a
     test can assert on *exactly* what the store would hold - which is what makes "the
     digest describes what was written" checkable instead of assumed.
+
+    boto3 answers with plain dicts and takes keyword arguments, so the fake does the
+    same. It is a real object with real methods rather than a ``Mock``: a mock would
+    happily accept a call shape the real SDK rejects, which is the one thing this fake
+    exists to prevent.
     """
 
     def __init__(
@@ -105,94 +110,106 @@ class FakeMinio:
         self.reads: list[str] = []
         self.bucket_calls: list[str] = []
 
-    # -- write -------------------------------------------------------------- #
-
-    def put_object(self, bucket_name, object_name, data, length, content_type="", **kwargs):
-        """Upload, asserting the exact shape the adapter promises to use."""
-        assert bucket_name == BUCKET, bucket_name
-        assert callable(getattr(data, "read", None)), "the SDK requires a file-like object"
-        assert isinstance(length, int) and length >= 0
+    def _maybe_hang(self) -> None:
         if self.hang_seconds:
             import time
 
             time.sleep(self.hang_seconds)
+
+    # -- write -------------------------------------------------------------- #
+
+    def put_object(self, *, Bucket, Key, Body, ContentLength, ContentType="", **kwargs):
+        """Upload, asserting the exact shape the adapter promises to use."""
+        assert Bucket == BUCKET, Bucket
+        assert callable(getattr(Body, "read", None)), "the SDK requires a file-like object"
+        assert isinstance(ContentLength, int) and ContentLength >= 0
+        self._maybe_hang()
         if self.put_error is not None:
             raise self.put_error
-        body = data.read(length)
+        body = Body.read(ContentLength)
         # The adapter's contract with the SDK: the declared length is the real one.
-        assert len(body) == length, f"declared {length}, supplied {len(body)}"
-        self.objects[object_name] = body
-        self.puts.append((object_name, content_type, length, body))
-        return object()
+        assert len(body) == ContentLength, f"declared {ContentLength}, supplied {len(body)}"
+        self.objects[Key] = body
+        self.puts.append((Key, ContentType, ContentLength, body))
+        return {"ETag": '"fake"'}
 
     # -- read --------------------------------------------------------------- #
 
-    def get_object(self, bucket_name, object_name, *args, **kwargs):
-        assert bucket_name == BUCKET, bucket_name
-        if self.hang_seconds:
-            import time
-
-            time.sleep(self.hang_seconds)
+    def get_object(self, *, Bucket, Key, **kwargs):
+        assert Bucket == BUCKET, Bucket
+        self._maybe_hang()
         if self.get_error is not None:
             raise self.get_error
-        if object_name not in self.objects:
+        if Key not in self.objects:
             raise _no_such_key()
-        self.reads.append(object_name)
-        return FakeResponse(self.objects[object_name], declare_size=self.read_size)
+        self.reads.append(Key)
+        return {"Body": FakeResponse(self.objects[Key], declare_size=self.read_size)}
 
-    def stat_object(self, bucket_name, object_name, *args, **kwargs):
-        assert bucket_name == BUCKET, bucket_name
-        if self.hang_seconds:
-            import time
-
-            time.sleep(self.hang_seconds)
+    def head_object(self, *, Bucket, Key, **kwargs):
+        assert Bucket == BUCKET, Bucket
+        self._maybe_hang()
         if self.stat_error is not None:
             raise self.stat_error
-        if object_name not in self.objects:
+        if Key not in self.objects:
             raise _no_such_key()
-        return type("Object", (), {"size": len(self.objects[object_name]), "key": object_name})()
+        return {"ContentLength": len(self.objects[Key])}
 
     # -- delete ------------------------------------------------------------- #
 
-    def remove_object(self, bucket_name, object_name, *args, **kwargs):
-        assert bucket_name == BUCKET, bucket_name
+    def delete_object(self, *, Bucket, Key, **kwargs):
+        assert Bucket == BUCKET, Bucket
         if self.remove_error is not None:
             raise self.remove_error
-        self.removals.append(object_name)
-        self.objects.pop(object_name, None)
+        self.removals.append(Key)
+        self.objects.pop(Key, None)
+        return {"ResponseMetadata": {"HTTPStatusCode": 204}}
 
     # -- bucket ------------------------------------------------------------- #
 
-    def bucket_exists(self, bucket_name):
-        self.bucket_calls.append(bucket_name)
+    def head_bucket(self, *, Bucket, **kwargs):
+        self.bucket_calls.append(Bucket)
         if self.exists_error is not None:
             raise self.exists_error
-        return bucket_name in self.buckets
+        if Bucket not in self.buckets:
+            raise _client_error("404", 404)
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
 
-class _ResponseStub:
-    """Minimal ``response`` for constructing real ``S3Error`` instances."""
+def _client_error(code: str, status: int = 500) -> ClientError:
+    """A ``ClientError`` whose *message* carries every value that must not leak.
 
-    def __init__(self, status: int) -> None:
-        self.status = status
-
-
-def _s3_error(code: str, status: int = 500) -> S3Error:
-    """A real ``S3Error`` whose message carries every value that must not leak."""
-    return S3Error(
-        _ResponseStub(status),
-        code,
-        f"server message quoting {KEY_SENTINEL}",
-        f"/{BUCKET}/{KEY_SENTINEL}",
-        "request-id-should-not-appear",
-        "host-id-should-not-appear",
-        BUCKET,
-        KEY_SENTINEL,
+    The adapter must classify by ``response["Error"]["Code"]`` and the HTTP status,
+    never by the text, so putting the sentinels in the message is the point: if the
+    translator ever leaked ``str(exc)`` this fixture would catch it.
+    """
+    return ClientError(
+        {
+            "Error": {
+                "Code": code,
+                "Message": f"server message quoting {KEY_SENTINEL} for {ACCESS_SENTINEL}",
+            },
+            "ResponseMetadata": {
+                "HTTPStatusCode": status,
+                "RequestId": "request-id-should-not-appear",
+                "HostId": "host-id-should-not-appear",
+            },
+        },
+        "GetObject",
     )
 
 
-def _no_such_key() -> S3Error:
-    return _s3_error("NoSuchKey", 404)
+def _s3_error(code: str, status: int = 500) -> ClientError:
+    """Alias kept so the existing cases read the same: an S3-level failure."""
+    return _client_error(code, status)
+
+
+def _no_such_key() -> ClientError:
+    return _client_error("NoSuchKey", 404)
+
+
+def _rename_error() -> ClientError:
+    """A rejected request a retry cannot fix (used by the configuration-code cases)."""
+    return _client_error("InvalidAccessKeyId", 403)
 
 
 # --------------------------------------------------------------------------- #
@@ -213,8 +230,8 @@ def settings() -> ObjectStorageSettings:
     )
 
 
-def _store(settings: ObjectStorageSettings, client: FakeMinio, **kwargs: Any) -> S3BlobStore:
-    return S3BlobStore(settings, client=client, **kwargs)  # type: ignore[arg-type]
+def _store(settings: ObjectStorageSettings, client: FakeS3Client, **kwargs: Any) -> S3BlobStore:
+    return S3BlobStore(settings, client=client, **kwargs)
 
 
 async def _chunks(data: bytes, size: int = 4096) -> AsyncIterator[bytes]:
@@ -243,7 +260,7 @@ async def test_put_hashes_and_counts_exactly_what_reaches_the_store(
 ) -> None:
     """The digest describes the stored bytes, not the announced size (D6)."""
     payload = bytes(range(256)) * 700  # 179_200 bytes, deliberately not a chunk multiple
-    client = FakeMinio()
+    client = FakeS3Client()
 
     digest = await _store(settings, client).put(
         KEY_SENTINEL, _chunks(payload), max_bytes=10_000_000, content_type="application/pdf"
@@ -261,7 +278,7 @@ async def test_put_matches_hashlib_across_chunk_boundaries(
 ) -> None:
     """Same bytes, any chunking: the hash is over the stream, not over the chunking."""
     payload = b"the quick brown fox jumps over the lazy dog" * 2500
-    client = FakeMinio()
+    client = FakeS3Client()
     store = _store(settings, client)
 
     for size in (1, 2, 3, 7, 64, 4096, len(payload)):
@@ -276,7 +293,7 @@ async def test_put_of_an_empty_stream_is_a_legal_empty_object(
     settings: ObjectStorageSettings,
 ) -> None:
     """An empty body must produce the empty-string hash, not an error or a skipped write."""
-    client = FakeMinio()
+    client = FakeS3Client()
 
     digest = await _store(settings, client).put(
         KEY_SENTINEL, _chunks(b""), max_bytes=1024, content_type="text/plain"
@@ -291,7 +308,7 @@ async def test_put_skips_empty_chunks_instead_of_treating_them_as_eof(
 ) -> None:
     """An async iterator may legitimately yield ``b""``; stopping there would truncate."""
     payload = b"abcdefghij" * 100
-    client = FakeMinio()
+    client = FakeS3Client()
 
     async def noisy() -> AsyncIterator[bytes]:
         for start in range(0, len(payload), 50):
@@ -311,7 +328,7 @@ async def test_put_aborts_at_the_first_byte_past_the_limit(
     settings: ObjectStorageSettings,
 ) -> None:
     """``max_bytes`` is a running total, checked before the chunk is retained."""
-    client = FakeMinio()
+    client = FakeS3Client()
     consumed = 0
 
     async def counted() -> AsyncIterator[bytes]:
@@ -336,7 +353,7 @@ async def test_put_accepts_a_stream_exactly_at_the_limit(
     settings: ObjectStorageSettings,
 ) -> None:
     """The boundary must be inclusive, or a 25 MiB attachment of exactly 25 MiB fails."""
-    client = FakeMinio()
+    client = FakeS3Client()
     payload = b"y" * 4096
 
     digest = await _store(settings, client).put(
@@ -351,7 +368,7 @@ async def test_put_reports_a_short_stream_as_short_rather_than_failing(
     settings: ObjectStorageSettings,
 ) -> None:
     """The service compares this digest with what it meant to send; it must be honest."""
-    client = FakeMinio()
+    client = FakeS3Client()
     payload = b"only this much"
 
     digest = await _store(settings, client).put(
@@ -366,7 +383,7 @@ async def test_put_reports_a_short_stream_as_short_rather_than_failing(
 async def test_put_refuses_a_nonsensical_limit_before_touching_the_store(
     settings: ObjectStorageSettings, max_bytes: int
 ) -> None:
-    client = FakeMinio()
+    client = FakeS3Client()
 
     with pytest.raises(ValueError, match="max_bytes"):
         await _store(settings, client).put(
@@ -377,7 +394,7 @@ async def test_put_refuses_a_nonsensical_limit_before_touching_the_store(
 
 async def test_put_refuses_an_empty_key(settings: ObjectStorageSettings) -> None:
     with pytest.raises(ValueError, match="key"):
-        await _store(settings, FakeMinio()).put(
+        await _store(settings, FakeS3Client()).put(
             "", _chunks(b"x"), max_bytes=10, content_type="text/plain"
         )
 
@@ -391,7 +408,7 @@ async def test_put_refuses_a_stream_of_something_other_than_bytes(
         yield "not bytes"  # type: ignore[misc]
 
     with pytest.raises(TypeError):
-        await _store(settings, FakeMinio()).put(
+        await _store(settings, FakeS3Client()).put(
             KEY_SENTINEL, text_chunks(), max_bytes=1024, content_type="text/plain"
         )
 
@@ -400,7 +417,7 @@ async def test_put_defaults_the_content_type_only_when_it_is_blank(
     settings: ObjectStorageSettings,
 ) -> None:
     """Never invent a MIME type from a filename: the caller's value is the contract."""
-    client = FakeMinio()
+    client = FakeS3Client()
 
     await _store(settings, client).put(KEY_SENTINEL, _chunks(b"x"), max_bytes=10, content_type="")
 
@@ -417,7 +434,7 @@ async def test_digest_re_reads_the_object_rather_than_trusting_a_stat(
 ) -> None:
     """The truth check must consume the bytes; a stat-only implementation would not."""
     payload = b"recomputed-from-the-stored-bytes" * 400
-    client = FakeMinio(objects={KEY_SENTINEL: payload})
+    client = FakeS3Client(objects={KEY_SENTINEL: payload})
 
     digest = await _store(settings, client).digest(KEY_SENTINEL)
 
@@ -430,7 +447,7 @@ async def test_digest_notices_that_the_store_returned_different_bytes(
     settings: ObjectStorageSettings,
 ) -> None:
     """The whole point: a store that altered the object must produce a different hash."""
-    client = FakeMinio(objects={KEY_SENTINEL: b"tampered"})
+    client = FakeS3Client(objects={KEY_SENTINEL: b"tampered"})
     written = hashlib.sha256(b"original").hexdigest()
 
     digest = await _store(settings, client).digest(KEY_SENTINEL)
@@ -445,25 +462,25 @@ async def test_digest_releases_the_response_even_when_the_read_fails(
     """A leaked pooled connection is invisible until the pool runs dry under load."""
     response = FakeResponse(b"x" * 100)
 
-    class ShortClient(FakeMinio):
-        def get_object(self, bucket_name, object_name, *args, **kwargs):
-            return response
+    class ShortClient(FakeS3Client):
+        def get_object(self, *, Bucket, Key, **kwargs):
+            return {"Body": response}
 
     class Boom(response.__class__):
         def read(self, size: int = -1) -> bytes:
             raise OSError("socket died mid-stream")
 
     boom = Boom(b"x")
-    boom.released = 0
 
-    class FailingReadClient(FakeMinio):
-        def get_object(self, bucket_name, object_name, *args, **kwargs):
-            return boom
+    class FailingReadClient(FakeS3Client):
+        def get_object(self, *, Bucket, Key, **kwargs):
+            return {"Body": boom}
 
     with pytest.raises(StorageUnavailable):
         await _store(settings, FailingReadClient()).digest(KEY_SENTINEL)
 
-    assert boom.released == 1
+    # boto3 exposes close() only; there is no release_conn on a StreamingBody.
+    assert boom.closed == 1
 
 
 async def test_digest_of_an_absent_key_is_a_storage_failure(
@@ -471,7 +488,7 @@ async def test_digest_of_an_absent_key_is_a_storage_failure(
 ) -> None:
     """A missing object is never "empty": the pair of digests would silently agree."""
     with pytest.raises(StorageUnavailable):
-        await _store(settings, FakeMinio()).digest(KEY_SENTINEL)
+        await _store(settings, FakeS3Client()).digest(KEY_SENTINEL)
 
 
 # --------------------------------------------------------------------------- #
@@ -483,7 +500,7 @@ async def test_iter_chunks_yields_the_object_in_bounded_pieces(
     settings: ObjectStorageSettings,
 ) -> None:
     payload = bytes(range(256)) * 40
-    store = _store(settings, FakeMinio(objects={KEY_SENTINEL: payload}))
+    store = _store(settings, FakeS3Client(objects={KEY_SENTINEL: payload}))
 
     pieces = [piece async for piece in store.iter_chunks(KEY_SENTINEL, chunk_size=100)]
 
@@ -496,7 +513,7 @@ async def test_iter_chunks_of_a_missing_key_raises_instead_of_yielding_nothing(
     settings: ObjectStorageSettings,
 ) -> None:
     """A silent empty stream would be served as a 200 with zero bytes."""
-    store = _store(settings, FakeMinio())
+    store = _store(settings, FakeS3Client())
 
     received: list[bytes] = []
     with pytest.raises(StorageUnavailable):
@@ -527,10 +544,10 @@ async def test_iter_chunks_releases_the_response_when_the_consumer_goes_away(
     started = asyncio.Event()
     first_piece: list[bytes] = []
 
-    class Client(FakeMinio):
-        def get_object(self, bucket_name, object_name, *args, **kwargs):
-            self.reads.append(object_name)
-            return response
+    class Client(FakeS3Client):
+        def get_object(self, *, Bucket, Key, **kwargs):
+            self.reads.append(Key)
+            return {"Body": response}
 
     store = _store(settings, Client())
     stream = store.iter_chunks(KEY_SENTINEL, chunk_size=16)
@@ -552,7 +569,7 @@ async def test_iter_chunks_releases_the_response_when_the_consumer_goes_away(
     # garbage collector finalises an abandoned async generator.
     await stream.aclose()  # type: ignore[attr-defined]
 
-    assert response.released == 1
+    assert response.closed == 1
 
 
 async def test_iter_chunks_releases_the_response_on_an_explicit_aclose(
@@ -561,21 +578,21 @@ async def test_iter_chunks_releases_the_response_on_an_explicit_aclose(
     """A caller that closes the iterator itself gets the same guarantee."""
     response = FakeResponse(b"q" * 1000)
 
-    class Client(FakeMinio):
-        def get_object(self, bucket_name, object_name, *args, **kwargs):
-            return response
+    class Client(FakeS3Client):
+        def get_object(self, *, Bucket, Key, **kwargs):
+            return {"Body": response}
 
     stream = _store(settings, Client()).iter_chunks(KEY_SENTINEL, chunk_size=16)
     await stream.__anext__()
     await stream.aclose()  # type: ignore[attr-defined]
 
-    assert response.released == 1
+    assert response.closed == 1
 
 
 async def test_iter_chunks_refuses_a_nonsensical_chunk_size(
     settings: ObjectStorageSettings,
 ) -> None:
-    store = _store(settings, FakeMinio(objects={KEY_SENTINEL: b"x"}))
+    store = _store(settings, FakeS3Client(objects={KEY_SENTINEL: b"x"}))
 
     with pytest.raises(ValueError, match="chunk_size"):
         store.iter_chunks(KEY_SENTINEL, chunk_size=0)
@@ -587,11 +604,11 @@ async def test_iter_chunks_refuses_a_nonsensical_chunk_size(
 
 
 async def test_stat_returns_none_for_an_absent_key(settings: ObjectStorageSettings) -> None:
-    assert await _store(settings, FakeMinio()).stat(KEY_SENTINEL) is None
+    assert await _store(settings, FakeS3Client()).stat(KEY_SENTINEL) is None
 
 
 async def test_stat_returns_the_size_of_a_present_key(settings: ObjectStorageSettings) -> None:
-    store = _store(settings, FakeMinio(objects={KEY_SENTINEL: b"12345"}))
+    store = _store(settings, FakeS3Client(objects={KEY_SENTINEL: b"12345"}))
 
     stat = await store.stat(KEY_SENTINEL)
 
@@ -603,7 +620,7 @@ async def test_a_missing_bucket_is_never_reported_as_a_missing_object(
     settings: ObjectStorageSettings,
 ) -> None:
     """Otherwise the service would re-upload into a bucket that does not exist."""
-    store = _store(settings, FakeMinio(stat_error=_s3_error("NoSuchBucket", 404)))
+    store = _store(settings, FakeS3Client(stat_error=_s3_error("NoSuchBucket", 404)))
 
     with pytest.raises(StorageClientError):
         await store.stat(KEY_SENTINEL)
@@ -615,7 +632,7 @@ async def test_a_missing_bucket_is_never_reported_as_a_missing_object(
 
 
 async def test_delete_removes_the_object(settings: ObjectStorageSettings) -> None:
-    client = FakeMinio(objects={KEY_SENTINEL: b"x"})
+    client = FakeS3Client(objects={KEY_SENTINEL: b"x"})
 
     await _store(settings, client).delete(KEY_SENTINEL)
 
@@ -625,7 +642,7 @@ async def test_delete_removes_the_object(settings: ObjectStorageSettings) -> Non
 
 async def test_delete_of_an_absent_key_succeeds(settings: ObjectStorageSettings) -> None:
     """Cleanup runs from ``finally``; "already gone" is the desired end state."""
-    client = FakeMinio()
+    client = FakeS3Client()
 
     await _store(settings, client).delete(KEY_SENTINEL)
     await _store(settings, client).delete(KEY_SENTINEL)  # and again, for good measure
@@ -637,7 +654,7 @@ async def test_delete_still_raises_when_the_store_is_unreachable(
     settings: ObjectStorageSettings,
 ) -> None:
     """Idempotent is not the same as silent: a real outage must surface."""
-    store = _store(settings, FakeMinio(remove_error=_s3_error("InternalError", 500)))
+    store = _store(settings, FakeS3Client(remove_error=_s3_error("InternalError", 500)))
 
     with pytest.raises(StorageUnavailable):
         await store.delete(KEY_SENTINEL)
@@ -655,9 +672,8 @@ async def test_delete_still_raises_when_the_store_is_unreachable(
         (_s3_error("SlowDown", 503), StorageUnavailable),
         (_s3_error("AccessDenied", 403), StorageClientError),
         (_s3_error("NoSuchBucket", 404), StorageClientError),
-        (ServerError(f"HTTP 502 while reading {KEY_SENTINEL}", 502), StorageUnavailable),
         (
-            InvalidResponseError(500, "text/html", f"<body>{KEY_SENTINEL}</body>"),
+            EndpointConnectionError(endpoint_url=f"http://127.0.0.1:9000/{KEY_SENTINEL}"),
             StorageUnavailable,
         ),
         (ConnectionResetError("connection reset by peer"), StorageUnavailable),
@@ -669,13 +685,13 @@ async def test_every_sdk_failure_becomes_a_port_error(
     error: BaseException,
     expected: type[Exception],
 ) -> None:
-    """A raw ``minio`` exception must never escape the adapter."""
-    store = _store(settings, FakeMinio(get_error=error))
+    """A raw SDK exception must never escape the adapter."""
+    store = _store(settings, FakeS3Client(get_error=error))
 
     with pytest.raises(expected) as caught:
         await store.digest(KEY_SENTINEL)
 
-    assert not isinstance(caught.value, S3Error | ServerError | InvalidResponseError)
+    assert not isinstance(caught.value, ClientError | EndpointConnectionError)
     _assert_no_leak(str(caught.value))
     # The original stays reachable for a local debugger, on the cause chain only.
     assert caught.value.__cause__ is error
@@ -685,7 +701,7 @@ async def test_a_missing_object_maps_to_storage_unavailable(
     settings: ObjectStorageSettings,
 ) -> None:
     """The absent-key case is still ``StorageUnavailable`` for the service layer."""
-    store = _store(settings, FakeMinio(get_error=_no_such_key()))
+    store = _store(settings, FakeS3Client(get_error=_no_such_key()))
 
     with pytest.raises(StorageUnavailable) as caught:
         await store.digest(KEY_SENTINEL)
@@ -699,7 +715,7 @@ async def test_a_client_error_is_still_a_storage_unavailable(
     """One name for callers to catch; the narrower type is for probes and operators."""
     assert issubclass(StorageClientError, StorageUnavailable)
 
-    store = _store(settings, FakeMinio(put_error=_s3_error("AccessDenied", 403)))
+    store = _store(settings, FakeS3Client(put_error=_s3_error("AccessDenied", 403)))
     with pytest.raises(StorageUnavailable):
         await store.put(KEY_SENTINEL, _chunks(b"x"), max_bytes=10, content_type="text/plain")
 
@@ -707,7 +723,7 @@ async def test_a_client_error_is_still_a_storage_unavailable(
 async def test_put_maps_an_upload_failure_without_leaking_the_key(
     settings: ObjectStorageSettings,
 ) -> None:
-    store = _store(settings, FakeMinio(put_error=_s3_error("InternalError", 500)))
+    store = _store(settings, FakeS3Client(put_error=_s3_error("InternalError", 500)))
 
     with pytest.raises(StorageUnavailable) as caught:
         await store.put(
@@ -722,8 +738,8 @@ async def test_a_transient_error_is_not_confused_with_a_configuration_one(
     settings: ObjectStorageSettings,
 ) -> None:
     """The 503 is retryable; the 403 is not, and the two must be distinguishable."""
-    transient = _store(settings, FakeMinio(stat_error=_s3_error("SlowDown", 503)))
-    permanent = _store(settings, FakeMinio(stat_error=_s3_error("SignatureDoesNotMatch", 403)))
+    transient = _store(settings, FakeS3Client(stat_error=_s3_error("SlowDown", 503)))
+    permanent = _store(settings, FakeS3Client(stat_error=_s3_error("SignatureDoesNotMatch", 403)))
 
     with pytest.raises(StorageUnavailable) as retryable:
         await transient.stat(KEY_SENTINEL)
@@ -750,7 +766,7 @@ async def test_a_hung_call_becomes_a_timeout_not_a_wedge(
     check - "it eventually raised" would also pass for an implementation that waited
     out the whole hang.
     """
-    client = FakeMinio(hang_seconds=0.5)
+    client = FakeS3Client(hang_seconds=0.5)
     store = _store(settings, client, timeout_s=0.05)
 
     started = asyncio.get_running_loop().time()
@@ -763,11 +779,11 @@ async def test_a_hung_call_becomes_a_timeout_not_a_wedge(
 
 async def test_the_timeout_must_be_positive(settings: ObjectStorageSettings) -> None:
     with pytest.raises(ValueError, match="timeout_s"):
-        S3BlobStore(settings, client=FakeMinio(), timeout_s=0)  # type: ignore[arg-type]
+        S3BlobStore(settings, client=FakeS3Client(), timeout_s=0)  # type: ignore[arg-type]
 
 
 async def test_the_timeout_defaults_from_the_settings(settings: ObjectStorageSettings) -> None:
-    assert S3BlobStore(settings, client=FakeMinio()).timeout_s == settings.timeout_s  # type: ignore[arg-type]
+    assert S3BlobStore(settings, client=FakeS3Client()).timeout_s == settings.timeout_s  # type: ignore[arg-type]
 
 
 async def test_cancellation_is_never_rewritten_as_a_storage_failure(
@@ -775,8 +791,8 @@ async def test_cancellation_is_never_rewritten_as_a_storage_failure(
 ) -> None:
     """A cancelled request must be torn down, not retried as if the store were down."""
 
-    class Cancelling(FakeMinio):
-        def stat_object(self, bucket_name, object_name, *args, **kwargs):
+    class Cancelling(FakeS3Client):
+        def head_object(self, *, Bucket, Key, **kwargs):
             raise asyncio.CancelledError()
 
     store = _store(settings, Cancelling())
@@ -791,12 +807,12 @@ async def test_cancellation_is_never_rewritten_as_a_storage_failure(
 
 
 async def test_ready_is_true_when_the_bucket_exists(settings: ObjectStorageSettings) -> None:
-    assert await _store(settings, FakeMinio(buckets={BUCKET})).ready() is True
+    assert await _store(settings, FakeS3Client(buckets={BUCKET})).ready() is True
 
 
 async def test_ready_is_false_when_the_bucket_is_absent(settings: ObjectStorageSettings) -> None:
     """A readiness probe answers ``False``; it does not raise."""
-    assert await _store(settings, FakeMinio(buckets=set())).ready() is False
+    assert await _store(settings, FakeS3Client(buckets=set())).ready() is False
 
 
 @pytest.mark.parametrize(
@@ -811,7 +827,7 @@ async def test_ready_answers_false_for_every_failure(
     settings: ObjectStorageSettings, error: BaseException
 ) -> None:
     """A probe that throws cannot distinguish "not ready" from "probe broken"."""
-    assert await _store(settings, FakeMinio(exists_error=error)).ready() is False
+    assert await _store(settings, FakeS3Client(exists_error=error)).ready() is False
 
 
 # --------------------------------------------------------------------------- #
@@ -833,20 +849,24 @@ def test_the_adapter_constructs_a_client_from_settings_without_credentials_in_re
 
 def test_the_client_property_is_the_injected_one(settings: ObjectStorageSettings) -> None:
     """The bootstrap helpers need it; a request path must not."""
-    client = FakeMinio()
+    client = FakeS3Client()
 
     assert S3BlobStore(settings, client=client).client is client  # type: ignore[arg-type]
 
 
 def test_the_sdk_is_reachable_from_this_module_only() -> None:
-    """Layering: ``kerne/**`` and ``services/**`` must not import ``minio``."""
+    """Layering: the adapter is the only module that touches the S3 SDK.
+
+    Asserted by name against the module's own globals, so a future refactor that
+    imports the SDK somewhere else fails here rather than in review.
+    """
     imported = {
         name
         for name in vars(s3_module)
-        if name in {"Minio", "S3Error", "ServerError", "InvalidResponseError"}
+        if name in {"boto3", "Config", "ClientError", "BotoCoreError"}
     }
 
-    assert imported == {"Minio", "S3Error", "ServerError", "InvalidResponseError"}
+    assert imported == {"boto3", "Config", "ClientError", "BotoCoreError"}
 
 
 async def test_chunk_size_is_the_size_the_contract_names(

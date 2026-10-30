@@ -152,9 +152,9 @@ def test_a_structured_dump_is_explicitly_outside_the_guarantee() -> None:
 
 def test_diagnostics_name_the_address_and_bucket_only() -> None:
     """What an operator pastes into an incident, so it must be safe by construction."""
-    diagnostics = _settings(endpoint="https://minio.internal:9000").diagnostics
+    diagnostics = _settings(endpoint="https://objectstore.internal:9000").diagnostics
 
-    assert "minio.internal:9000" in diagnostics
+    assert "objectstore.internal:9000" in diagnostics
     assert "revnote-attachments" in diagnostics
     assert ACCESS_SENTINEL not in diagnostics
     assert SECRET_SENTINEL not in diagnostics
@@ -188,21 +188,21 @@ def test_a_malformed_endpoint_is_refused(endpoint: str) -> None:
 
 
 def test_a_bare_host_port_endpoint_is_accepted() -> None:
-    """``MINIO_ENDPOINT``-style spellings (no scheme) are common and must work."""
-    settings = _settings(endpoint="minio:9000")
+    """A scheme-less ``host:port`` spelling is common and must work."""
+    settings = _settings(endpoint="objectstore:9000")
 
-    assert settings.host_port == "minio:9000"
+    assert settings.host_port == "objectstore:9000"
     assert settings.is_secure is False
 
 
 def test_an_https_endpoint_forces_tls_even_when_the_flag_is_false() -> None:
     """The harder-to-typo spelling wins: no input downgrades an ``https`` endpoint."""
-    assert _settings(endpoint="https://minio.internal:9000", secure=False).is_secure is True
+    assert _settings(endpoint="https://objectstore.internal:9000", secure=False).is_secure is True
 
 
 def test_the_secure_flag_applies_to_a_scheme_less_endpoint() -> None:
     """With nothing else to read the intent from, the flag decides."""
-    assert _settings(endpoint="minio.internal:9000", secure=True).is_secure is True
+    assert _settings(endpoint="objectstore.internal:9000", secure=True).is_secure is True
 
 
 def test_secure_is_off_by_default() -> None:
@@ -282,9 +282,9 @@ def test_the_settings_reuse_the_app_local_env_file() -> None:
 
 
 def test_unknown_environment_variables_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The process environment is shared with compose (``MINIO_*``, ``POSTGRES_*``)."""
-    monkeypatch.setenv("MINIO_ROOT_USER", "revnote_minio_dev")
-    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "irrelevant-here")
+    """The process environment is shared with compose (``RUSTFS_*``, ``POSTGRES_*``)."""
+    monkeypatch.setenv("RUSTFS_ACCESS_KEY", "revnote_local_only")
+    monkeypatch.setenv("RUSTFS_SECRET_KEY", "irrelevant-here")
     monkeypatch.setenv("SOMETHING_ELSE", "1")
 
     assert _settings().bucket == "revnote-attachments"
@@ -293,13 +293,13 @@ def test_unknown_environment_variables_are_ignored(monkeypatch: pytest.MonkeyPat
 def test_the_values_are_read_from_the_namespaced_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every field is ``OBJECT_STORAGE_``-prefixed, so nothing else can collide."""
-    monkeypatch.setenv("OBJECT_STORAGE_ENDPOINT", "http://store.internal:9000")
-    monkeypatch.setenv("OBJECT_STORAGE_BUCKET", "env-bucket")
-    monkeypatch.setenv("OBJECT_STORAGE_ACCESS_KEY", "env-access")
-    monkeypatch.setenv("OBJECT_STORAGE_SECRET_KEY", "env-private")
-    monkeypatch.setenv("OBJECT_STORAGE_SECURE", "true")
-    monkeypatch.setenv("OBJECT_STORAGE_TIMEOUT_S", "3.5")
+    """Every field is ``S3_``-prefixed, so nothing else can collide."""
+    monkeypatch.setenv("S3_ENDPOINT", "http://store.internal:9000")
+    monkeypatch.setenv("S3_BUCKET", "env-bucket")
+    monkeypatch.setenv("S3_ACCESS_KEY", "env-access")
+    monkeypatch.setenv("S3_SECRET_KEY", "env-private")
+    monkeypatch.setenv("S3_SECURE", "true")
+    monkeypatch.setenv("S3_TIMEOUT_S", "3.5")
 
     settings = ObjectStorageSettings(_env_file=None)
 
@@ -316,10 +316,10 @@ def test_a_missing_required_value_is_refused_at_construction(
 ) -> None:
     """No defaults: a half-configured deployment must not start and fail on upload."""
     for name in (
-        "OBJECT_STORAGE_ENDPOINT",
-        "OBJECT_STORAGE_BUCKET",
-        "OBJECT_STORAGE_ACCESS_KEY",
-        "OBJECT_STORAGE_SECRET_KEY",
+        "S3_ENDPOINT",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -336,10 +336,10 @@ def test_the_settings_singleton_is_cached_and_clearable(
     validated at boot" true; ``cache_clear`` is what lets a test change the environment
     without leaking a stale object into the next case.
     """
-    monkeypatch.setenv("OBJECT_STORAGE_ENDPOINT", "http://127.0.0.1:9000")
-    monkeypatch.setenv("OBJECT_STORAGE_BUCKET", "singleton-bucket")
-    monkeypatch.setenv("OBJECT_STORAGE_ACCESS_KEY", "access")
-    monkeypatch.setenv("OBJECT_STORAGE_SECRET_KEY", SECRET_SENTINEL)
+    monkeypatch.setenv("S3_ENDPOINT", "http://127.0.0.1:9000")
+    monkeypatch.setenv("S3_BUCKET", "singleton-bucket")
+    monkeypatch.setenv("S3_ACCESS_KEY", "access")
+    monkeypatch.setenv("S3_SECRET_KEY", SECRET_SENTINEL)
     get_object_storage_settings.cache_clear()
     try:
         first = get_object_storage_settings()
@@ -348,7 +348,7 @@ def test_the_settings_singleton_is_cached_and_clearable(
         assert first.bucket == "singleton-bucket"
         assert SECRET_SENTINEL not in repr(first)
 
-        monkeypatch.setenv("OBJECT_STORAGE_BUCKET", "changed-bucket")
+        monkeypatch.setenv("S3_BUCKET", "changed-bucket")
         assert get_object_storage_settings() is first  # cached, not re-read
 
         get_object_storage_settings.cache_clear()

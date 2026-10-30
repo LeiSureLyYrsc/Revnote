@@ -5,7 +5,7 @@ Two things are worth testing here and nothing else is:
 * the digest's own invariants, because a 63-character hash reaching the database would
   trip a CHECK constraint halfway through an upload;
 * the *absence* of an SDK import. That is the property the whole port exists for - the
-  service layer must be importable without ``minio`` installed - so it is asserted
+  service layer must be importable without ``boto3`` installed - so it is asserted
   twice: against the module's own source, and against the contents of a **fresh
   interpreter** that has imported nothing but the port. Neither is promised in a
   docstring, and neither can be satisfied by an accident of test ordering.
@@ -47,16 +47,16 @@ _PROBE_SOURCE = "\n".join(
         "sys.path.insert(0, sys.argv[1])",
         "",
         "# The SDK must be *installed* for this check to mean anything: the absence of",
-        "# minio from sys.modules is trivially true in an interpreter without minio, and",
+        "# the SDK from sys.modules is trivially true in an interpreter without it, and",
         "# that would turn the assertion below into a no-op exactly when it cannot be",
         "# trusted.",
-        "assert importlib.util.find_spec('minio') is not None, (",
-        "    'minio is not installed, so this check would pass for the wrong reason'",
+        "assert importlib.util.find_spec('boto3') is not None, (",
+        "    'boto3 is not installed, so this check would pass for the wrong reason'",
         ")",
         "",
         "import revnote_api.storage.ports",
         "",
-        "loaded = sorted(name for name in sys.modules if name.split('.')[0] == 'minio')",
+        "loaded = sorted(name for name in sys.modules if name.split('.')[0] == 'boto3')",
         "assert not loaded, f'importing the port loaded the storage SDK: {loaded}'",
         "",
         "# The adapter module itself must stay unimported too: an __init__ that",
@@ -91,7 +91,7 @@ def test_ports_imports_only_the_standard_library() -> None:
 
     Checked against the source rather than ``sys.modules`` so the assertion is about
     this file's own intent - a transitive import elsewhere in the process would
-    otherwise mask a new ``import minio`` line here.
+    otherwise mask a new SDK import line here.
     """
     imported = _imports_of(PORTS_PATH)
 
@@ -118,7 +118,7 @@ def test_ports_does_not_pull_in_the_storage_sdk() -> None:
     the port - which answers the wrong question once any other test module has
     imported ``storage.s3``: the SDK's own cache entry is still there, so the assertion
     failed for a reason that had nothing to do with ``ports`` (green alone, red in the
-    full suite). Deleting ``minio``'s entry too would not really fix it either: the
+    full suite). Deleting ``boto3``'s entry too would not really fix it either: the
     interpreter would still be one where the SDK had been loaded, and re-importing a
     module that others hold live references to is exactly the kind of global-state
     surgery that produces order-dependent failures somewhere else later.
@@ -126,7 +126,7 @@ def test_ports_does_not_pull_in_the_storage_sdk() -> None:
     A child process asks the honest question instead - "in an interpreter that has
     only ever imported ``revnote_api.storage.ports``, is the SDK absent?" - so the
     result cannot depend on which test ran before this one, and the parent's
-    ``sys.modules`` is not mutated at all. The child first asserts that ``minio`` is
+    ``sys.modules`` is not mutated at all. The child first asserts that ``boto3`` is
     installed, because "not loaded" is trivially true when there is nothing to load;
     without that guard the test would quietly become a no-op on a machine missing the
     dependency.

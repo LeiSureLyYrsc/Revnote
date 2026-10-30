@@ -55,10 +55,10 @@ __all__ = [
     "get_object_storage_settings",
 ]
 
-#: Every env var this class reads is namespaced: ``endpoint`` -> ``OBJECT_STORAGE_ENDPOINT``.
+#: Every env var this class reads is namespaced: ``endpoint`` -> ``S3_ENDPOINT``.
 #: A bare ``ENDPOINT`` or ``BUCKET`` in a shared process environment would be far too
 #: easy to collide with something else the deployment sets.
-ENV_PREFIX: str = "OBJECT_STORAGE_"
+ENV_PREFIX: str = "S3_"
 
 #: What a masked field renders as. A constant, so a reader can tell "masked" from
 #: "unset" and no prefix of the real value can survive.
@@ -103,10 +103,14 @@ def _split_endpoint(value: str) -> SplitResult:
 class ObjectStorageSettings(BaseSettings):
     """How to reach the attachment bucket.
 
-    ``OBJECT_STORAGE_ENDPOINT`` may be written with a scheme (``http://host:9000``)
+    ``S3_ENDPOINT`` may be written with a scheme (``http://host:9000``)
     or bare (``host:9000``); the scheme is stripped before the value reaches the SDK,
     which wants host and port only and takes TLS as a separate flag. See
     :attr:`is_secure` for how the two spellings combine.
+
+    The names are deliberately the S3 ones, not any vendor's: the adapter is a generic
+    S3 client and the development target (RustFS) is a deployment choice, not part of
+    the contract.
     """
 
     model_config = SettingsConfigDict(
@@ -115,17 +119,16 @@ class ObjectStorageSettings(BaseSettings):
         env_file_encoding="utf-8",
         env_prefix=ENV_PREFIX,
         case_sensitive=False,
-        # The process environment is shared with compose, which also exports
-        # ``MINIO_*`` and ``POSTGRES_*`` keys this class has no field for.
+        # The process environment is shared with compose, which also exports the
+        # server-side ``RUSTFS_*`` keys and ``POSTGRES_*``; this class has no field
+        # for them and must not fail on their presence.
         extra="ignore",
         populate_by_name=True,
     )
 
     # -- address ------------------------------------------------------------ #
-    endpoint: str = Field(description="OBJECT_STORAGE_ENDPOINT; the scheme is optional.")
-    bucket: str = Field(
-        description="OBJECT_STORAGE_BUCKET; a private bucket the API alone may reach."
-    )
+    endpoint: str = Field(description="S3_ENDPOINT; the scheme is optional.")
+    bucket: str = Field(description="S3_BUCKET; a private bucket the API alone may reach.")
 
     # -- credentials -------------------------------------------------------- #
     #: Values masked by :meth:`__repr__`. ``repr=False`` removes them from a
@@ -134,13 +137,18 @@ class ObjectStorageSettings(BaseSettings):
     #: ``model_dump_json``, which return the raw values - this object is therefore
     #: never a candidate for a structured-dump log line, only for ``repr``/``str``
     #: (see :func:`revnote_api.storage.settings.__doc__` and the masking test matrix).
-    access_key: str = Field(repr=False, description="OBJECT_STORAGE_ACCESS_KEY.")
-    secret_key: str = Field(repr=False, description="OBJECT_STORAGE_SECRET_KEY.")
+    access_key: str = Field(repr=False, description="S3_ACCESS_KEY.")
+    secret_key: str = Field(repr=False, description="S3_SECRET_KEY.")
 
     # -- transport ---------------------------------------------------------- #
     #: TLS to the object store. Only consulted when ``endpoint`` carries no scheme;
     #: an explicit ``https://`` endpoint always wins (see :attr:`is_secure`).
     secure: bool = False
+
+    #: Signing region. S3 requires one even when the endpoint is not AWS; the default
+    #: is what every S3-compatible server accepts. It is configuration rather than a
+    #: constant so an operator pointing at a real AWS bucket can name the right one.
+    region: str = Field(default="us-east-1", description="S3_REGION; the signing region.")
 
     #: Per-socket connect/read budget, in seconds. Deliberately **one** number: a
     #: connect timeout shorter than the read timeout would make a merely slow store
@@ -160,19 +168,17 @@ class ObjectStorageSettings(BaseSettings):
         """
         raw = value.strip().rstrip("/")
         if not raw:
-            raise ValueError("OBJECT_STORAGE_ENDPOINT must not be empty")
+            raise ValueError("S3_ENDPOINT must not be empty")
 
         parts = _split_endpoint(raw)
         if parts.scheme and parts.scheme not in {"http", "https"}:
-            raise ValueError(
-                f"OBJECT_STORAGE_ENDPOINT scheme must be http or https, got {parts.scheme!r}"
-            )
+            raise ValueError(f"S3_ENDPOINT scheme must be http or https, got {parts.scheme!r}")
         if parts.query or parts.fragment:
-            raise ValueError("OBJECT_STORAGE_ENDPOINT must not carry a query or a fragment")
+            raise ValueError("S3_ENDPOINT must not carry a query or a fragment")
         if parts.path:
-            raise ValueError("OBJECT_STORAGE_ENDPOINT must not carry a path")
+            raise ValueError("S3_ENDPOINT must not carry a path")
         if not parts.hostname:
-            raise ValueError("OBJECT_STORAGE_ENDPOINT must include a host")
+            raise ValueError("S3_ENDPOINT must include a host")
         return raw
 
     @field_validator("bucket")
@@ -187,20 +193,19 @@ class ObjectStorageSettings(BaseSettings):
         """
         name = value.strip()
         if not name:
-            raise ValueError("OBJECT_STORAGE_BUCKET must not be empty")
+            raise ValueError("S3_BUCKET must not be empty")
         if not BUCKET_NAME_MIN_CHARS <= len(name) <= BUCKET_NAME_MAX_CHARS:
             raise ValueError(
-                f"OBJECT_STORAGE_BUCKET must be {BUCKET_NAME_MIN_CHARS}-"
-                f"{BUCKET_NAME_MAX_CHARS} characters long"
+                f"S3_BUCKET must be {BUCKET_NAME_MIN_CHARS}-{BUCKET_NAME_MAX_CHARS} characters long"
             )
         if not _BUCKET_NAME_PATTERN.match(name):
             raise ValueError(
-                "OBJECT_STORAGE_BUCKET must be lowercase letters, digits, dots and "
+                "S3_BUCKET must be lowercase letters, digits, dots and "
                 "hyphens, and must start and end with a letter or a digit"
             )
         if any(pair in name for pair in _BUCKET_NAME_FORBIDDEN_PAIRS):
             raise ValueError(
-                "OBJECT_STORAGE_BUCKET must not contain '..', '.-' or '-.' (the SDK "
+                "S3_BUCKET must not contain '..', '.-' or '-.' (the SDK "
                 "rejects them, and they make an empty label look like a real one)"
             )
         return name
@@ -244,7 +249,10 @@ class ObjectStorageSettings(BaseSettings):
         the real-storage test support reports and what a failed ``ready()`` probe
         logs.
         """
-        return f"endpoint={self.masked_endpoint} bucket={self.bucket} secure={self.is_secure}"
+        return (
+            f"endpoint={self.masked_endpoint} bucket={self.bucket} "
+            f"secure={self.is_secure} region={self.region}"
+        )
 
     # -- rendering ---------------------------------------------------------- #
 

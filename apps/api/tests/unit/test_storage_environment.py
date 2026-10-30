@@ -43,10 +43,10 @@ SECRET_SENTINEL = "sk-private-sentinel-do-not-log-9f3a"
 #: Every variable this module reads, so a test can clear all of them.
 ENV_VARS = (
     "REQUIRE_OBJECT_STORAGE_TESTS",
-    "OBJECT_STORAGE_ENDPOINT",
-    "OBJECT_STORAGE_ACCESS_KEY",
-    "OBJECT_STORAGE_SECRET_KEY",
-    "OBJECT_STORAGE_TIMEOUT_S",
+    "S3_ENDPOINT",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "S3_TIMEOUT_S",
     "CI",
     "GITHUB_ACTIONS",
 )
@@ -65,9 +65,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _configure(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
     """Set the four mandatory variables, with optional overrides."""
     values = {
-        "OBJECT_STORAGE_ENDPOINT": "http://127.0.0.1:9000",
-        "OBJECT_STORAGE_ACCESS_KEY": ACCESS_SENTINEL,
-        "OBJECT_STORAGE_SECRET_KEY": SECRET_SENTINEL,
+        "S3_ENDPOINT": "http://127.0.0.1:9000",
+        "S3_ACCESS_KEY": ACCESS_SENTINEL,
+        "S3_SECRET_KEY": SECRET_SENTINEL,
     }
     values.update(overrides)
     for name, value in values.items():
@@ -170,9 +170,9 @@ def test_an_unconfigured_environment_is_not_required(
 @pytest.mark.parametrize(
     "missing",
     [
-        "OBJECT_STORAGE_ENDPOINT",
-        "OBJECT_STORAGE_ACCESS_KEY",
-        "OBJECT_STORAGE_SECRET_KEY",
+        "S3_ENDPOINT",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
     ],
 )
 def test_a_missing_variable_raises_and_names_itself(
@@ -192,9 +192,9 @@ def test_a_missing_variable_raises_and_names_itself(
 
 def test_a_blank_value_counts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Whitespace is what an unset shell variable expands to; treating it as set lies."""
-    _configure(monkeypatch, OBJECT_STORAGE_ENDPOINT="   ")
+    _configure(monkeypatch, S3_ENDPOINT="   ")
 
-    with pytest.raises(ObjectStorageRequirementError, match="OBJECT_STORAGE_ENDPOINT"):
+    with pytest.raises(ObjectStorageRequirementError, match="S3_ENDPOINT"):
         require_object_storage()
 
 
@@ -206,16 +206,16 @@ def test_a_malformed_endpoint_raises_rather_than_proceeding(
     monkeypatch: pytest.MonkeyPatch, endpoint: str
 ) -> None:
     """Failing here, with a message about the setting, beats failing inside the SDK."""
-    _configure(monkeypatch, OBJECT_STORAGE_ENDPOINT=endpoint)
+    _configure(monkeypatch, S3_ENDPOINT=endpoint)
 
     with pytest.raises(ObjectStorageRequirementError, match="not usable"):
         require_object_storage()
 
 
 def test_a_non_numeric_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure(monkeypatch, OBJECT_STORAGE_TIMEOUT_S="soon")
+    _configure(monkeypatch, S3_TIMEOUT_S="soon")
 
-    with pytest.raises(ObjectStorageRequirementError, match="OBJECT_STORAGE_TIMEOUT_S"):
+    with pytest.raises(ObjectStorageRequirementError, match="S3_TIMEOUT_S"):
         require_object_storage()
 
 
@@ -237,7 +237,7 @@ def test_a_complete_environment_yields_a_target(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_the_timeout_override_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure(monkeypatch, OBJECT_STORAGE_TIMEOUT_S="2.5")
+    _configure(monkeypatch, S3_TIMEOUT_S="2.5")
 
     assert require_object_storage().timeout_s == 2.5
 
@@ -255,7 +255,7 @@ def test_the_configured_bucket_is_deliberately_not_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A per-run bucket is created instead, so a real bucket can never be emptied."""
-    _configure(monkeypatch, OBJECT_STORAGE_BUCKET="a-production-bucket-name")
+    _configure(monkeypatch, S3_BUCKET="a-production-bucket-name")
 
     target = require_object_storage()
 
@@ -325,7 +325,7 @@ def test_diagnostics_render_host_and_port_for_a_scheme_less_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``host:9000`` parses ``host`` as a scheme; the printer must not print nothing."""
-    _configure(monkeypatch, OBJECT_STORAGE_ENDPOINT="store.internal:9000")
+    _configure(monkeypatch, S3_ENDPOINT="store.internal:9000")
 
     assert "store.internal:9000" in describe(require_object_storage())
 
@@ -370,17 +370,14 @@ def test_describe_accepts_settings_and_a_store_shaped_object(
 # --------------------------------------------------------------------------- #
 
 
-class FakeListing:
-    def __init__(self, keys: list[str]) -> None:
-        self._keys = list(keys)
-        self.closed = 0
+class FakePaginator:
+    """``get_paginator("list_objects_v2")`` yielding one page, as S3 does."""
 
-    def __iter__(self):
-        for key in self._keys:
-            yield type("Item", (), {"object_name": key})()
+    def __init__(self, client: FakeCleanupClient) -> None:
+        self._client = client
 
-    def close(self) -> None:
-        self.closed += 1
+    def paginate(self, *, Bucket, **kwargs):
+        yield {"Contents": [{"Key": key} for key in self._client.keys], "IsTruncated": False}
 
 
 class FakeCleanupClient:
@@ -397,43 +394,32 @@ class FakeCleanupClient:
         self.remove_error = remove_error
         self.bucket_error = bucket_error
         self.calls: list[str] = []
-        self.listing: FakeListing | None = None
+        self.deleted: list[list[str]] = []
 
-    def list_objects(self, bucket_name: str, prefix: str = "", recursive: bool = False):
+    def get_paginator(self, name: str) -> FakePaginator:
+        assert name == "list_objects_v2", name
         self.calls.append("list")
-        self.listing = FakeListing(self.keys)
-        return self.listing
+        return FakePaginator(self)
 
-    def remove_objects(self, bucket_name: str, delete_list):
-        self.calls.append("remove_objects")
+    def delete_objects(self, *, Bucket, Delete, **kwargs):
+        self.calls.append("delete_objects")
         if self.remove_error is not None:
             raise self.remove_error
-        for _ in delete_list:
-            yield
+        keys = [item["Key"] for item in Delete["Objects"]]
+        self.deleted.append(keys)
+        return {"Deleted": [{"Key": k} for k in keys], "Errors": []}
 
-    def remove_bucket(self, bucket_name: str) -> None:
-        self.calls.append("remove_bucket")
+    def delete_bucket(self, *, Bucket, **kwargs):
+        self.calls.append("delete_bucket")
         if self.bucket_error is not None:
             raise self.bucket_error
+        return {"ResponseMetadata": {"HTTPStatusCode": 204}}
 
 
 class _Store:
     def __init__(self, client: FakeCleanupClient, settings: object) -> None:
         self.client = client
         self.settings = settings
-
-
-@pytest.fixture(autouse=True)
-def _patch_delete_object(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace ``DeleteObject`` so the fake client receives a plain string carrier."""
-    import minio.deleteobjects as deleteobjects
-
-    monkeypatch.setattr(deleteobjects, "DeleteObject", _FakeDeleteObject, raising=True)
-
-
-class _FakeDeleteObject:
-    def __init__(self, name: str) -> None:
-        self.name = name
 
 
 def _settings() -> object:
@@ -454,9 +440,8 @@ def test_cleanup_deletes_the_objects_before_dropping_the_bucket() -> None:
 
     purge_and_drop_bucket(_Store(client, _settings()))
 
-    assert client.calls == ["list", "remove_objects", "remove_bucket"]
-    assert client.listing is not None
-    assert client.listing.closed == 1
+    assert client.calls == ["list", "delete_objects", "delete_bucket"]
+    assert client.deleted == [["a/1", "a/2"]]
 
 
 def test_cleanup_drops_an_already_empty_bucket() -> None:
@@ -464,7 +449,7 @@ def test_cleanup_drops_an_already_empty_bucket() -> None:
 
     purge_and_drop_bucket(_Store(client, _settings()))
 
-    assert client.calls == ["list", "remove_bucket"]
+    assert client.calls == ["list", "delete_bucket"]
 
 
 def test_cleanup_still_tries_the_bucket_when_emptying_failed() -> None:
@@ -474,7 +459,7 @@ def test_cleanup_still_tries_the_bucket_when_emptying_failed() -> None:
     with pytest.raises(RuntimeError, match="could not empty the bucket") as caught:
         purge_and_drop_bucket(_Store(client, _settings()))
 
-    assert client.calls == ["list", "remove_objects", "remove_bucket"]
+    assert client.calls == ["list", "delete_objects", "delete_bucket"]
     assert SECRET_SENTINEL not in str(caught.value)
 
 

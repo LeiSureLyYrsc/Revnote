@@ -13,6 +13,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from botocore.exceptions import ClientError
 
 from revnote_api.storage import bootstrap
 from revnote_api.storage.bootstrap import (
@@ -27,7 +28,7 @@ BUCKET = "revnote-attachments"
 OBJECT_PREFIX = "ws/00000000-0000-0000-0000-000000000001/att/"
 
 
-class FakeListing:
+class FakeListing:  # unused; kept out of the way
     """The SDK's listing handle: an iterator of items with a ``close``."""
 
     def __init__(self, keys: list[str]) -> None:
@@ -47,7 +48,23 @@ class FakeDeleteError:
         self.code = code
 
 
-class FakeMinio:
+class _FakePaginator:
+    """``get_paginator("list_objects_v2")`` with one page per call, as S3 does."""
+
+    def __init__(self, client: FakeS3Client) -> None:
+        self._client = client
+
+    def paginate(self, *, Bucket, Prefix="", **kwargs):
+        if self._client.list_error is not None:
+            raise self._client.list_error
+        self._client.listings.append((Bucket, Prefix))
+        keys = sorted(key for key in self._client.objects if key.startswith(Prefix))
+        # One page is enough to exercise the loop; the adapter's pagination is a thin
+        # pass-through to boto3, which is tested by the real-storage suite.
+        yield {"Contents": [{"Key": key} for key in keys], "IsTruncated": False}
+
+
+class FakeS3Client:
     """Bucket + bulk-delete surface used by the bootstrap helpers."""
 
     def __init__(
@@ -67,57 +84,45 @@ class FakeMinio:
         self.make_error = make_error
         self.list_error = list_error
         self.created: list[str] = []
-        self.listings: list[tuple[str, str | None, bool]] = []
+        self.listings: list[tuple[str, str]] = []
         self.delete_batches: list[list[str]] = []
-        self.last_listing: FakeListing | None = None
 
-    def bucket_exists(self, bucket_name: str) -> bool:
+    # -- bucket -------------------------------------------------------------- #
+
+    def head_bucket(self, *, Bucket, **kwargs):
         if self.exists_error is not None:
             raise self.exists_error
-        return bucket_name in self.buckets
+        if Bucket not in self.buckets:
+            raise ClientError(
+                {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+                "HeadBucket",
+            )
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
-    def make_bucket(self, bucket_name: str) -> None:
+    def create_bucket(self, *, Bucket, **kwargs):
         if self.make_error is not None:
             raise self.make_error
-        self.created.append(bucket_name)
-        self.buckets.add(bucket_name)
+        self.created.append(Bucket)
+        self.buckets.add(Bucket)
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
-    def list_objects(self, bucket_name: str, prefix: str = "", recursive: bool = False):
-        if self.list_error is not None:
-            raise self.list_error
-        self.listings.append((bucket_name, prefix, recursive))
-        keys = sorted(key for key in self.objects if key.startswith(prefix))
-        self.last_listing = FakeListing(keys)
-        return self.last_listing
+    # -- listing and bulk delete --------------------------------------------- #
 
-    def remove_objects(self, bucket_name: str, delete_list):
-        keys = [item._object_name for item in delete_list]
+    def get_paginator(self, name: str) -> _FakePaginator:
+        assert name == "list_objects_v2", name
+        return _FakePaginator(self)
+
+    def delete_objects(self, *, Bucket, Delete, **kwargs):
+        keys = [item["Key"] for item in Delete["Objects"]]
         self.delete_batches.append(keys)
+        errors = []
         for key in keys:
             if key in self.fail_delete_for:
-                yield FakeDeleteError()
+                errors.append({"Key": key, "Code": "AccessDenied"})
                 continue
             self.objects.pop(key, None)
-
-
-class FakeDeleteObject:
-    """Stand-in for ``minio.deleteobjects.DeleteObject`` (built inside the helper)."""
-
-    def __init__(self, name: str) -> None:
-        self._object_name = name
-
-
-@pytest.fixture(autouse=True)
-def _patch_delete_object(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace the real ``DeleteObject`` so no SDK object is constructed.
-
-    ``bootstrap`` imports it lazily from ``minio.deleteobjects`` precisely so this
-    module can run without the SDK's delete-object model; the patch mirrors the one
-    attribute the helper reads.
-    """
-    import minio.deleteobjects as deleteobjects
-
-    monkeypatch.setattr(deleteobjects, "DeleteObject", FakeDeleteObject, raising=True)
+        deleted = [{"Key": key} for key in keys if key not in self.fail_delete_for]
+        return {"Deleted": deleted, "Errors": errors}
 
 
 def _settings() -> ObjectStorageSettings:
@@ -133,7 +138,7 @@ def _settings() -> ObjectStorageSettings:
 class _Store:
     """The narrow shape ``bootstrap`` accepts: ``.client`` plus ``.settings``."""
 
-    def __init__(self, client: FakeMinio, settings: ObjectStorageSettings) -> None:
+    def __init__(self, client: FakeS3Client, settings: ObjectStorageSettings) -> None:
         self.client = client
         self.settings = settings
 
@@ -147,7 +152,7 @@ def test_the_module_has_no_import_time_side_effects() -> None:
     """No client, no bucket, no environment read: importing must do nothing.
 
     Checked structurally: the module's top level may import, define and assign only.
-    A ``Minio(...)`` call or an ``os.environ`` read at module scope would turn a plain
+    A client construction or an ``os.environ`` read at module scope would turn a plain
     import into a connection attempt.
     """
     tree = ast.parse(Path(bootstrap.__file__).read_text(encoding="utf-8"))
@@ -196,7 +201,7 @@ def test_no_http_surface_is_declared() -> None:
 
 
 def test_ensure_bucket_creates_a_missing_bucket() -> None:
-    client = FakeMinio(buckets=set())
+    client = FakeS3Client(buckets=set())
     store = _Store(client, _settings())
 
     assert ensure_bucket(store) == BUCKET  # type: ignore[arg-type]
@@ -205,7 +210,7 @@ def test_ensure_bucket_creates_a_missing_bucket() -> None:
 
 def test_ensure_bucket_is_idempotent() -> None:
     """A session fixture reruns unconditionally; a second call must be a no-op."""
-    client = FakeMinio(buckets={BUCKET})
+    client = FakeS3Client(buckets={BUCKET})
     store = _Store(client, _settings())
 
     ensure_bucket(store)  # type: ignore[arg-type]
@@ -216,7 +221,7 @@ def test_ensure_bucket_is_idempotent() -> None:
 
 def test_ensure_bucket_attaches_no_policy() -> None:
     """Created private: running a bootstrap step must not make anything readable."""
-    client = FakeMinio(buckets=set())
+    client = FakeS3Client(buckets=set())
 
     ensure_bucket(_Store(client, _settings()))  # type: ignore[arg-type]
 
@@ -226,20 +231,20 @@ def test_ensure_bucket_attaches_no_policy() -> None:
 
 
 def test_ensure_bucket_reports_a_rejected_creation() -> None:
-    client = FakeMinio(buckets=set(), make_error=ValueError("invalid bucket name"))
+    client = FakeS3Client(buckets=set(), make_error=ValueError("invalid bucket name"))
     store = _Store(client, _settings())
 
     with pytest.raises(BucketBootstrapError) as caught:
         ensure_bucket(store)  # type: ignore[arg-type]
 
-    assert "OBJECT_STORAGE_BUCKET" in str(caught.value)
+    assert "S3_BUCKET" in str(caught.value)
     assert "private-sentinel" not in str(caught.value)
     assert caught.value.__cause__ is not None
 
 
 def test_ensure_bucket_propagates_a_store_outage_as_a_port_error() -> None:
     """Unreachable is a port failure, not a bootstrap one: an operator cares."""
-    client = FakeMinio(exists_error=StorageUnavailable("down"))
+    client = FakeS3Client(exists_error=StorageUnavailable("down"))
     store = _Store(client, _settings())
 
     with pytest.raises(StorageUnavailable):
@@ -258,7 +263,7 @@ def test_ensure_bucket_refuses_an_argument_it_cannot_use() -> None:
 
 def test_purge_prefix_removes_only_the_requested_prefix() -> None:
     """Prefix-scoped by contract: a neighbouring attachment must survive."""
-    client = FakeMinio(
+    client = FakeS3Client(
         objects={
             f"{OBJECT_PREFIX}one/nonce": b"a",
             f"{OBJECT_PREFIX}two/nonce": b"b",
@@ -275,7 +280,7 @@ def test_purge_prefix_removes_only_the_requested_prefix() -> None:
 
 def test_purge_prefix_refuses_an_empty_prefix() -> None:
     """An empty prefix is "the whole bucket" - the one thing this must never do."""
-    client = FakeMinio(objects={"keep": b"x"})
+    client = FakeS3Client(objects={"keep": b"x"})
 
     with pytest.raises(ValueError, match="prefix"):
         purge_prefix(_Store(client, _settings()), "")  # type: ignore[arg-type]
@@ -286,7 +291,7 @@ def test_purge_prefix_refuses_an_empty_prefix() -> None:
 
 def test_purge_prefix_on_an_empty_prefix_is_a_no_op() -> None:
     """Idempotent, so a cleanup can rerun over a prefix it already emptied."""
-    client = FakeMinio(objects={"elsewhere/key": b"x"})
+    client = FakeS3Client(objects={"elsewhere/key": b"x"})
 
     assert purge_prefix(_Store(client, _settings()), OBJECT_PREFIX) == 0  # type: ignore[arg-type]
     assert client.objects == {"elsewhere/key": b"x"}
@@ -295,7 +300,7 @@ def test_purge_prefix_on_an_empty_prefix_is_a_no_op() -> None:
 def test_purge_prefix_batches_a_large_purge() -> None:
     """One oversized bulk request would make the entire purge all-or-nothing."""
     objects = {f"{OBJECT_PREFIX}{index}/nonce": b"x" for index in range(1050)}
-    client = FakeMinio(objects=objects)
+    client = FakeS3Client(objects=objects)
 
     removed = purge_prefix(
         _Store(client, _settings()),  # type: ignore[arg-type]
@@ -307,20 +312,30 @@ def test_purge_prefix_batches_a_large_purge() -> None:
     assert [len(batch) for batch in client.delete_batches] == [500, 500, 50]
 
 
-def test_purge_prefix_closes_the_listing() -> None:
-    """An abandoned listing leaks its HTTP response; the helper closes it."""
-    client = FakeMinio(objects={f"{OBJECT_PREFIX}a/nonce": b"x"})
+def test_purge_prefix_walks_a_paginated_listing() -> None:
+    """The purge must page through the listing, not read one page and stop.
 
-    purge_prefix(_Store(client, _settings()), OBJECT_PREFIX)  # type: ignore[arg-type]
+    Replaces an older assertion that the helper closed the listing handle itself: with
+    boto3 the paginator owns the HTTP responses, so there is no handle for this module to
+    close. What still matters - and what a naive rewrite to a single ``list_objects_v2``
+    call would break - is that the purge uses the paginator at all, because one page caps
+    at 1000 keys and the rest of a large bucket would be silently left behind while the
+    command reported success.
+    """
+    client = FakeS3Client(objects={f"{OBJECT_PREFIX}a/nonce": b"x"})
 
-    assert client.last_listing is not None
-    assert client.last_listing.closed == 1
+    removed = purge_prefix(_Store(client, _settings()), OBJECT_PREFIX)  # type: ignore[arg-type]
+
+    assert removed == 1
+    # `listings` records (bucket, prefix) once per paginator walk.
+    assert client.listings == [(BUCKET, OBJECT_PREFIX)]
+    assert client.objects == {}
 
 
 def test_purge_prefix_reports_a_partial_failure_without_naming_the_object() -> None:
     """A per-object ``DeleteError`` echoes the key, which must not enter the message."""
     failing = f"{OBJECT_PREFIX}{'0' * 12}/nonce"
-    client = FakeMinio(
+    client = FakeS3Client(
         objects={failing: b"x", f"{OBJECT_PREFIX}b/nonce": b"y"},
         fail_delete_for={failing},
     )
@@ -335,7 +350,7 @@ def test_purge_prefix_reports_a_partial_failure_without_naming_the_object() -> N
 
 
 def test_purge_prefix_propagates_a_store_outage_as_a_port_error() -> None:
-    client = FakeMinio(list_error=StorageUnavailable("down"))
+    client = FakeS3Client(list_error=StorageUnavailable("down"))
 
     with pytest.raises(StorageUnavailable):
         purge_prefix(_Store(client, _settings()), OBJECT_PREFIX)  # type: ignore[arg-type]
@@ -343,7 +358,7 @@ def test_purge_prefix_propagates_a_store_outage_as_a_port_error() -> None:
 
 def test_purge_prefix_reports_an_unexpected_failure_with_a_fixed_message() -> None:
     """The SDK's own text can quote a bucket; only the phase is reported."""
-    client = FakeMinio(list_error=RuntimeError(f"weird failure on {BUCKET}"))
+    client = FakeS3Client(list_error=RuntimeError(f"weird failure on {BUCKET}"))
     client.list_objects = lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"on {BUCKET}"))  # type: ignore[assignment]
 
     with pytest.raises(BucketBootstrapError) as caught:
@@ -354,7 +369,7 @@ def test_purge_prefix_reports_an_unexpected_failure_with_a_fixed_message() -> No
 
 
 def test_purge_prefix_refuses_a_nonsensical_batch_size() -> None:
-    client = FakeMinio(objects={f"{OBJECT_PREFIX}a/nonce": b"x"})
+    client = FakeS3Client(objects={f"{OBJECT_PREFIX}a/nonce": b"x"})
 
     with pytest.raises(ValueError, match="batch_size"):
         purge_prefix(_Store(client, _settings()), OBJECT_PREFIX, batch_size=0)  # type: ignore[arg-type]

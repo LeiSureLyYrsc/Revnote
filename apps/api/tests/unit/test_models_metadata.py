@@ -69,8 +69,11 @@ AUTH_TABLES = (
 #: Phase 5 attachment table. Not a kernel entity: no ``rev``/``updated_seq``/``seq``.
 ATTACHMENT_TABLES = ("attachments",)
 
-#: The exact table set of the project: eleven domain tables, nothing else.
-EXPECTED_TABLES = (*KERNEL_TABLES, *AUTH_TABLES, *ATTACHMENT_TABLES)
+#: Phase 6 bridge tables. Additive, and none is a kernel entity.
+JOPLIN_TABLES = ("joplin_id_map", "joplin_locks", "joplin_sessions")
+
+#: The exact table set of the project: fourteen domain tables, nothing else.
+EXPECTED_TABLES = (*KERNEL_TABLES, *AUTH_TABLES, *ATTACHMENT_TABLES, *JOPLIN_TABLES)
 
 
 def _called_names(source: str) -> set[str]:
@@ -341,6 +344,17 @@ def test_exact_check_set_per_table() -> None:
             "ck_attachments_storage_key_len",
             "ck_attachments_ready_iff_hash",
         },
+        "joplin_id_map": {
+            "ck_joplin_id_map_entity_kind_known",
+            "ck_joplin_id_map_jop_key_len",
+            "ck_joplin_id_map_jop_key_hex",
+        },
+        "joplin_locks": {
+            "ck_joplin_locks_lock_type_known",
+            "ck_joplin_locks_client_type_known",
+            "ck_joplin_locks_client_id_len",
+        },
+        "joplin_sessions": {"ck_joplin_sessions_token_hash_len"},
     }
 
     assert set(Base.metadata.tables) == set(expected)
@@ -396,6 +410,21 @@ def test_check_sql_text_is_pinned() -> None:
             ),
             "ck_attachments_storage_key_len": "octet_length(storage_key) BETWEEN 8 AND 512",
             "ck_attachments_ready_iff_hash": "(state = 'ready') = (content_hash IS NOT NULL)",
+        },
+        "joplin_id_map": {
+            "ck_joplin_id_map_entity_kind_known": (
+                "entity_kind IN ('folder', 'note', 'attachment')"
+            ),
+            "ck_joplin_id_map_jop_key_len": "octet_length(jop_key) BETWEEN 32 AND 32",
+            "ck_joplin_id_map_jop_key_hex": "jop_key ~ '^[0-9a-f]{32}$'",
+        },
+        "joplin_locks": {
+            "ck_joplin_locks_lock_type_known": "lock_type IN ('sync', 'exclusive')",
+            "ck_joplin_locks_client_type_known": "client_type IN (1, 2, 3)",
+            "ck_joplin_locks_client_id_len": "octet_length(client_id) BETWEEN 1 AND 128",
+        },
+        "joplin_sessions": {
+            "ck_joplin_sessions_token_hash_len": "octet_length(token_hash) = 32",
         },
     }
 
@@ -1076,6 +1105,10 @@ def test_index_ddl_is_rendered_for_every_declared_index() -> None:
         "CREATE INDEX ix_attachments_workspace_id_state ON attachments (workspace_id, state)",
         "CREATE INDEX ix_attachments_workspace_id_created_at ON attachments "
         "(workspace_id, created_at)",
+        "CREATE INDEX ix_joplin_locks_workspace_id_updated_at ON joplin_locks "
+        "(workspace_id, updated_at)",
+        "CREATE INDEX ix_joplin_sessions_expires_at ON joplin_sessions (expires_at)",
+        "CREATE INDEX ix_joplin_sessions_user_id ON joplin_sessions (user_id)",
     }
 
 

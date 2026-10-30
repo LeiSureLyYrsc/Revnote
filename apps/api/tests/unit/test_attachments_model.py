@@ -42,6 +42,10 @@ EXPECTED_TABLES = (
     "auth_refresh_tokens",
     "workspace_members",
     "attachments",
+    # Phase 6: additive bridge tables (not kernel entities either).
+    "joplin_id_map",
+    "joplin_locks",
+    "joplin_sessions",
 )
 
 TABLE = "attachments"
@@ -370,7 +374,7 @@ def test_migration_0004_creates_only_the_attachments_table() -> None:
     created = re.findall(r'op\.create_table\(\s*"(\w+)"', source)
     assert created == ["attachments"]
     # And it must not touch any of the ten existing tables.
-    for existing in EXPECTED_TABLES[:-1]:
+    for existing in EXPECTED_TABLES[:10]:
         assert f'op.create_table(\n        "{existing}"' not in source, existing
         assert f'op.add_column(\n        "{existing}"' not in source, existing
         assert f'op.drop_table("{existing}")' not in source, existing

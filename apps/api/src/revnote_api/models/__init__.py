@@ -35,6 +35,9 @@ from revnote_api.models.auth_refresh_token import AuthRefreshToken
 from revnote_api.models.auth_session import AuthSession
 from revnote_api.models.change_event import ENTITY_TYPES, OPERATIONS, ChangeEvent
 from revnote_api.models.folder import Folder
+from revnote_api.models.joplin_id_map import JOPLIN_ENTITY_KINDS, JoplinIdMap
+from revnote_api.models.joplin_lock import JOPLIN_LOCK_TYPES, JoplinLock
+from revnote_api.models.joplin_session import JoplinSession
 from revnote_api.models.note import Note
 from revnote_api.models.op_ledger import REQUEST_HASH_BYTES, OpLedger
 from revnote_api.models.user import User
@@ -54,11 +57,18 @@ MODEL_TABLES: tuple[str, ...] = (
     "auth_refresh_tokens",
     "workspace_members",
     "attachments",
+    # Phase 6: the Joplin bridge's own three tables (additive; none is a kernel
+    # entity and none is referenced by change_events).
+    "joplin_id_map",
+    "joplin_locks",
+    "joplin_sessions",
 )
 
 __all__ = [
     "ATTACHMENT_STATES",
     "ENTITY_TYPES",
+    "JOPLIN_ENTITY_KINDS",
+    "JOPLIN_LOCK_TYPES",
     "MEMBER_ROLES",
     "MODEL_TABLES",
     "OPERATIONS",
@@ -70,6 +80,9 @@ __all__ = [
     "Base",
     "ChangeEvent",
     "Folder",
+    "JoplinIdMap",
+    "JoplinLock",
+    "JoplinSession",
     "Note",
     "OpLedger",
     "User",

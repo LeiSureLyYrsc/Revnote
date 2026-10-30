@@ -31,6 +31,8 @@ from pg_testing import (
     DOMAIN_TABLES,
     HEAD_REVISION,
     HEAD_TABLES,
+    JOPLIN_REVISION,
+    JOPLIN_TABLES,
     KERNEL_REVISION,
     KERNEL_TABLES,
     VERSION_TABLE,
@@ -135,8 +137,8 @@ def test_revision_chain_has_exactly_one_head(
     exactly one revision and ``0003`` becomes an ancestor. A head still at
     ``0003`` (0004 not reachable) or any extra head fails here.
     """
-    assert alembic_heads == (ATTACHMENT_REVISION,)
-    assert head_revision == ATTACHMENT_REVISION == HEAD_REVISION
+    assert alembic_heads == (JOPLIN_REVISION,)
+    assert head_revision == JOPLIN_REVISION == HEAD_REVISION
 
 
 def test_attachment_revision_is_the_child_of_the_auth_revision() -> None:
@@ -152,6 +154,8 @@ def test_attachment_revision_is_the_child_of_the_auth_revision() -> None:
     attachment = script.get_revision(ATTACHMENT_REVISION)
     assert attachment.down_revision == AUTH_REVISION
     assert script.get_revision(AUTH_REVISION).down_revision == KERNEL_REVISION
+    bridge = script.get_revision(JOPLIN_REVISION)
+    assert bridge.down_revision == ATTACHMENT_REVISION
 
 
 def test_downgrade_refused_for_business_db(alembic_cli, normal_database_url: str) -> None:
@@ -255,6 +259,7 @@ async def test_attachment_revision_downgrade_restores_the_auth_schema(
     assert await migration_catalog.version() == AUTH_REVISION
     assert await migration_catalog.table_set() == {*KERNEL_TABLES, *AUTH_TABLES, VERSION_TABLE}
     assert not await migration_catalog.table_set() & set(ATTACHMENT_TABLES)
+    assert not await migration_catalog.table_set() & set(JOPLIN_TABLES)
     # Nothing else moved: the auth table keeps its columns and its indexes.
     assert await migration_catalog.index_names("auth_sessions") == auth_indexes
     assert await migration_catalog.column_map("auth_sessions") == auth_columns

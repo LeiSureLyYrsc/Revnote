@@ -176,6 +176,28 @@ class Settings(BaseSettings):
         ]
     )
 
+    # -- Joplin bridge (Phase 6) -------------------------------------------- #
+    #: Master switch (D10). Closed by default: a deployment that has not opted
+    #: into Joplin compatibility must not *look* like a Joplin Server. When it is
+    #: false the compatibility routes are never registered and ``/capabilities``
+    #: reports ``enabled: false``.
+    joplin_bridge_enabled: bool = False
+    #: Declared protocol baseline (D9). Informational: the HTTP contract in
+    #: ``docs/joplin-protocol-notes.md`` is what the tests pin.
+    joplin_protocol_baseline: str = "3.7"
+    #: Lifetime of one bridge session token. A Joplin client keeps its
+    #: ``session.id`` for weeks, so this is long by design; revocation is a row
+    #: update and is checked on every request.
+    joplin_session_ttl_s: int = Field(default=2_592_000, ge=300)
+    #: A lock whose ``updated_at`` is older than this is treated as abandoned
+    #: and may be reclaimed (Joplin Server's lock TTL is three hours).
+    joplin_lock_ttl_s: int = Field(default=10_800, ge=60)
+    #: Delta page size: default and ceiling. The ``limit`` parameter is advisory
+    #: in Joplin's protocol (compression may shrink a page), but it is still
+    #: bounded so one request cannot ask for the whole event log.
+    joplin_delta_default_limit: int = Field(default=100, ge=1, le=500)
+    joplin_delta_max_limit: int = Field(default=500, ge=1, le=500)
+
     # -- HTTP cross-cutting ------------------------------------------------- #
     #: Explicit origins only; empty means no CORS headers at all. CORS is not
     #: an authorization mechanism - credentials are never allowed.
@@ -223,6 +245,8 @@ class Settings(BaseSettings):
             )
         if self.sync_pull_default_limit > self.sync_pull_max_limit:
             raise ValueError("SYNC_PULL_DEFAULT_LIMIT must not exceed SYNC_PULL_MAX_LIMIT")
+        if self.joplin_delta_default_limit > self.joplin_delta_max_limit:
+            raise ValueError("JOPLIN_DELTA_DEFAULT_LIMIT must not exceed JOPLIN_DELTA_MAX_LIMIT")
         if self.db_lock_timeout_ms > self.db_statement_timeout_ms:
             raise ValueError("DB_LOCK_TIMEOUT_MS must not exceed DB_STATEMENT_TIMEOUT_MS")
         # SVG is refused here as well as in the service: the allowlist is a

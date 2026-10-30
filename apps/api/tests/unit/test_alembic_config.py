@@ -113,7 +113,7 @@ def test_env_py_is_async_and_uses_settings() -> None:
 
 
 def test_revision_chain_is_baseline_kernel_core_then_auth() -> None:
-    """One head: 0001_baseline -> 0002_sync_kernel_core -> 0003 auth -> 0004 attachments."""
+    """One head: 0001 -> 0002 kernel -> 0003 auth -> 0004 attachments -> 0005 bridge."""
     versions = sorted((API_DIR / "migrations" / "versions").glob("*.py"))
 
     assert [path.name for path in versions] == [
@@ -121,6 +121,7 @@ def test_revision_chain_is_baseline_kernel_core_then_auth() -> None:
         "0002_sync_kernel_core.py",
         "0003_auth_sessions_members.py",
         "0004_attachments.py",
+        "0005_joplin_bridge.py",
     ]
 
     baseline = versions[0].read_text(encoding="utf-8")
@@ -150,6 +151,13 @@ def test_revision_chain_is_baseline_kernel_core_then_auth() -> None:
     assert attachments.count("def upgrade") == 1
     assert attachments.count("def downgrade") == 1
 
+    # Phase 6 appends one revision: the three Joplin bridge tables (D5).
+    joplin = versions[4].read_text(encoding="utf-8")
+    assert 'revision: str = "0005_joplin_bridge"' in joplin
+    assert 'down_revision: str | None = "0004_attachments"' in joplin
+    assert joplin.count("def upgrade") == 1
+    assert joplin.count("def downgrade") == 1
+
 
 def test_models_package_exists_and_declares_the_domain_tables() -> None:
     """Phase 3 adds the auth models, Phase 5 the attachment model (no second layer)."""
@@ -164,6 +172,9 @@ def test_models_package_exists_and_declares_the_domain_tables() -> None:
         "auth_session.py",
         "change_event.py",
         "folder.py",
+        "joplin_id_map.py",
+        "joplin_lock.py",
+        "joplin_session.py",
         "note.py",
         "op_ledger.py",
         "user.py",
@@ -180,6 +191,9 @@ def test_models_package_exists_and_declares_the_domain_tables() -> None:
         "revnote_api.models.auth_session",
         "revnote_api.models.change_event",
         "revnote_api.models.folder",
+        "revnote_api.models.joplin_id_map",
+        "revnote_api.models.joplin_lock",
+        "revnote_api.models.joplin_session",
         "revnote_api.models.note",
         "revnote_api.models.op_ledger",
         "revnote_api.models.user",

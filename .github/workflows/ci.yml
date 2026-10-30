@@ -19,12 +19,13 @@
 #   api-http         /api/v1 over an in-process ASGI client
 #   api-http-concurrency  real PostgreSQL + concurrent HTTP requests
 #   api-transport    a real TCP socket served by uvicorn (disconnect, RST)
+#   cli              reference CLI: real PostgreSQL, real socket, child process
 #   api-attachments  real PostgreSQL + real RustFS (its own job, below)
 #
-# The first seven are produced and guarded by the `api` job. The eighth needs a
-# real object store, so it runs in `api-attachments` and is guarded there by
-# `check_test_reports.py --group attachments` — a job can only guard reports it
-# actually produced.
+# The first eight are produced and guarded by the `api` job. The last two need a
+# real object store, so they run in `api-attachments` and are guarded there by
+# `check_test_reports.py --group attachments` / `--group joplin` — a job can only
+# guard reports it actually produced.
 
 name: ci
 
@@ -106,6 +107,7 @@ jobs:
             uv.lock
             pyproject.toml
             apps/api/pyproject.toml
+            apps/cli/pyproject.toml
 
       - name: Sync workspace from the lock file
         # --locked fails when uv.lock disagrees with pyproject.toml rather than
@@ -131,10 +133,10 @@ jobs:
           PY
 
       - name: Lint (ruff check)
-        run: uv run ruff check apps/api
+        run: uv run ruff check apps/api apps/cli
 
       - name: Format check (ruff format)
-        run: uv run ruff format --check apps/api
+        run: uv run ruff format --check apps/api apps/cli
 
       - name: Type check the production modules (ty, pinned)
         # The plan's §14.2 list, spelled out as explicit paths (and globs) so a new
@@ -161,7 +163,8 @@ jobs:
             apps/api/src/revnote_api/config.py \
             apps/api/src/revnote_api/main.py \
             apps/api/scripts/run_web_e2e.py \
-            apps/api/scripts/check_test_reports.py
+            apps/api/scripts/check_test_reports.py \
+            apps/cli/src
 
       - name: Unit tests (must pass with no external service)
         # Proves create_app() boots and serves / with /health while PostgreSQL and
@@ -204,6 +207,13 @@ jobs:
         # rollback. ASGITransport cannot produce one, so it is not used here.
         run: uv run pytest apps/api/tests/api -v -m transport --junitxml=api-transport.xml
 
+      - name: Reference CLI (real PostgreSQL, real socket, console entry point)
+        # Unit cases use httpx.MockTransport; the integration cases run the real
+        # `python -m revnote_cli` in a child process against the production app
+        # served by uvicorn. Both carry the `cli` marker, and a missing database
+        # is a failure, never a skip.
+        run: uv run pytest apps/cli/tests -v -m cli --junitxml=api-cli.xml
+
       - name: Guard - every PostgreSQL and HTTP group ran, passed, and skipped nothing
         # A skip is NOT an acceptance check. Parsing the JUnit XML (not grepping
         # it) avoids `set -o pipefail` failing when there is nothing to match, and
@@ -217,11 +227,11 @@ jobs:
           # equivalently named case is acceptable but the *set* below must be
           # present in the report, or the group silently shrank.
           #
-          # This table covers exactly the seven reports this job produces. The
-          # eighth group (api-attachments.xml) needs a real RustFS, is produced by
-          # the `api-attachments` job, and is pinned there by
-          # `check_test_reports.py --group attachments`. Requiring it here would
-          # ask this job for a file it never generates.
+          # This table covers exactly the eight reports this job produces. The
+          # remaining two groups (api-attachments.xml, api-joplin.xml) need a real
+          # RustFS, are produced by the `api-attachments` job, and are pinned there
+          # by `check_test_reports.py --group attachments` / `--group joplin`.
+          # Requiring them here would ask this job for a file it never generates.
           required = {
               "api-unit.xml": set(),
               "api-integration.xml": {
@@ -286,6 +296,18 @@ jobs:
                   "test_commit_survives_a_lost_response",
                   "test_the_probe_serves_http_on_a_real_socket",
               },
+              # Phase 8: the reference CLI. Every name below is a load-bearing
+              # claim: auth/session handling, paged bootstrap completeness, the
+              # incremental cursor, push round trips, and an honest conflict exit.
+              "api-cli.xml": {
+                  "test_cli_login_me_tree_logout_keep_tokens_in_the_config_dir",
+                  "test_cli_paged_snapshot_collects_every_object_and_pins_the_watermark",
+                  "test_cli_pull_returns_the_increment_after_the_snapshot",
+                  "test_cli_push_note_create_and_update_round_trip",
+                  "test_cli_push_conflict_exits_four_and_leaves_the_note_untouched",
+                  "test_cli_capabilities_are_available_without_a_session",
+                  "test_cli_me_without_a_session_exits_three",
+              },
           }
           for path, names in required.items():
               try:
@@ -301,10 +323,10 @@ jobs:
                   sys.exit(1)
           PY
 
-      - name: Reusable API report guard (same seven-group inventory)
+      - name: Reusable API report guard (same eight-group inventory)
         # Named group by group rather than left to the default: the script's default
-        # is all eight, and the eighth (api-attachments) is produced by the
-        # `api-attachments` job, not here. The same seven-file slice is what the
+        # is all ten, and the other two (attachments, joplin) are produced by the
+        # `api-attachments` job, not here. The same eight-file slice is what the
         # inline guard above pins by case name.
         run: |
           uv run python apps/api/scripts/check_test_reports.py \
@@ -314,7 +336,8 @@ jobs:
             --group migrations \
             --group http \
             --group http-concurrency \
-            --group transport
+            --group transport \
+            --group cli
 
       - name: Alembic upgrade head (documented repo-root command)
         # Alembic reads DATABASE_URL from Settings, so it is supplied here only —
@@ -421,6 +444,7 @@ jobs:
             api-http.xml
             api-http-concurrency.xml
             api-transport.xml
+            api-cli.xml
           if-no-files-found: warn
           retention-days: 7
 

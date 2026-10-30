@@ -1,11 +1,12 @@
-"""Guard the exact nine API report groups without printing failure bodies.
+"""Guard the exact ten API report groups without printing failure bodies.
 
-Seven are the Phase 3 groups, one is the Phase 5 real-PostgreSQL-plus-real-store
-group, and one is the Phase 6 Joplin bridge group (also real PostgreSQL, plus
-real storage for its resource cases). By default every one of the nine is
-required. Repeat --group for focused verification; that does not stand in for
-the default full group gate. --full-report optionally checks an additional
-aggregate report, never instead of the nine group reports.
+Eight are produced by the `api` job (the Phase 3 groups plus the Phase 8 reference
+CLI), one is the Phase 5 real-PostgreSQL-plus-real-store group, and one is the
+Phase 6 Joplin bridge group (also real PostgreSQL, plus real storage for its
+resource cases). By default every one of the ten is required. Repeat --group for
+focused verification; that does not stand in for the default full group gate.
+--full-report optionally checks an additional aggregate report, never instead of
+the ten group reports.
 """
 
 from __future__ import annotations
@@ -82,6 +83,20 @@ REQUIRED: dict[str, set[str]] = {
         "test_socket_disconnect_stops_batch",
         "test_commit_survives_a_lost_response",
         "test_the_probe_serves_http_on_a_real_socket",
+    },
+    # Phase 8: the reference CLI. One case per load-bearing claim: session
+    # storage, a complete paged bootstrap, the incremental cursor, push round
+    # trips, an honest conflict exit, capability discovery, and the unauthenticated
+    # refusal. The unit cases in the same report are extra evidence, not a
+    # substitute for any name here.
+    "api-cli.xml": {
+        "test_cli_login_me_tree_logout_keep_tokens_in_the_config_dir",
+        "test_cli_paged_snapshot_collects_every_object_and_pins_the_watermark",
+        "test_cli_pull_returns_the_increment_after_the_snapshot",
+        "test_cli_push_note_create_and_update_round_trip",
+        "test_cli_push_conflict_exits_four_and_leaves_the_note_untouched",
+        "test_cli_capabilities_are_available_without_a_session",
+        "test_cli_me_without_a_session_exits_three",
     },
     # Phase 5: real PostgreSQL + real object storage, one case per load-bearing
     # claim of plan §7.1. A fake store cannot satisfy these: the digest is
@@ -202,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"api/full: {exc}", file=sys.stderr)
             failed = True
     if args.group:
-        print("Focused group evidence only; the default eight-group gate is still required.")
+        print("Focused group evidence only; the default ten-group gate is still required.")
     return int(failed)
 
 

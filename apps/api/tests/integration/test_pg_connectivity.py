@@ -118,7 +118,7 @@ async def test_business_database_is_stamped_with_the_single_head(
 
 
 async def test_exactly_the_contract_tables_exist(catalog: Catalog) -> None:
-    """The business schema is the ten domain tables + ``alembic_version``."""
+    """The business schema is the eleven domain tables + ``alembic_version``."""
     assert await catalog.tables() == list(HEAD_TABLES)
     assert await catalog.table_set() == {*DOMAIN_TABLES, VERSION_TABLE}
 
@@ -162,7 +162,7 @@ def test_downgrade_is_refused_for_the_business_database(
 async def test_schema_is_still_at_head_after_connectivity(
     catalog: Catalog, head_revision: str
 ) -> None:
-    """Nothing in this module mutated the schema: still head, still ten tables."""
+    """Nothing in this module mutated the schema: still head, still eleven tables."""
     assert await catalog.version() == head_revision
     assert await catalog.table_set() == {*DOMAIN_TABLES, VERSION_TABLE}
 

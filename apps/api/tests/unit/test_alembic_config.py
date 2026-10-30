@@ -113,13 +113,14 @@ def test_env_py_is_async_and_uses_settings() -> None:
 
 
 def test_revision_chain_is_baseline_kernel_core_then_auth() -> None:
-    """One head: 0001_baseline -> 0002_sync_kernel_core -> 0003 auth schema."""
+    """One head: 0001_baseline -> 0002_sync_kernel_core -> 0003 auth -> 0004 attachments."""
     versions = sorted((API_DIR / "migrations" / "versions").glob("*.py"))
 
     assert [path.name for path in versions] == [
         "0001_baseline.py",
         "0002_sync_kernel_core.py",
         "0003_auth_sessions_members.py",
+        "0004_attachments.py",
     ]
 
     baseline = versions[0].read_text(encoding="utf-8")
@@ -142,14 +143,22 @@ def test_revision_chain_is_baseline_kernel_core_then_auth() -> None:
     assert auth.count("def upgrade") == 1
     assert auth.count("def downgrade") == 1
 
+    # Phase 5 appends one revision for the attachments table, still a single head.
+    attachments = versions[3].read_text(encoding="utf-8")
+    assert 'revision: str = "0004_attachments"' in attachments
+    assert 'down_revision: str | None = "0003_auth_sessions_members"' in attachments
+    assert attachments.count("def upgrade") == 1
+    assert attachments.count("def downgrade") == 1
+
 
 def test_models_package_exists_and_declares_the_domain_tables() -> None:
-    """Phase 3 adds the auth models to the same package (no second layer)."""
+    """Phase 3 adds the auth models, Phase 5 the attachment model (no second layer)."""
     models_dir = API_DIR / "src" / "revnote_api" / "models"
 
     assert (models_dir / "__init__.py").is_file()
     assert sorted(path.name for path in models_dir.glob("*.py")) == [
         "__init__.py",
+        "attachment.py",
         "auth_access_token.py",
         "auth_refresh_token.py",
         "auth_session.py",
@@ -165,6 +174,7 @@ def test_models_package_exists_and_declares_the_domain_tables() -> None:
     imported = _imported_modules(models_dir / "__init__.py")
     assert imported == {
         "revnote_api.db.base",
+        "revnote_api.models.attachment",
         "revnote_api.models.auth_access_token",
         "revnote_api.models.auth_refresh_token",
         "revnote_api.models.auth_session",

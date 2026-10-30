@@ -41,12 +41,15 @@ def test_base_metadata_declares_the_phase3_tables() -> None:
     """Every declared table is in ``MODEL_TABLES``, and nothing else is declared.
 
     Phase 2 declared six tables; Phase 3 adds the auth schema and membership
-    (plan §9). Schema is still owned by Alembic (``create_all`` is never
-    called), so this asserts *declared metadata*, not a live database.
+    (plan §9); Phase 5 adds the attachment table, which is deliberately *not* a
+    kernel entity (D3) but still owns schema. Schema is still owned by Alembic
+    (``create_all`` is never called), so this asserts *declared metadata*, not a
+    live database.
     """
     assert tuple(sorted(Base.metadata.tables)) == tuple(sorted(MODEL_TABLES))
     # Pinned literally too: MODEL_TABLES must not silently drift.
     assert tuple(sorted(MODEL_TABLES)) == (
+        "attachments",
         "auth_access_tokens",
         "auth_refresh_tokens",
         "auth_sessions",

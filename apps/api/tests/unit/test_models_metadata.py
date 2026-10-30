@@ -66,8 +66,11 @@ AUTH_TABLES = (
     "workspace_members",
 )
 
-#: The exact table set of the project: ten domain tables, nothing else.
-EXPECTED_TABLES = (*KERNEL_TABLES, *AUTH_TABLES)
+#: Phase 5 attachment table. Not a kernel entity: no ``rev``/``updated_seq``/``seq``.
+ATTACHMENT_TABLES = ("attachments",)
+
+#: The exact table set of the project: eleven domain tables, nothing else.
+EXPECTED_TABLES = (*KERNEL_TABLES, *AUTH_TABLES, *ATTACHMENT_TABLES)
 
 
 def _called_names(source: str) -> set[str]:
@@ -184,7 +187,6 @@ def test_metadata_declares_exactly_the_contract_tables() -> None:
 def test_out_of_scope_tables_are_absent() -> None:
     """Tables the plan excludes must not be declared (plan §1 and §9)."""
     forbidden = {
-        "attachments",
         "change_seq",
         "outbox",
         "revisions",
@@ -331,6 +333,14 @@ def test_exact_check_set_per_table() -> None:
         "auth_access_tokens": {"ck_auth_access_tokens_token_hash_len"},
         "auth_refresh_tokens": {"ck_auth_refresh_tokens_token_hash_len"},
         "workspace_members": {"ck_workspace_members_role_owner_only"},
+        "attachments": {
+            "ck_attachments_state_known",
+            "ck_attachments_mime_len",
+            "ck_attachments_byte_size_positive",
+            "ck_attachments_content_hash_len",
+            "ck_attachments_storage_key_len",
+            "ck_attachments_ready_iff_hash",
+        },
     }
 
     assert set(Base.metadata.tables) == set(expected)
@@ -376,6 +386,16 @@ def test_check_sql_text_is_pinned() -> None:
         },
         "workspace_members": {
             "ck_workspace_members_role_owner_only": "role = 'owner'",
+        },
+        "attachments": {
+            "ck_attachments_state_known": "state IN ('pending', 'ready', 'deleted')",
+            "ck_attachments_mime_len": "octet_length(mime) BETWEEN 3 AND 127",
+            "ck_attachments_byte_size_positive": "byte_size IS NULL OR byte_size > 0",
+            "ck_attachments_content_hash_len": (
+                "content_hash IS NULL OR octet_length(content_hash) = 32"
+            ),
+            "ck_attachments_storage_key_len": "octet_length(storage_key) BETWEEN 8 AND 512",
+            "ck_attachments_ready_iff_hash": "(state = 'ready') = (content_hash IS NOT NULL)",
         },
     }
 
@@ -1053,6 +1073,9 @@ def test_index_ddl_is_rendered_for_every_declared_index() -> None:
         "CREATE INDEX ix_auth_access_tokens_session_id ON auth_access_tokens (session_id)",
         "CREATE INDEX ix_auth_refresh_tokens_session_id ON auth_refresh_tokens (session_id)",
         "CREATE INDEX ix_workspace_members_user_id ON workspace_members (user_id)",
+        "CREATE INDEX ix_attachments_workspace_id_state ON attachments (workspace_id, state)",
+        "CREATE INDEX ix_attachments_workspace_id_created_at ON attachments "
+        "(workspace_id, created_at)",
     }
 
 

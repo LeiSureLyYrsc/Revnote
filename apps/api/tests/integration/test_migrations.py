@@ -16,10 +16,15 @@ still be intact after 0003, and legacy ``users`` rows must come out with
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from pg_migrations import AlembicError, AlembicGuardError, MigrationDatabase
 from pg_testing import (
+    ATTACHMENT_REVISION,
+    ATTACHMENT_TABLES,
     AUTH_REVISION,
     AUTH_TABLES,
     BASELINE_REVISION,
@@ -35,6 +40,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 pytestmark = [pytest.mark.anyio, pytest.mark.integration, pytest.mark.migrations]
+
+# apps/api/tests/integration/test_migrations.py -> integration, tests, api
+API_DIR = Path(__file__).resolve().parents[2]
 
 SENTINEL = "migration_sentinel"
 
@@ -55,6 +63,13 @@ GOOD_HASH = b"\x2a" * 32
 BAD_HASH = b"\x2a" * 31
 GOOD_DIGEST = b"\x5c" * 32
 BAD_DIGEST = b"\x5c" * 33
+
+# Phase 5 attachments: one id, one immutable storage key, one upload nonce.
+ATTACHMENT = "018f0000-0000-7000-8000-0000000000d1"
+ATTACHMENT_NONCE = "018f0000-0000-7000-8000-0000000000e1"
+ATTACHMENT_KEY = f"ws/{WORKSPACE}/att/{ATTACHMENT}/{ATTACHMENT_NONCE}"
+#: 31 octets: one byte short of a SHA-256 digest, so ``content_hash_len`` fires.
+SHORT_DIGEST = b"\x5c" * 31
 
 
 @pytest.fixture
@@ -114,9 +129,29 @@ def test_business_and_migration_databases_are_different(
 def test_revision_chain_has_exactly_one_head(
     alembic_heads: tuple[str, ...], head_revision: str
 ) -> None:
-    """One head: the auth revision sits on the sync-kernel revision."""
-    assert alembic_heads == (AUTH_REVISION,)
-    assert head_revision == AUTH_REVISION == HEAD_REVISION
+    """One head: the attachment revision sits on the auth revision.
+
+    Phase 5 appends ``0004`` on top of ``0003``, so the head moves forward by
+    exactly one revision and ``0003`` becomes an ancestor. A head still at
+    ``0003`` (0004 not reachable) or any extra head fails here.
+    """
+    assert alembic_heads == (ATTACHMENT_REVISION,)
+    assert head_revision == ATTACHMENT_REVISION == HEAD_REVISION
+
+
+def test_attachment_revision_is_the_child_of_the_auth_revision() -> None:
+    """The chain link itself, read from the script directory (no database needed).
+
+    The head moved on, but ``0003`` must stay in the chain: deleting it, or
+    rebasing ``0004`` onto ``0001``/``0002``, would silently drop the auth schema
+    from a fresh ``upgrade head``.
+    """
+    config = Config(str(API_DIR / "alembic.ini"), ini_section="alembic")
+    script = ScriptDirectory.from_config(config)
+
+    attachment = script.get_revision(ATTACHMENT_REVISION)
+    assert attachment.down_revision == AUTH_REVISION
+    assert script.get_revision(AUTH_REVISION).down_revision == KERNEL_REVISION
 
 
 def test_downgrade_refused_for_business_db(alembic_cli, normal_database_url: str) -> None:
@@ -152,7 +187,7 @@ async def test_baseline_creates_only_the_version_table(
 async def test_head_creates_exactly_the_domain_tables_plus_version(
     at_base: MigrationDatabase, migration_catalog: Catalog, head_revision: str
 ) -> None:
-    """``upgrade head`` -> ten domain tables + ``alembic_version``, nothing else."""
+    """``upgrade head`` -> eleven domain tables + ``alembic_version``, nothing else."""
     at_base.upgrade("head")
 
     assert await migration_catalog.tables() == list(HEAD_TABLES)
@@ -201,6 +236,28 @@ async def test_full_round_trip_and_reapply(
 
     at_base.upgrade("head")
     assert await migration_catalog.tables() == head_tables
+
+
+async def test_attachment_revision_downgrade_restores_the_auth_schema(
+    at_base: MigrationDatabase, migration_catalog: Catalog
+) -> None:
+    """``head -> 0003`` drops only ``attachments`` and its indexes (plan §7).
+
+    The rest of the schema must be untouched: this revision owns one table, so its
+    downgrade may not take the auth or kernel DDL with it.
+    """
+    at_base.upgrade("head")
+    auth_indexes = await migration_catalog.index_names("auth_sessions")
+    auth_columns = await migration_catalog.column_map("auth_sessions")
+
+    at_base.downgrade(AUTH_REVISION)
+
+    assert await migration_catalog.version() == AUTH_REVISION
+    assert await migration_catalog.table_set() == {*KERNEL_TABLES, *AUTH_TABLES, VERSION_TABLE}
+    assert not await migration_catalog.table_set() & set(ATTACHMENT_TABLES)
+    # Nothing else moved: the auth table keeps its columns and its indexes.
+    assert await migration_catalog.index_names("auth_sessions") == auth_indexes
+    assert await migration_catalog.column_map("auth_sessions") == auth_columns
 
 
 async def test_auth_revision_downgrade_restores_the_kernel_schema(
@@ -349,6 +406,8 @@ async def test_primary_keys_and_uniques_match_the_contract(
             "workspace_members",
             "PRIMARY KEY (workspace_id, user_id)",
         ),
+        "pk_attachments": ("attachments", "PRIMARY KEY (id)"),
+        "uq_attachments_storage_key": ("attachments", "UNIQUE (storage_key)"),
     }
     for name, (table, definition) in expected.items():
         constraints = await migration_catalog.constraint_map(table)
@@ -401,6 +460,10 @@ async def test_foreign_keys_columns_and_on_delete(
             "FOREIGN KEY (workspace_id, result_seq) REFERENCES "
             "change_events(workspace_id, seq) ON DELETE RESTRICT",
         ),
+        "fk_attachments_workspace_id_workspaces": (
+            "attachments",
+            "FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE RESTRICT",
+        ),
     }
     for name, (table, definition) in expected.items():
         constraint = (await migration_catalog.constraint_map(table))[name]
@@ -414,12 +477,17 @@ async def test_foreign_keys_columns_and_on_delete(
 async def test_only_object_to_event_fks_are_deferred(
     at_base: MigrationDatabase, migration_catalog: Catalog
 ) -> None:
-    """Exactly two deferrable FKs: ``NO ACTION DEFERRABLE INITIALLY DEFERRED``."""
+    """Exactly two deferrable FKs: ``NO ACTION DEFERRABLE INITIALLY DEFERRED``.
+
+    Scanned across **every** domain table, not just the kernel six: the Phase 5
+    attachment FK must stay immediate, and a deferrable FK added elsewhere would
+    have to be announced here.
+    """
     at_base.upgrade("head")
 
     found = [
         (table, constraint.name)
-        for table in KERNEL_TABLES
+        for table in DOMAIN_TABLES
         for constraint in await migration_catalog.constraints(table)
         if constraint.kind == "foreign key" and constraint.deferrable
     ]
@@ -442,7 +510,7 @@ async def test_only_object_to_event_fks_are_deferred(
 async def test_every_check_constraint_is_named(
     at_base: MigrationDatabase, migration_catalog: Catalog
 ) -> None:
-    """All 19 contract CHECKs exist under their exact names, and nothing else.
+    """All 25 contract CHECKs exist under their exact names, and nothing else.
 
     The set is exact per table - no missing CHECK, no extra unnamed CHECK, and no
     drift between the models, the revisions and the live catalog. ``users``
@@ -477,13 +545,21 @@ async def test_every_check_constraint_is_named(
         "auth_access_tokens": {"ck_auth_access_tokens_token_hash_len"},
         "auth_refresh_tokens": {"ck_auth_refresh_tokens_token_hash_len"},
         "workspace_members": {"ck_workspace_members_role_owner_only"},
+        "attachments": {
+            "ck_attachments_state_known",
+            "ck_attachments_mime_len",
+            "ck_attachments_byte_size_positive",
+            "ck_attachments_content_hash_len",
+            "ck_attachments_storage_key_len",
+            "ck_attachments_ready_iff_hash",
+        },
     }
     total = 0
     for table, wanted in expected.items():
         found = {c.name for c in await migration_catalog.constraints(table) if c.kind == "check"}
         assert found == wanted, f"{table}: expected {sorted(wanted)}, found {sorted(found)}"
         total += len(wanted)
-    assert total == 19
+    assert total == 25
 
 
 async def test_check_constraint_definitions_match(
@@ -569,6 +645,12 @@ async def test_index_set_is_exact(at_base: MigrationDatabase, migration_catalog:
         },
         # The (workspace_id, user_id) PK covers the forward lookup.
         "workspace_members": {"pk_workspace_members", "ix_workspace_members_user_id"},
+        "attachments": {
+            "pk_attachments",
+            "uq_attachments_storage_key",
+            "ix_attachments_workspace_id_state",
+            "ix_attachments_workspace_id_created_at",
+        },
     }
     for table, wanted in expected.items():
         found = await migration_catalog.index_names(table)
@@ -776,6 +858,57 @@ async def test_check_constraints_reject_bad_rows(
                         "digest": BAD_DIGEST,
                         "ws": WORKSPACE,
                         "owner": USER,
+                    },
+                )
+                await session.commit()
+        assert expected in str(error.value), f"{expected} not enforced: {error.value}"
+
+    # Phase 5: the state machine is enforced by the server, not only by the service.
+    # ``ready`` without a digest (and ``pending`` with one) must both be impossible.
+    attachment_cases = [
+        (
+            "INSERT INTO attachments (id, workspace_id, state, mime, content_hash, "
+            "storage_key, upload_nonce) VALUES (:att, :ws, 'ready', 'text/plain', NULL, "
+            ":key, :nonce)",
+            "ck_attachments_ready_iff_hash",
+        ),
+        (
+            "INSERT INTO attachments (id, workspace_id, state, mime, content_hash, "
+            "storage_key, upload_nonce) VALUES (:att, :ws, 'pending', 'text/plain', "
+            ":digest, :key, :nonce)",
+            "ck_attachments_ready_iff_hash",
+        ),
+        (
+            "INSERT INTO attachments (id, workspace_id, state, mime, storage_key, "
+            "upload_nonce) VALUES (:att, :ws, 'archived', 'text/plain', :key, :nonce)",
+            "ck_attachments_state_known",
+        ),
+        (
+            "INSERT INTO attachments (id, workspace_id, state, mime, byte_size, "
+            "storage_key, upload_nonce) VALUES (:att, :ws, 'pending', 'text/plain', 0, "
+            ":key, :nonce)",
+            "ck_attachments_byte_size_positive",
+        ),
+        (
+            # 31 octets: one byte short of a SHA-256 digest.
+            "INSERT INTO attachments (id, workspace_id, state, mime, content_hash, "
+            "storage_key, upload_nonce) VALUES (:att, :ws, 'ready', 'text/plain', "
+            ":short_digest, :key, :nonce)",
+            "ck_attachments_content_hash_len",
+        ),
+    ]
+    for statement, expected in attachment_cases:
+        with pytest.raises(IntegrityError) as error:
+            async with migration_session_factory() as session:
+                await session.execute(
+                    text(statement),
+                    {
+                        "att": ATTACHMENT,
+                        "ws": WORKSPACE,
+                        "key": ATTACHMENT_KEY,
+                        "nonce": ATTACHMENT_NONCE,
+                        "digest": GOOD_DIGEST,
+                        "short_digest": SHORT_DIGEST,
                     },
                 )
                 await session.commit()
@@ -1260,9 +1393,11 @@ async def test_upgrade_0003_refuses_to_merge_normalised_email_collisions(
     assert "revnote.test" not in str(error.value)
     assert "same.person" not in str(error.value)
 
-    # Nothing was applied: still 0002, no auth tables, both accounts preserved.
+    # Nothing was applied: still 0002, no auth and no attachment tables, both
+    # accounts preserved.
     assert await migration_catalog.version() == KERNEL_REVISION
     assert not await migration_catalog.table_set() & set(AUTH_TABLES)
+    assert not await migration_catalog.table_set() & set(ATTACHMENT_TABLES)
     async with migration_session_factory() as session:
         remaining = (await session.execute(text("SELECT count(*) FROM users"))).scalar_one()
     assert remaining == 2, "a failed upgrade must not delete an account"
@@ -1436,6 +1571,58 @@ async def test_auth_columns_and_nullability_at_head(
     members = await migration_catalog.column_map("workspace_members")
     assert members["role"].nullable is False
     assert members["role"].data_type == "text"
+
+
+async def test_attachment_columns_and_nullability_at_head(
+    at_base: MigrationDatabase, migration_catalog: Catalog
+) -> None:
+    """The Phase 5 columns exist with the exact types and NULLability promised.
+
+    Asserted against ``information_schema`` on the migrated database, not against
+    the ORM: this is the shape a client and the GC both read.
+    """
+    at_base.upgrade("head")
+
+    columns = await migration_catalog.column_map("attachments")
+
+    assert list(columns) == [
+        "id",
+        "workspace_id",
+        "state",
+        "mime",
+        "byte_size",
+        "content_hash",
+        "storage_key",
+        "upload_nonce",
+        "file_name",
+        "created_at",
+        "upload_started_at",
+        "ready_at",
+        "deleted_at",
+        "delete_reason",
+    ]
+    assert columns["id"].data_type == "uuid" and columns["id"].nullable is False
+    assert columns["workspace_id"].data_type == "uuid"
+    assert columns["workspace_id"].nullable is False
+    assert columns["state"].data_type == "text" and columns["state"].nullable is False
+    assert columns["mime"].data_type == "text" and columns["mime"].nullable is False
+    assert columns["byte_size"].data_type == "bigint"
+    assert columns["byte_size"].nullable is True
+    assert columns["byte_size"].default is None
+    assert columns["content_hash"].data_type == "bytea"
+    assert columns["content_hash"].nullable is True
+    assert columns["storage_key"].data_type == "text"
+    assert columns["storage_key"].nullable is False
+    assert columns["upload_nonce"].data_type == "uuid"
+    assert columns["upload_nonce"].nullable is False
+    # User content and the GC bookkeeping columns are all optional.
+    for optional in ("file_name", "upload_started_at", "ready_at", "deleted_at", "delete_reason"):
+        assert columns[optional].nullable is True, optional
+    # ``created_at`` is the only defaulted column: it anchors the GC grace window.
+    assert columns["created_at"].data_type == "timestamp with time zone"
+    assert columns["created_at"].nullable is False
+    assert columns["created_at"].default == "now()"
+    assert columns["upload_started_at"].default is None
 
 
 @pytest.fixture(scope="module", autouse=True)

@@ -23,12 +23,13 @@ nullable columns rather than a second credentials table.
 
 Services/tests import the entities from here::
 
-    from revnote_api.models import Folder, Note, User, Workspace, WorkspaceMember
+    from revnote_api.models import Attachment, Folder, Note, User, Workspace, WorkspaceMember
 """
 
 from __future__ import annotations
 
 from revnote_api.db.base import Base
+from revnote_api.models.attachment import ATTACHMENT_STATES, Attachment
 from revnote_api.models.auth_access_token import AuthAccessToken
 from revnote_api.models.auth_refresh_token import AuthRefreshToken
 from revnote_api.models.auth_session import AuthSession
@@ -52,14 +53,17 @@ MODEL_TABLES: tuple[str, ...] = (
     "auth_access_tokens",
     "auth_refresh_tokens",
     "workspace_members",
+    "attachments",
 )
 
 __all__ = [
+    "ATTACHMENT_STATES",
     "ENTITY_TYPES",
     "MEMBER_ROLES",
     "MODEL_TABLES",
     "OPERATIONS",
     "REQUEST_HASH_BYTES",
+    "Attachment",
     "AuthAccessToken",
     "AuthRefreshToken",
     "AuthSession",

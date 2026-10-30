@@ -39,15 +39,18 @@ FALSY_VALUES = frozenset({"", "0", "false", "no", "off"})
 KERNEL_TABLES = ("users", "workspaces", "folders", "notes", "change_events", "op_ledger")
 #: Phase 3 auth tables plus the per-request authorisation row (plan §9).
 AUTH_TABLES = ("auth_sessions", "auth_access_tokens", "auth_refresh_tokens", "workspace_members")
-#: Every domain table the current head owns — ten of them.
-DOMAIN_TABLES = (*KERNEL_TABLES, *AUTH_TABLES)
+#: Phase 5 attachment table: not a kernel entity, so never in the sync stream.
+ATTACHMENT_TABLES = ("attachments",)
+#: Every domain table the current head owns — eleven of them.
+DOMAIN_TABLES = (*KERNEL_TABLES, *AUTH_TABLES, *ATTACHMENT_TABLES)
 VERSION_TABLE = "alembic_version"
 HEAD_TABLES = tuple(sorted((*DOMAIN_TABLES, VERSION_TABLE)))
 
 BASELINE_REVISION = "0001_baseline"
 KERNEL_REVISION = "0002_sync_kernel_core"
 AUTH_REVISION = "0003_auth_sessions_members"
-HEAD_REVISION = AUTH_REVISION
+ATTACHMENT_REVISION = "0004_attachments"
+HEAD_REVISION = ATTACHMENT_REVISION
 
 # --------------------------------------------------------------------------- #
 # engines / sessions

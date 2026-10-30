@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ApiError } from '../../../src/api/client'
-import { decodePullResponse, decodePushResponse, decodeServerObject, decodeSnapshotResponse } from '../../../src/api/sync'
+import { decodePullResponse, decodePushResponse, decodeServerObject, decodeSnapshotPageResponse, decodeSnapshotResponse } from '../../../src/api/sync'
 import { note } from './fixtures'
 
 const workspace = '11111111-1111-4111-8111-111111111111'
@@ -77,5 +77,30 @@ describe('complete sync runtime decoders', () => {
     expect(() => decodeSnapshotResponse({ objects: [object()], as_of_seq: '0', min_retained_seq: '1' }, workspace)).toThrow()
     expect(() => decodeSnapshotResponse({ objects: [object(), object()], as_of_seq: '1', min_retained_seq: '1' }, workspace)).toThrow()
     expect(() => decodeSnapshotResponse({ objects: [{ ...object(), deleted: true, deleted_at: object().updated_at }], as_of_seq: '1', min_retained_seq: '1' }, workspace)).toThrow()
+  })
+
+  it('checks paged snapshot watermark, terminal cursor and active-only objects', () => {
+    const first = { objects: [object()], as_of_seq: '9', min_retained_seq: '1', next_cursor: 'page.two-1', has_more: true }
+    const decoded = decodeSnapshotPageResponse(first, workspace)
+    expect(decoded.as_of_seq).toBe('9')
+    expect(decoded.next_cursor).toBe('page.two-1')
+    expect(decodeSnapshotPageResponse({ ...first, objects: [], as_of_seq: '9', min_retained_seq: '1', next_cursor: null, has_more: false }, workspace).objects).toEqual([])
+
+    // The watermark is pinned across pages; the floor may only advance.
+    expect(() => decodeSnapshotPageResponse(first, workspace, '8')).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, min_retained_seq: '0' }, workspace, '9', '1')).toThrow()
+
+    // An empty page may not claim more, and a terminal page may not carry a cursor.
+    expect(() => decodeSnapshotPageResponse({ ...first, objects: [] }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, next_cursor: null }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, has_more: false }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, next_cursor: 'bad cursor' }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, next_cursor: 2 }, workspace)).toThrow()
+
+    // Paged objects are active and cannot be newer than the pinned watermark.
+    expect(() => decodeSnapshotPageResponse({ ...first, objects: [{ ...object(), deleted: true, deleted_at: object().updated_at }] }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, objects: [{ ...object(), updated_seq: '10' }] }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, objects: [object(), object()] }, workspace)).toThrow()
+    expect(() => decodeSnapshotPageResponse({ ...first, objects: [], has_more: false, next_cursor: null, as_of_seq: '0', min_retained_seq: '2' }, workspace)).toThrow()
   })
 })

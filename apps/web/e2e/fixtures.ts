@@ -338,11 +338,18 @@ export async function ensureOwnedApi(request: APIRequestContext): Promise<void> 
  * rejects a start while the previous process is alive, so a reachable API is
  * stopped first; a process that died in between is not an error.
  */
-export async function restartOwnedApi(request: APIRequestContext, snapshotLimit?: 1): Promise<void> {
+export async function restartOwnedApi(
+  request: APIRequestContext,
+  options: { snapshotLimit?: 1; snapshotPageLimit?: number } = {},
+): Promise<void> {
   if (await apiReachable(request)) {
     try { await control(request, { action: 'stop' }) } catch { /* Exiting on its own is fine. */ }
   }
-  await control(request, { action: 'start', ...(snapshotLimit === 1 ? { snapshotLimit: 1 } : {}) })
+  await control(request, {
+    action: 'start',
+    ...(options.snapshotLimit === 1 ? { snapshotLimit: 1 } : {}),
+    ...(options.snapshotPageLimit !== undefined ? { snapshotPageLimit: options.snapshotPageLimit } : {}),
+  })
   expect(await apiReachable(request), 'Owned API answers after being restarted').toBe(true)
 }
 

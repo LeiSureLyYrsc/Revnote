@@ -79,3 +79,10 @@ export interface SnapshotResponse {
   min_retained_seq: Decimal
   objects: ServerObject[]
 }
+export interface SnapshotPageResponse {
+  as_of_seq: Decimal
+  min_retained_seq: Decimal
+  objects: ServerObject[]
+  next_cursor: string | null
+  has_more: boolean
+}

@@ -19,6 +19,8 @@ export const E2E_LABELS = [
   'session_identity_isolation',
   'resync_preservation',
   'cursor_integrity',
+  // Phase 7: a workspace larger than one snapshot page still bootstraps.
+  'snapshot_pagination',
   'markdown_preservation',
   'mobile_layout',
   // Phase 5 (interface §9): real object storage through the API proxy.

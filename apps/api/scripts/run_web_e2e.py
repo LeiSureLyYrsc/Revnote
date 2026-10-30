@@ -1094,7 +1094,18 @@ class TestControl:
                             raise LifecycleError("The owned API is already running.")
                         child_env = dict(control.env)
                         if payload.get("snapshotLimit") == 1:
+                            # Legacy full-snapshot cap *and* the Phase 7 total cap:
+                            # a paged client must fail the same way, not silently
+                            # bypass a deliberately unbootstrappable workspace.
                             child_env["SYNC_SNAPSHOT_MAX_OBJECTS"] = "1"
+                            child_env["SYNC_SNAPSHOT_MAX_TOTAL_OBJECTS"] = "1"
+                        page_limit = payload.get("snapshotPageLimit")
+                        if (
+                            isinstance(page_limit, int)
+                            and not isinstance(page_limit, bool)
+                            and 1 <= page_limit <= 1_000
+                        ):
+                            child_env["SYNC_SNAPSHOT_PAGE_MAX_OBJECTS"] = str(page_limit)
                         try:
                             reservation = reserve_port(control.port)
                         except LifecycleError:

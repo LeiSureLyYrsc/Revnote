@@ -62,12 +62,14 @@ misreported as a product defect:
    workspace and the login form is gone. It deliberately does *not* assert that
    `新建笔记` is enabled, because `NotesSidebar` gates creation on
    `bootstrapped`, and `resync_preservation` intentionally leaves the workspace
-   unbootstrappable by restarting the API with `snapshotLimit: 1` (a real
-   `snapshot_too_large` can never bootstrap). Disabling creation there is
-   approved behaviour, not a bug. Cases that need an editable workspace call
-   `expectWorkspaceReady`, and `createNote`/`createFolder` wait for it
-   themselves, so removing the coupled assertion cannot introduce a bootstrap
-   race.
+   unbootstrappable by restarting the API with `snapshotLimit: 1` (the legacy
+   full-read cap and the Phase 7 total-bootstrap cap both refuse this workspace).
+   Disabling creation there is approved behaviour, not a bug. Cases that need an
+   editable workspace call `expectWorkspaceReady`, and
+   `createNote`/`createFolder` wait for it themselves, so removing the coupled
+   assertion cannot introduce a bootstrap race. `snapshot_pagination`
+   deliberately restarts the same API with a two-object *page* limit instead:
+   that workspace must bootstrap successfully in several real pages.
 
 `single_writer_takeover` keeps the writer and follower as two tabs of the same
 `BrowserContext`, because only that shares the origin-wide Web Lock and

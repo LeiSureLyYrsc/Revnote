@@ -180,6 +180,39 @@ pull的since为排他十进制字符串（默认0），保留完整事件并独�
 - Compose 官方镜像在当前环境未完成拉取与运行验证；若官方 MinIO 分发源不可用，应停止并确认来源，不切换第三方镜像或其他 S3 产品。
 - GitHub 仓库为 [LeiSureLyYrsc/Revnote](https://github.com/LeiSureLyYrsc/Revnote)。Actions、API 镜像构建和 GHCR 发布状态以实际运行记录为准，文件已生成不代表已验收。
 
+**Phase 5（附件）已实现**，协议细节见 [附件 API 附录](docs/phase5-attachments-api.md)，范围与决策见 [实施计划](docs/plan-phase5.md)：
+
+- 附件上传与下载**全部经 API 代理**，浏览器不直连对象存储；`upload.url` 是相对路径，协议里没有预签名。
+- `GET /api/v1/capabilities` 提供能力探测（永远 200，关闭时 `enabled:false` 仍带限额）。
+- `pending → ready` 两阶段生命周期，上传与校验在**事务外**完成；`ready` 以**真实 SHA-256** 为准——边写边算，完成后回读复算，不采信 ETag/HEAD/客户端声明。
+- `python -m revnote_api.tools.attachments_gc` 运维脚本，**只**清理过期 `pending`（行 + 对象），`ready` 永不自动回收。
+- Web 上传界面带能力门控：旧服务缺 `/capabilities`、离线、只读或无存储时入口显式禁用并说明原因。
+- 附件**不是内核实体**：不写 `change_events`、不分配 `seq`、不出现在 `pull`/`snapshot`。
+
+本轮补充（同属已实现，细节以附录为准）：
+
+- 新增 5 个端点：`POST /workspaces/{workspace_id}/attachments`、`PUT /workspaces/{workspace_id}/attachments/{attachment_id}/content`、`GET /attachments/{attachment_id}`、`GET /attachments/{attachment_id}/content`、`GET /capabilities`。不删除、不改写 Phase 3 的任何端点或错误码，因此仍是 `/api/v1`，不引入 v2。
+- `GET /capabilities` **不要求 token**（客户端在拿到 token 前就要决定是否显示附件入口），且不暴露任何工作区数据。
+- 摘要校验的比对对象是**服务端回读复算**的 SHA-256；不一致时返回 `attachment_hash_mismatch`（409），并先删除对象、不留下 `ready` 行。
+- GC 脚本支持 `--dry-run`、`--limit`、`--grace-seconds`，以运维命令运行，**不是后台调度器**；输出只有计数，从不打印对象键、文件名或 id。
+- 附件不出现在 `tree`，也不推进 `workspaces.last_seq`；正文 Markdown 里的相对 URL 是唯一引用关系。
+
+**Phase 5 明确不做**（不是遗漏，是范围决定）：
+
+- 预签名直传/直读、桶 CORS、浏览器直连对象存储。
+- 附件去重、附件删除（无端点、无 UI）、未引用 `ready` 对象的回收、后台调度器。
+- `Range` 请求、断点续传、分片上传。
+- 附件事件流、附件进入 `pull`/`snapshot`、扩 `change_events.entity_type`。
+- Joplin 桥、自动三方合并、snapshot 分页。
+- 公网加固：TLS、真实限流、备份恢复演练、同源生产部署与反向代理。
+- 参考 CLI。
+
+**Phase 5 已验证 / 未验证**（数字不在此复述，一律以 [Phase 5 实际验收记录](docs/phase5-validation.md) 为准；该文件中仍标「待填」或写明尚未运行的小节即尚未运行）：
+
+- 已验证：**以 [Phase 5 实际验收记录](docs/phase5-validation.md) 各节的实际运行结果为准**；本文不复述任何未从该文件读到的数字或结论。该文件同时记录了已确认但尚未修复的缺陷（并发上传丢字节、E2E runner 存储生命周期未接线），阅读时须一并采信。**专项通过不等于整个阶段或发布已通过。**
+- 未验证：Docker 镜像在真实 Docker 主机上的可拉取与可运行性（本机无 Docker/daemon，无法验证，只能由 CI 运行结果证明）；公网部署（TLS、真实限流、备份恢复演练、生产反向代理）。
+- 未验证（附件 E2E）：`apps/web/e2e/attachments.spec.ts` 文件已存在，但 `apps/api/scripts/run_web_e2e.py` 未把 `OBJECT_STORAGE_*` 与 `ATTACHMENTS_ENABLED` 传给子进程，4 个附件 E2E 标签因此**没有真实浏览器证据**；详见验收记录 §B2。
+
 ## Actions 与 GHCR
 
 工作流先检查 API、双库真实 PG/并发/迁移、Web 单元/组件及独立 `web-e2e` 真实浏览器组，再构建 API 镜像；`image.needs` 同时依赖三组。发布目标为 `ghcr.io/<owner>/revnote-api`。PR 不推镜像；发布使用 GitHub Actions 的 `GITHUB_TOKEN`，不在仓库保存 PAT。
